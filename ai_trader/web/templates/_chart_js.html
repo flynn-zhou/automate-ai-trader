@@ -1,0 +1,205 @@
+{# 图表初始化脚本：总览页 / 独立行情页共用 #}
+<script src="/static/vendor/echarts.min.js"></script>
+<script src="/static/chartkit.js"></script>
+<script>
+(function () {
+  "use strict";
+  var API = {{ pack_url|tojson }};
+  var POLL_MS = 3000, PRICE_MS = 1000;
+  var cur = {{ default_interval|tojson or '"3m"' }};
+  var bars = [], cats = [], EMA_FULL = {}, chart = null, emaSeries = [];
+
+  var EMA_PERIODS = [20, 50, 144, 169, 200];
+  var EMA_COLORS = { 20: "#9aa1ac", 50: "#c3c9d4", 144: "#22c55e",
+                     169: "#ef4444", 200: "#3b82f6" };
+
+  function $(id) { return document.getElementById(id); }
+  var fmt = ChartKit.fmt;
+
+  function init() {
+    var el = $("chart");
+    if (!el || !window.echarts) return false;
+    chart = echarts.init(el, null, { renderer: "canvas" });
+    chart.on("finished", redraw);
+    chart.on("datazoom", function () { setTimeout(redraw, 0); });
+    window.addEventListener("resize", function () {
+      chart.resize(); setTimeout(redraw, 60);
+    });
+    return true;
+  }
+
+  // 井字层不在 ECharts 里：这版 echarts.min.js 会静默丢弃 CanvasPattern
+  // （areaStyle 传 pattern 那块直接透明，换纯红立刻出现）。
+  function redraw() {
+    ChartKit.drawHatch(chart, $("chart"), $("ema-hatch"), EMA_FULL);
+  }
+
+  function renderLive(j) {
+    if (!j.ok) { $("feed-status").textContent = j.error || "读取失败"; return; }
+    var L = j.live;
+    bars = L.bars.map(function (b) {
+      return { t: b[0], o: b[1], c: b[2], l: b[3], h: b[4] };
+    });
+    var n = bars.length;
+    cats = bars.map(function (b) {
+      var d = new Date(b.t), p = function (x) { return (x < 10 ? "0" : "") + x; };
+      return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+             p(d.getHours()) + ":" + p(d.getMinutes());
+    });
+    var ohlc = bars.map(function (b) { return [b.o, b.c, b.l, b.h]; });
+
+    // 最新 K 与价格刻度之间留出空隙：末尾补 4 个空分类。
+    // 这是旧版验收过的做法，注释原话："避免最新一根贴住网格右缘"。
+    // 只调 grid.right 是错的 —— 那只缩窄绘图区，最新一根仍然贴着右缘。
+    // 空占位必须用 '-' 不能用 null：candlestick 遇 null 会抛 TypeError 并静默白屏。
+    var EMA_PAD = 4;
+    for (var pi = 0; pi < EMA_PAD; pi++) { cats.push(""); ohlc.push("-"); }
+
+    EMA_FULL = {};
+    emaSeries = [];
+    EMA_PERIODS.forEach(function (per) {
+      var arr = (L.ema[String(per)] || []).slice();
+      if (!arr.length) return;
+      // 补空分类对应的 null：不补的话 ECharts 会把线拉到最后，视觉上盖住留白
+      while (arr.length < cats.length) arr.push(null);
+      EMA_FULL[String(per)] = arr;
+      emaSeries.push({
+        name: "EMA" + per, type: "line", data: arr, z: 6,
+        showSymbol: false, smooth: false, animation: false, connectNulls: false,
+        lineStyle: { color: EMA_COLORS[per], width: per >= 144 ? 1.6 : 1.2,
+                     opacity: per >= 144 ? 1 : 0.9 },
+        itemStyle: { color: EMA_COLORS[per] }
+      });
+    });
+
+    var last = bars[n - 1], prev = bars[n - 2];
+    var col = (prev && last.c < prev.c) ? "#ef4444" : "#22c55e";
+
+    chart.setOption({
+      backgroundColor: "transparent", animation: false,
+      tooltip: {
+        trigger: "axis", axisPointer: { type: "cross" },
+        backgroundColor: "rgba(23,26,33,.95)", borderColor: "#2a2e37",
+        textStyle: { color: "#e6e8eb", fontSize: 12 },
+        formatter: function (ps) {
+          var p = ps[0]; if (!p) return "";
+          var b = bars[p.dataIndex]; if (!b) return "";
+          var c2 = (b.c >= b.o) ? "#22c55e" : "#ef4444";
+          var s = "<b>" + cats[p.dataIndex] + "</b><br/>" +
+            "开 <span style='color:" + c2 + "'>" + fmt(b.o) + "</span><br/>" +
+            "高 <span style='color:" + c2 + "'>" + fmt(b.h) + "</span><br/>" +
+            "低 <span style='color:" + c2 + "'>" + fmt(b.l) + "</span><br/>" +
+            "收 <span style='color:" + c2 + "'>" + fmt(b.c) + "</span>";
+          for (var k = 0; k < ps.length; k++) {
+            var nm = ps[k].seriesName || "";
+            if (nm.indexOf("EMA") !== 0) continue;
+            if (ps[k].data == null) continue;
+            s += "<br/>" + nm + " " + fmt(ps[k].data);
+          }
+          return s;
+        }
+      },
+      legend: { data: ["EMA20", "EMA50", "EMA144", "EMA169", "EMA200"],
+                textStyle: { color: "#9aa1ac" }, top: 4,
+                itemWidth: 14, itemHeight: 8 },
+      // yAxis 在右侧时 right 必须留够约 72px：
+      // 标 "80232.7" 约需 55px，留 18px 会被裁成 "70" 这种两位数。
+      grid: [{ left: 18, right: 72, top: 30, bottom: 74 }],
+      xAxis: {
+        type: "category", data: cats, boundaryGap: true,
+        axisLine: { lineStyle: { color: "#2a2e37" } },
+        axisLabel: { color: "#9aa1ac", fontSize: 11 },
+        splitLine: { show: false },
+        axisPointer: { label: { backgroundColor: "#3b82f6" } }
+      },
+      yAxis: {
+        scale: true, position: "right",
+        axisLine: { lineStyle: { color: "#2a2e37" } },
+        axisLabel: { color: "#9aa1ac", fontSize: 11, margin: 10,
+                     formatter: function (v) { return Number(v).toFixed(1); } },
+        splitLine: { lineStyle: { color: "rgba(42,46,55,.6)" } }
+      },
+      dataZoom: [
+        { type: "inside", xAxisIndex: 0,
+          start: Math.max(0, 100 - 12000 / n), end: 100 },
+        { type: "slider", xAxisIndex: 0, height: 22, bottom: 12,
+          backgroundColor: "#141821", borderColor: "#2a2e37",
+          fillerColor: "rgba(59,130,246,.15)",
+          handleStyle: { color: "#3b82f6" }, textStyle: { color: "#9aa1ac" } }
+      ],
+      series: [{
+        name: (j.symbol || "BTCUSDT") + " " + L.interval,
+        type: "candlestick", data: ohlc,
+        itemStyle: { color: "#22c55e", color0: "#ef4444",
+                     borderColor: "#22c55e", borderColor0: "#ef4444" },
+        // 现价横向虚线：不悬停也能看到现价在哪。silent 保证不抢鼠标事件
+        markLine: {
+          silent: true, symbol: "none", animation: false,
+          lineStyle: { color: col, type: "dashed", width: 1.2, opacity: 0.95 },
+          label: { show: false },
+          data: [{ yAxis: last.c }]
+        }
+      }].concat(emaSeries)
+    }, true);
+
+    redraw();
+    paintPrice(j.price, j.change, j.change_pct);
+
+    var emaKeys = Object.keys(L.ema || {});
+    $("feed-status").textContent =
+      (j.stale ? "⚠ 上游异常，显示上次成功数据" : L.interval + " · 每 3 秒轮询") +
+      " · 预热 " + L.warmup + " 根 · EMA 组数=" + emaKeys.length +
+      " 曲线=" + emaSeries.length +
+      " · " + new Date(j.server_time).toLocaleTimeString("zh-CN");
+  }
+
+  function paintPrice(p, d, pct) {
+    var el = $("last-price"), de = $("last-delta");
+    if (el) { el.textContent = fmt(p); el.style.color = (d != null && d < 0) ? "#ef4444" : "#22c55e"; }
+    if (de && d != null) {
+      de.textContent = (d >= 0 ? "+" : "") + fmt(d) + "  (" +
+                       (pct >= 0 ? "+" : "") + fmt(pct, 2) + "%)";
+      de.style.color = d >= 0 ? "#22c55e" : "#ef4444";
+    }
+  }
+
+  // 现价 1s 一刷，K 线 3s 一刷：
+  // 价格是"看着它在动"的东西，等 3 秒会显得死；K 线一根 3 分钟，刷太快没意义。
+  function priceTick() {
+    fetch(API + "?interval=" + encodeURIComponent(cur), { credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.ok) paintPrice(j.price, j.change, j.change_pct);
+      })
+      .catch(function () {});
+  }
+
+  var pollTimer = null, priceTimer = null;
+  function poll() {
+    // cache: 'no-store' —— 否则浏览器会用自己的缓存，看起来"数据不动"
+    fetch(API + "?interval=" + encodeURIComponent(cur) + "&_t=" + Date.now(),
+          { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(renderLive)
+      .catch(function (e) { $("feed-status").textContent = "请求失败: " + e; });
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll(".iv"), function (btn) {
+    btn.onclick = function () {
+      Array.prototype.forEach.call(document.querySelectorAll(".iv"), function (o) {
+        o.classList.remove("on");
+      });
+      btn.classList.add("on");
+      cur = btn.getAttribute("data-iv");
+      EMA_FULL = {};
+      poll();
+    };
+  });
+
+  var go = $("refresh");          // 页面顶部"刷新"按钮：手动立刻重取
+  if (go) go.onclick = function () { poll(); priceTick(); };
+
+  if (init()) { poll(); priceTimer = setInterval(priceTick, PRICE_MS); }
+  pollTimer = setInterval(poll, POLL_MS);
+})();
+</script>

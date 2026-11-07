@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ai-trader health check every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=ai-trader-healthcheck.service
+
+[Install]
+WantedBy=timers.target

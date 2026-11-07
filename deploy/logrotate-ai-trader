@@ -1,0 +1,10 @@
+# 交易系统的日志不由 rsyslog 管，必须显式轮转，否则跑几个月会撑满磁盘
+/home/cryptobot/ai-trader/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -1,0 +1,29 @@
+# automate-ai-trader · 主配置（不含敏感信息）
+env: dev
+log_level: INFO
+
+market:
+  symbol: BTCUSDT
+  # 3s 是结构不变量（INTERVALS_MS[0] + agg.py 的断言），不是可调项，
+  # 所以这里没有 tick_bucket_ms 这个键了。
+  ws_url: wss://fstream.binance.com/ws
+  fapi_base: https://fapi.binance.com
+  rest_poll_ms: 3000                   # REST 逐笔轮询间隔（= 3s 桶宽）
+  tick_mode: auto                      # auto | ws | rest（auto：WS 有推送走 WS，否则 REST 逐笔）
+  enable_ws: true
+  enable_rest_fallback: true
+  rest_tick_bootstrap: 300             # 冷启动回补逐笔条数
+  ws_stale_ms: 10000                   # WS 静默超 10s 判定降级
+  # 逐笔流名：trade 或 aggTrade。2026-11-02 实测本环境下永续 @aggTrade
+  # 连得上但一条不推（45s 0 条，同时 @trade 45s 195 条），故用 trade。
+  ws_stream: trade
+  http_proxy: ""                       # 生产留空；本机经代理填 http://127.0.0.1:4780
+
+store:
+  path: ""                             # 空 = 默认 data/market.db
+  tick_retention_hours: 168
+
+web:
+  host: 0.0.0.0
+  port: 8090                           # Flask 历史 API；看板 WebSocket 用 8091
+  auth_token: ""

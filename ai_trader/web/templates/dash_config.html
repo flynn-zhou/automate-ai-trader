@@ -1,0 +1,40 @@
+{% extends "dash_base.html" %}
+{% block title %}仓位配置<div class="card">
+  <a href="{{ url_for('dash.home') }}" class="k">← 回到总览（同一张仓位参数表）</a>
+</div>
+{% endblock %}
+{% block body %}
+{% if error %}<div class="card bad">{{ error }}</div>{% endif %}
+{% if saved %}<div class="card ok">{{ saved }}</div>{% endif %}
+
+<div class="card">
+  <form method="post" action="{{ url_for('dash.config_save') }}">
+    <div class="grid">
+      <div>
+        <label class="k">本金（USDT）</label>
+        <input name="capital" type="number" step="1" min="1"
+               value="{{ settings['sizing.capital'] }}">
+      </div>
+      <div>
+        <label class="k">每笔风险（%）</label>
+        <input name="risk_pct" type="number" step="0.5" min="0.1" max="100"
+               value="{{ settings['sizing.risk_pct'] }}">
+      </div>
+      <div>
+        <label class="k">杠杆（倍）</label>
+        <input name="leverage" type="number" step="1" min="1" max="125"
+               value="{{ settings['sizing.leverage'] }}">
+      </div>
+    </div>
+    <div class="row" style="margin-top:16px">
+      <button>保存并立即生效</button>
+      <span class="k">改动会写进数据库，引擎下一次决策就用新值，无需重启</span>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <div class="k" style="margin-bottom:8px">派生指标（服务端计算，前端不重算）</div>
+  {% include "_sizing_table.html" %}
+</div>
+{% endblock %}

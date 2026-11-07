@@ -1,0 +1,8 @@
+[Unit]
+Description=ai-trader health check (auto restart on failure)
+After=ai-trader.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/cryptobot/ai-trader/deploy/healthcheck.sh
+User=root

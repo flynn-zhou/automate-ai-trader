@@ -1,0 +1,16 @@
+[Unit]
+Description=ai-trader sentinel (independent watchdog + daily report)
+After=network.target
+
+[Service]
+Type=simple
+User=cryptobot
+WorkingDirectory=/home/cryptobot/ai-trader
+EnvironmentFile=-/etc/ai-trader/env
+Environment=PYTHONPATH=/home/cryptobot/ai-trader
+ExecStart=/home/cryptobot/ai-trader/.venv/bin/python -m ai_trader.sentinel_daemon --interval 300
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+{% extends "dash_base.html" %}
+{% block title %}准实时行情{% endblock %}
+{% block head %}
+<style>
+  #chart{width:100%;height:620px}
+  .iv{padding:6px 14px;border:1px solid var(--line);border-radius:6px;
+      background:transparent;color:var(--dim);cursor:pointer;font:inherit}
+  .iv.on{background:var(--accent);color:#0b0d12;border-color:var(--accent);font-weight:600}
+  .px{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+  .dl{font-size:13px;font-variant-numeric:tabular-nums}
+</style>
+{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="row">
+    <span class="k">周期</span>
+    <button class="iv on" data-iv="3m">3m</button>
+    <button class="iv" data-iv="15m">15m</button>
+    <button class="iv" data-iv="1h">1h</button>
+    <button id="refresh" style="margin-left:14px">刷新</button>
+    <span style="margin-left:auto;text-align:right">
+      <div id="last-price" class="px">--</div>
+      <div id="last-delta" class="dl">--</div>
+    </span>
+  </div>
+</div>
+
+{% include "_chart_body.html" %}
+<div class="card k"><span id="feed-status">读取中…</span></div>
+{% include "_chart_js.html" %}
+{% endblock %}

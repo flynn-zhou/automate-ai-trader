@@ -1,0 +1,12 @@
+# -*- coding: utf-8 -*-
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ai_trader.journal import Journal
+L = json.loads(r'''["这轮不是挑毛病挑出来的，是顺着「看板到底读了哪些字段」查出来的。","","=== 一、系统性核对前端字段 ===","","把 board.js 里所有 X.field 引用抽出来，和真实 /api/trade/state 的 payload 对照。","一度以为 st.error 是缺字段，查下去发现后端出错时确实返回 {\"error\":...}（404），","board.js 的判断是对的——虚惊。","","但顺着查出一个真的：**last_error 没有任何地方显示**。","","=== 二、真缺陷：引擎报错大屏一个字都不显示 ===","","last_error 由引擎两处写入：","    engine.py:337  主循环步骤异常（每 3 秒的 _step 抛了）","    engine.py:158  实盘对账失败（不确定交易所里有没有仓）","并且在 payload 里暴露（engine.py:1441）。而：","","    board.js      从来没读过它","    board.html    里没有任何错误显示元素","","于是最糟的情况在用户眼里和正常完全一样：","引擎每 3 秒抛一次异常、策略停止评估、决策不再更新，","而大屏上行情还在跳、均线还在显示、文案还在写「空仓等待」。","**用户会以为系统在安静地等信号。**","","这违反项目自己写下的原则：监控发现了问题却不显示，等于没有监控。","（第 75 轮记录过类似事故：进程活着但停工，止损永远不再评估。）","","=== 三、修法：光显示还不够，必须能分辨新旧 ===","","第二个缺陷是 last_error 从不清除。一旦写入就永久留着，","于是三天前的网络抖动和正在发生的崩溃在 API 里长得一模一样。","如果直接画成红条，它会永远红着，用户很快学会无视它——那等于没显示。","","所以加时间戳，并按新旧分级：","","    <10 分钟   「引擎报错」红条，带「刚刚」","    >=10 分钟  「历史错误」淡色条，带「12 分钟前 / 5 小时前 / 2 天前」","    没有错误   完全不占位（常驻空白条会让用户学会无视它）","    只有文本没时间戳  「历史错误 / 时间未知」（保守处理，不冒充当前故障）","","改动：engine.py 加 last_error_ts（两处写入点都记时间）；","state() 暴露 last_error_ts；board.html 加 #errBar；board.js 加 renderError()。","","=== 四、测试与变异 ===","","新增 tests/test_board_error_bar.py（4 条，用真 node + DOM 桩跑 board.js）","和 tests/test_engine_error_ts.py（3 条）。","","顺手改进了 harness：以前只 dump textContent 和 innerHTML，","而「当前错误 vs 历史错误」是靠 className 区分的——","不抓 className 的话两种状态在断言里一模一样。现在一并 dump。","","7 条变异全部变红：","  state() 不报错误时间 / 步骤异常不记时间 / 对账失败不记时间","  根本不渲染错误条 / 永远是历史样式 / 永远是当前样式 / 没有错误也渲染","","=== 五、验证 ===","","全量 428 条全绿（421 -> 428，两个新文件共 7 条）。","实测渲染：无错误不占位；当前错误红条带「刚刚」；","12 分钟/5 小时/2 天分别显示对应文案；无时间戳显示「时间未知」。","","账户仍未到账（现货 USDT = 0）。"]''')
+meta = json.loads(r'''{"round":86,"theme":"引擎报错大屏从不显示；加时间戳并按新旧分级显示，使其可分辨","finding":"last_error 由 engine.py:337/158 写入并暴露在 payload，但 board.js 从不读取、board.html 无任何错误元素","impact":"引擎每 3s 抛异常时，大屏看起来与「安静等待」完全一致","second_defect":"last_error 从不清除，旧错误与当前错误无法区分","fix":["engine.py 加 last_error_ts（两处写入点）","state() 暴露 last_error_ts","board.html 加 #errBar","board.js 加 renderError()，<10min 红条/更早淡显/无错不占位"],"harness_change":"board_harness.js 现在同时 dump className（当前/历史靠 class 区分，只比文字区分不了）","tests":{"total":428,"new":7,"mutation":"7/7 红"},"account_state":{"spot_usdt":0}}''')
+J = Journal('data/market_trade.db')
+J.start()
+J.add('info', u'引擎报错大屏从不显示；加时间戳按新旧分级显示',
+      chr(10).join(L), json.dumps(meta, ensure_ascii=False))
+print('journal ok')
+J.stop()

@@ -1,0 +1,29 @@
+{# 仓位参数表。总览与仓位配置页共用，避免两处各写一份后漂移。 #}
+{# 全部由 sizing.derive() 在服务端算好，前端不重算 —— 页面显示的数
+   和闸门实际用的必须是同一份代码算出来的。 #}
+<table>
+  <thead><tr><th>项目</th><th>数值</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>本金</td><td class="num">{{ "%g"|format(sz.capital) }} U</td>
+        <td class="k">账户计划投入</td></tr>
+    <tr><td>每笔风险</td><td class="num">{{ "%g"|format(sz.risk_pct) }} %</td>
+        <td class="k">单笔最多亏本金的比例</td></tr>
+    <tr><td>杠杆上限</td><td class="num">{{ "%g"|format(sz.leverage) }} x</td>
+        <td class="k">信号可以建议更高，闸门按这个拦</td></tr>
+    <tr><td>每笔风险 R</td><td class="num">{{ "%g"|format(sz.risk_per_trade) }} U</td>
+        <td class="k">本金 x 风险%，向下取整</td></tr>
+    <tr><td>可连亏</td><td class="num">{{ sz.lives }} 次</td>
+        <td class="k">本金 / R</td></tr>
+    <tr><td>爆仓距离</td><td class="num">{{ "%.3f"|format(sz.liq_distance_pct) }} %</td>
+        <td class="k">1/杠杆 - 维持保证金率</td></tr>
+    <tr><td>止损距离上限</td><td class="num">{{ "%.3f"|format(sz.max_stop_distance_pct) }} %</td>
+        <td class="k">爆仓距离 / 2.5 —— 超过它，爆仓会先于止损</td></tr>
+    <tr><td>单笔保证金上限</td><td class="num">{{ "%g"|format(sz.margin_cap_amount) }} U</td>
+        <td class="k">本金 x 保证金占比上限</td></tr>
+  </tbody>
+</table>
+<p class="k" style="margin:6px 0 0">
+  以上全部由公式算出，改上面三个输入会立刻变。
+  止损距离<b>上限</b>是硬约束；真实止损距离要等开仓信号与真实成交价出来才算得出，
+  由闸门在开仓前做最后一道校验。
+</p>

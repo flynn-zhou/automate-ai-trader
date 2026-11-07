@@ -1,0 +1,218 @@
+{% extends "dash_base.html" %}
+{% block title %}区间演化{% endblock %}
+{% block head %}
+<script src="/static/vendor/echarts.min.js"></script>
+<style>
+  .px{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.15}
+  .dl{font-size:12px;font-variant-numeric:tabular-nums}
+</style>
+{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="row">
+    <div><label class="k">品种</label>
+      <input id="symbol" value="BTCUSDT" style="width:130px"></div>
+    <div><label class="k">天数</label>
+      <select id="days" style="background:#0f1117;color:var(--txt);border:1px solid var(--line);
+              border-radius:6px;padding:8px 10px;font-size:14px">
+        <option>7</option><option selected>14</option><option>30</option>
+        <option>60</option><option>120</option>
+      </select></div>
+    <button id="go" style="margin-top:18px">刷新</button>
+    <span style="margin-left:auto;text-align:right">
+      <div id="last-price" class="px">--</div>
+      <div id="last-delta" class="dl">--</div>
+    </span>
+  </div>
+</div>
+
+<div class="card"><div id="chart" style="width:100%;height:580px"></div></div>
+<div id="js-err" class="card" style="display:none;border-color:#e05c6a;color:#e05c6a;
+     white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px"></div>
+<script>
+// 图表挂掉不能静默白屏：把异常顶到页面上，否则只能翻控制台。
+window.onerror = function(msg, src, line, col, err){
+  var d = document.getElementById("js-err");
+  if (!d) return;
+  d.style.display = "block";
+  d.textContent = "前端异常：" + msg + "  @" + String(src).split("/").pop() + ":" + line;
+};
+</script>
+
+<div class="card k"><span id="msg">读取中…</span></div>
+
+<script>
+(function(){
+  "use strict";
+  var TOKEN = {{ token|tojson }};
+  var chart = echarts.init(document.getElementById("chart"), null, {renderer:"canvas"});
+  function $(id){ return document.getElementById(id); }
+  function fmt(v,d){ return (v==null||isNaN(v)) ? "--" : Number(v).toFixed(d==null?1:d); }
+  function q(u){ return u + (u.indexOf("?")>=0?"&":"?") + "token=" + encodeURIComponent(TOKEN); }
+
+  function ema(closes, period){
+    // 标准 EMA，α=2/(N+1)，种子用第一根收盘价。
+    // 未收盘那根跟着实时价动是**正确**行为：EMA 是价格变换，不是模型输出。
+    var a = 2/(period+1), out = [], e = null;
+    for (var i=0;i<closes.length;i++){
+      var v = closes[i];
+      e = (e===null) ? v : v*a + e*(1-a);
+      out.push(Math.round(e*10)/10);
+    }
+    return out;
+  }
+
+  function load(){
+    var sym = $("symbol").value.trim().toUpperCase();
+    var days = $("days").value;
+    $("msg").textContent = "读取中…";
+    // cache:"no-store" + 时间戳：不这样做浏览器会拿自己的缓存，
+    // 表现为"数据明明在动，页面上却一动不动"。
+    fetch(q("/api/range/evo?symbol="+encodeURIComponent(sym)+"&days="+days+"&_t="+Date.now()),
+          {cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok){ $("msg").textContent = d.error || "读取失败"; return; }
+        if (d.empty){ $("msg").textContent = d.hint || "该品种暂无区间数据"; chart.clear(); return; }
+
+        // bars_1h 行 = (ts, ts8, o, h, l, c, v)
+        //   => b[0]=ts  b[1]=ts8字符串  b[2]=open  b[3]=high  b[4]=low  b[5]=close
+        // 注意 high 在 low **前面**。ECharts 蜡烛图要的是 [开, 收, 低, 高]，
+        // 这里顺序写反了不会报错，只会把所有蜡烛的上下影线画颠倒。
+        var raw = d.bars.slice();
+        raw.sort(function(x,y){ return x[0]-y[0]; });
+        var cats = raw.map(function(b){ return b[1].slice(5, 16); });
+        var ohlc = raw.map(function(b){ return [b[2], b[5], b[4], b[3]]; });
+        var closes = raw.map(function(b){ return b[5]; });
+        var ema20 = ema(closes, 20);
+
+        // 未完成的那根 1h：库里故意不写（见 range/live.py），由 API 现算附在 tail。
+        // 只在它确实比最后一根已收盘更新时才追加 —— 否则会和时间轴错位。
+        var liveIdx = -1, liveBar = null;
+        if (d.tail && raw.length && d.tail.ts > raw[raw.length-1][0]) {
+          var tb = d.tail;
+          liveBar = tb;
+          liveIdx = cats.length;
+          cats.push(tb.ts_h.slice(5, 16) + " ●");
+          ohlc.push([tb.ohlc[0], tb.ohlc[3], tb.ohlc[2], tb.ohlc[1]]);
+          closes.push(tb.ohlc[3]);
+        }
+
+        // 最新 K 与价格刻度之间留出空隙：在末尾补 4 个空分类。
+        // 这是旧版验收过的做法（page_range.html 原注释）：
+        //   "右侧留白：在「未收盘蜡烛」之后再补 2 个空分类，避免最新一根贴住网格右缘。"
+        // 调 grid.right 是错的 —— 那只改变绘图区宽度，最新一根依旧贴在右缘。
+        // 空占位必须用 '-' 不能用 null：candlestick 遇 null 会抛 TypeError 并静默白屏。
+        for (var pi = 0; pi < 4; pi++) { cats.push(''); ohlc.push('-'); }
+
+        // states 列: [ts, ts_h, soft_up, soft_dn, hard_up, hard_dn, key, family, segment, dir, tag]
+        var stMap = {};
+        d.states.forEach(function(s){ stMap[s[0]] = s; });
+        function col(idx){
+          var arr = new Array(cats.length).fill(null);
+          for (var i = 0; i < raw.length; i++) {
+            var s = stMap[raw[i][0]];
+            if (s && s[idx] != null) arr[i] = s[idx];
+          }
+          // 四线延续到未收盘那根（表示"该水平当前仍生效"）。
+          // 值取最后一根**已收盘**的，绝不按实时价外推 —— 那就是造假。
+          if (liveIdx >= 0 && d.states.length) {
+            var ls = d.states[d.states.length - 1];
+            if (ls && ls[idx] != null) arr[liveIdx] = ls[idx];
+          }
+          return arr;
+        }
+
+        // 最新价：优先用未完成那根的收盘（它等于当前成交价）。
+        // 不能用 raw[raw.length-1] —— 那是**已收盘**的上一个小时，和总览的现价
+        // 天然差一整个小时。这正是"两个页面价格对不上"的原因。
+        var closedLast = raw[raw.length - 1];
+        var closedPrev = raw[raw.length - 2];
+        var priceNow = liveBar ? liveBar.ohlc[3] : (closedLast ? closedLast[5] : null);
+        var pricePrev = liveBar ? (closedLast ? closedLast[5] : null)
+                                : (closedPrev ? closedPrev[5] : null);
+        var upCol = (pricePrev && priceNow != null && priceNow < pricePrev)
+                    ? "#ef4444" : "#22c55e";
+
+        function line(name, data, color, width, dash){
+          return {name:name, type:"line", data:data, connectNulls:false,
+                  showSymbol:false, animation:false, z:5,
+                  lineStyle:{width:width||1.2, color:color, type:dash||"solid",
+                             opacity:0.95},
+                  itemStyle:{color:color}};
+        }
+
+        // 保留用户当前的缩放窗口：每 3 秒重设一次 option，
+        // 不保存/恢复 dataZoom 的话窗口会每次跳回默认，图看着在"抽动"。
+        var prevOpt = chart.getOption();
+        var z = (prevOpt && prevOpt.dataZoom && prevOpt.dataZoom[0])
+                ? [prevOpt.dataZoom[0].start, prevOpt.dataZoom[0].end] : null;
+
+        chart.setOption({
+          backgroundColor:"transparent", animation:false,
+          tooltip:{trigger:"axis", axisPointer:{type:"cross"},
+                   backgroundColor:"rgba(23,26,33,.95)", borderColor:"#2a2e37",
+                   textStyle:{color:"#e6e8eb", fontSize:12}},
+          legend:{data:["K线","EMA20","软上沿S↑","软下沿S↓","反向边界R↑","反向边界R↓","关键价K"],
+                  textStyle:{color:"#9aa1ac"}, top:6, itemWidth:14, itemHeight:8},
+          // right 必须留 72：yAxis 在右侧，标 "80232.7" 约需 55px，
+          // 留 18px 会被裁成两位数（就是之前只看到 "70" 的原因）。
+          grid:[{left:18, right:72, top:40, bottom:74}],
+          xAxis:{type:"category", data:cats, boundaryGap:true,
+                 axisLine:{lineStyle:{color:"#2a2e37"}},
+                 axisLabel:{color:"#9aa1ac", fontSize:11},
+                 splitLine:{show:false},
+                 axisPointer:{label:{backgroundColor:"#3b82f6"}}},
+          yAxis:{scale:true, position:"right",
+                 axisLine:{lineStyle:{color:"#2a2e37"}},
+                 axisLabel:{color:"#9aa1ac", fontSize:11, margin:10,
+                            formatter:function(v){ return Number(v).toFixed(1); }},
+                 splitLine:{lineStyle:{color:"rgba(42,46,55,.6)"}}},
+          dataZoom:[{type:"inside", xAxisIndex:0,
+                     start: z ? z[0] : Math.max(0, 100 - 12000/raw.length),
+                     end: z ? z[1] : 100},
+                    {type:"slider", xAxisIndex:0, height:22, bottom:12,
+                     backgroundColor:"#141821", borderColor:"#2a2e37",
+                     fillerColor:"rgba(59,130,246,.15)",
+                     handleStyle:{color:"#3b82f6"}, textStyle:{color:"#9aa1ac"}}],
+          series:[{
+            name:"K线", type:"candlestick", data:ohlc,
+            itemStyle:{color:"#22c55e", color0:"#ef4444",
+                       borderColor:"#22c55e", borderColor0:"#ef4444"},
+            // 当前价横向虚线。满屏四线里没有这条，很难判断现价相对边界的位置。
+            markLine:{silent:true, symbol:"none", animation:false,
+                      lineStyle:{color:upCol, type:"dashed", width:1.2, opacity:0.95},
+                      label:{show:false},
+                      data:[{yAxis:priceNow}]}
+          },
+          line("EMA20", liveIdx >= 0 ? ema20.concat(new Array(cats.length - ema20.length).fill(null)) : ema20, "#e8b44a", 1.6),
+          line("软上沿S↑", col(2), "#3b82f6", 1.2),
+          line("软下沿S↓", col(3), "#3b82f6", 1.2, "dashed"),
+          line("反向边界R↑", col(4), "#e05c6a", 1.4),
+          line("反向边界R↓", col(5), "#e05c6a", 1.4, "dashed"),
+          line("关键价K", col(6), "#9aa1ac", 1.0, "dotted")
+          ]
+        }, true);
+
+        $("last-price").textContent = fmt(priceNow);
+        $("last-price").style.color = upCol;
+        if (pricePrev){
+          var dv = priceNow-pricePrev, pct = dv/pricePrev*100;
+          $("last-delta").textContent = (dv>=0?"+":"")+fmt(dv)+"  ("+(dv>=0?"+":"")+fmt(pct,2)+"%)";
+          $("last-delta").style.color = dv>=0 ? "#22c55e" : "#ef4444";
+        }
+        $("msg").textContent = sym + " · " + raw.length + " 根 · " + d.events.length +
+          " 个事件 · EMA20 len=" + ema20.length + " 末值=" + fmt(ema20[ema20.length-1]);
+      })
+      .catch(function(e){ $("msg").textContent = "请求失败: "+e; });
+  }
+
+  $("go").onclick = load;
+  window.addEventListener("resize", function(){ chart.resize(); });
+  load();
+  // 每 3 秒重取：未收盘那根 1h 的 close 就是现价，不轮询它永远不动。
+  // 旧版就是这么做的（page_range.html：POLL_LIVE_MS = 3000）。
+  setInterval(function(){ load(); }, 3000);
+})();
+</script>
+{% endblock %}

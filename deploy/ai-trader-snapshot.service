@@ -1,0 +1,9 @@
+[Unit]
+Description=ai-trader state snapshot into research journal
+After=ai-trader.service
+
+[Service]
+Type=oneshot
+User=cryptobot
+WorkingDirectory=/home/cryptobot/ai-trader
+ExecStart=/home/cryptobot/ai-trader/.venv/bin/python tools/snapshot_state.py --journal

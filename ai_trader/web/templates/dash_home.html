@@ -1,0 +1,54 @@
+{% extends "dash_base.html" %}
+{% block title %}总览{% endblock %}
+{% block head %}
+<style>
+  #chart{width:100%;height:620px}
+  .iv{padding:6px 14px;border:1px solid var(--line);border-radius:6px;
+      background:transparent;color:var(--dim);cursor:pointer;font:inherit}
+  .iv.on{background:var(--accent);color:#0b0d12;border-color:var(--accent);font-weight:600}
+  .px{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+  .dl{font-size:13px;font-variant-numeric:tabular-nums}
+</style>
+{% endblock %}
+{% block body %}
+{# 原来有一格"最新价"，但它取的是服务端渲染那一刻的快照，
+   页面上的实时价在下面图表标题里每秒刷新——同一页两个价格，差几分钟，
+   看着就像"不动了"。删掉，只保留一个现价来源。 #}
+<div class="card">
+  <div class="grid">
+    <div><div class="k">数据源</div>
+      <div class="v {{ 'ok' if snap.src == 'WS' else 'warn' }}">{{ snap.src or '--' }}</div></div>
+    <div><div class="k">逐笔 WS</div>
+      <div class="v {{ 'ok' if snap.ws_connected else 'bad' }}">
+        {{ '已连接' if snap.ws_connected else '断开' }}</div></div>
+    <div><div class="k">下单模式</div>
+      <div class="v {{ 'ok' if shop_mode == 'live' else 'warn' }}">
+        {{ '实盘 live' if shop_mode == 'live' else '纸面 paper' }}</div></div>
+    <div><div class="k">策略 / 市场</div>
+      <div class="v">{{ shop_strategy }} / {{ shop_market }}</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <span class="k">周期</span>
+    <button class="iv on" data-iv="3m">3m</button>
+    <button class="iv" data-iv="15m">15m</button>
+    <button class="iv" data-iv="1h">1h</button>
+    <button id="refresh" style="margin-left:14px">刷新</button>
+    <span style="margin-left:auto;text-align:right">
+      <div id="last-price" class="px">--</div>
+      <div id="last-delta" class="dl">--</div>
+    </span>
+  </div>
+</div>
+
+{% include "_chart_body.html" %}
+<div class="card k"><span id="feed-status">读取中…</span></div>
+
+<div class="card">
+  <div class="k" style="margin-bottom:8px">仓位参数（数据库为准，改完立即生效）</div>
+  {% include "_sizing_table.html" %}
+</div>
+{% include "_chart_js.html" %}
+{% endblock %}

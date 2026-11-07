@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>区间演化 · v11 四线</title>
+<script src="/static/vendor/echarts.min.js"></script>
+<style>
+  :root { --bg:#0f1117; --panel:#171a23; --line:#2a2f3d; --txt:#d8dee9;
+          --dim:#8b95a7; --up:#e05c6a; --dn:#3aa675; --soft:#6ba3f0;
+          --hard:#e8b44a; --key:#9d7cf5; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:13px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; }
+  .nav a { color:var(--dim); text-decoration:none; margin-right:12px; }
+  .nav a:hover { color:var(--soft); }
+  .spacer { flex:1; }
+  input,select,button { background:var(--panel); color:var(--txt);
+      border:1px solid var(--line); border-radius:5px; padding:5px 9px;
+      font:inherit; }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--soft); }
+  #chart { height:calc(100vh - 190px); min-height:380px; }
+  #asof { border-top:1px solid var(--line); padding:10px 16px;
+          display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap; }
+  #asofResult { flex:1; min-width:320px; font-size:12px; color:var(--dim); }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:6px; padding:10px 12px; }
+  .kv { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
+        gap:6px 14px; }
+  .kv div span { color:var(--dim); }
+  .tag { display:inline-block; padding:1px 6px; border-radius:4px;
+         background:#242938; font-size:11px; }
+  .warn { color:var(--hard); }
+  .err { color:var(--up); }
+</style>
+</head>
+<body>
+<header>
+  <h1>区间演化 · v11 四线</h1>
+  <nav class="nav">
+    <a href="/">实时看板</a><a href="/range">区间演化</a><a href="/config">仓位配置</a>
+  </nav>
+  <span class="spacer"></span>
+  <label>品种 <input id="symbol" size="10" value="BTCUSDT"></label>
+  <label>天数 <select id="days">
+    <option value="3">3</option><option value="7">7</option>
+    <option value="14" selected>14</option><option value="30">30</option>
+    <option value="60">60</option><option value="120">120</option>
+  </select></label>
+  <button id="reload">刷新</button>
+</header>
+
+<div id="chart"></div>
+
+<div id="asof">
+  <div style="display:flex;gap:8px;align-items:center;">
+    <strong>按时间看区间</strong>
+    <input id="when" type="datetime-local" step="3600">
+    <button id="ask">查询</button>
+  </div>
+  <div id="asofResult">给任意时刻，返回那一刻的区间状态与对应 1h K 线。</div>
+</div>
+
+<script>
+// 令牌从地址栏带进来（与看板一致），所有 /api 请求都附上
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const q = (p) => p + (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+
+const fmt = (v, n) => (v === null || v === undefined) ? '—' :
+      Number(v).toLocaleString('en-US', {minimumFractionDigits:n, maximumFractionDigits:n});
+
+let chart = echarts.init(document.getElementById('chart'), null, {renderer:'canvas'});
+addEventListener('resize', () => chart.resize());
+
+async function load() {
+  const sym = document.getElementById('symbol').value.trim() || 'BTCUSDT';
+  const days = document.getElementById('days').value;
+  chart.showLoading({text:'读取中', color:'#6ba3f0', textColor:'#8b95a7',
+                     maskColor:'rgba(15,17,23,.7)'});
+  let d;
+  try {
+    const r = await fetch(q('/api/range/evo?symbol=' + encodeURIComponent(sym) + '&days=' + days));
+    d = await r.json();
+  } catch (e) {
+    chart.hideLoading();
+    document.getElementById('asofResult').innerHTML =
+      '<span class="err">请求失败：' + e + '</span>';
+    return;
+  }
+  chart.hideLoading();
+  if (!d.ok) { document.getElementById('asofResult').innerHTML =
+      '<span class="err">' + (d.error || '未知错误') + '</span>'; return; }
+  if (d.empty) { chart.clear(); chart.setOption({title:{text:d.hint,
+      left:'center', top:'middle', textStyle:{color:'#8b95a7', fontSize:13}}}); return; }
+
+  render(d);
+}
+
+function render(d) {
+  const bars = d.bars, states = d.states, events = d.events;
+  const tss = Array.from(new Set(bars.map(b => b[0]).concat(states.map(s => s[0])))).sort((a,b)=>a-b);
+  const idx = new Map(tss.map((t,i)=>[t,i]));
+  const label = (t) => {
+    const s = states.find(x => x[0] === t) || bars.find(x => x[0] === t);
+    return s ? s[1] : '';
+  };
+  const axis = tss.map(label);
+
+  // 蜡烛：[open, close, low, high]
+  const candle = tss.map(t => {
+    const b = bars.find(x => x[0] === t);
+    return b ? [b[2], b[5], b[4], b[3]] : [null,null,null,null];
+  });
+
+  // 四条线：该根没有这条边界时必须是 null，配合 connectNulls:false 断线。
+  // 绝不能填 0 或前值——那是伪造数据（老项目踩过）。
+  const lineOf = (col) => tss.map(t => {
+    const s = states.find(x => x[0] === t);
+    if (!s) return null;
+    const v = s[col];
+    return (v === null || v === undefined) ? null : v;
+  });
+  // states 列序: 0 ts,1 ts_h,2 soft_up,3 soft_dn,4 hard_up,5 hard_dn,6 v11_key,7 fam,8 seg,9 dir,10 tag
+  const series = [
+    { name:'K线', type:'candlestick', data:candle,
+      itemStyle:{color:'#e05c6a', color0:'#3aa675',
+                 borderColor:'#e05c6a', borderColor0:'#3aa675'} },
+    { name:'软上沿 S↑', type:'line', data:lineOf(2), connectNulls:false,
+      symbol:'none', lineStyle:{width:1.4, color:'#6ba3f0'} },
+    { name:'软下沿 S↓', type:'line', data:lineOf(3), connectNulls:false,
+      symbol:'none', lineStyle:{width:1.4, color:'#4a7fc1', type:'dashed'} },
+    { name:'反向边界 R↑', type:'line', data:lineOf(4), connectNulls:false,
+      symbol:'none', lineStyle:{width:1.8, color:'#e8b44a'} },
+    { name:'反向边界 R↓', type:'line', data:lineOf(5), connectNulls:false,
+      symbol:'none', lineStyle:{width:1.8, color:'#e8b44a', type:'dashed'} },
+    { name:'关键价 K', type:'line', data:lineOf(6), connectNulls:false,
+      symbol:'none', lineStyle:{width:1, color:'#9d7cf5', opacity:.85} },
+  ];
+
+  // 事件标记：只标离散事件，不要把每根都标满
+  const marks = events.filter(e => idx.has(e[0])).map(e => ({
+    name: e[2], coord:[idx.get(e[0]), e[4]],
+    value: e[2], itemStyle:{color:'#d8dee9'},
+    label:{show:false}, tooltip:{formatter:() => e[2] + ' @ ' + e[1]},
+  }));
+  if (marks.length) {
+    series[0].markPoint = { data: marks, symbolSize: 6,
+      label:{show:false}, silent:false };
+  }
+
+  chart.setOption({
+    backgroundColor:'transparent',
+    animation:false,
+    legend:{ top:4, textStyle:{color:'#8b95a7', fontSize:11},
+             data:series.map(s=>s.name) },
+    tooltip:{ trigger:'axis', axisPointer:{type:'cross'},
+      backgroundColor:'#171a23', borderColor:'#2a2f3d',
+      textStyle:{color:'#d8dee9', fontSize:11} },
+    grid:{ left:64, right:76, top:38, bottom:56 },
+    xAxis:{ type:'category', data:axis, boundaryGap:true,
+      axisLine:{lineStyle:{color:'#2a2f3d'}},
+      axisLabel:{color:'#8b95a7', fontSize:10, hideOverlap:true},
+      splitLine:{show:false} },
+    yAxis:{ scale:true, position:'right',
+      axisLine:{lineStyle:{color:'#2a2f3d'}},
+      axisLabel:{color:'#8b95a7', fontSize:10,
+                 formatter:(v)=>v.toLocaleString('en-US')},
+      splitLine:{lineStyle:{color:'#1e222d'}} },
+    dataZoom:[{type:'inside'}, {type:'slider', height:16, bottom:12,
+      backgroundColor:'#171a23', borderColor:'#2a2f3d',
+      fillerColor:'rgba(107,163,240,.12)',
+      handleStyle:{color:'#6ba3f0'},
+      textStyle:{color:'#8b95a7', fontSize:10}}],
+    series,
+  }, true);
+}
+
+document.getElementById('reload').onclick = load;
+
+document.getElementById('ask').onclick = async () => {
+  const raw = document.getElementById('when').value;   // 'YYYY-MM-DDTHH:MM'
+  const box = document.getElementById('asofResult');
+  if (!raw) { box.innerHTML = '<span class="warn">请先选一个时间</span>'; return; }
+  const when = raw.replace('T', ' ');
+  const sym = document.getElementById('symbol').value.trim() || 'BTCUSDT';
+  box.innerHTML = '查询中…';
+  try {
+    const r = await fetch(q('/api/range/asof?symbol=' + encodeURIComponent(sym) +
+                            '&when=' + encodeURIComponent(when)));
+    const d = await r.json();
+    if (!d.ok) { box.innerHTML = '<span class="err">' + (d.error||'无数据') + '</span>'; return; }
+    const s = d.state, b = s.bar || {};
+    const dirTxt = s.direction === 'UP' ? '上涨区间' :
+                   s.direction === 'DOWN' ? '下跌区间' : (s.direction || '未成形');
+    box.innerHTML = '<div class="card">' +
+      '<div style="margin-bottom:6px;"><strong>' + s.ts_h + '</strong> ' +
+        '<span class="tag">' + dirTxt + '</span> ' +
+        '<span class="tag">' + (s.label || '—') + '</span> ' +
+        '<span class="tag">' + (s.tag || '—') + '</span></div>' +
+      '<div class="kv">' +
+        '<div><span>软上沿 S↑</span><br>' + fmt(s.soft_up,1) + '</div>' +
+        '<div><span>软下沿 S↓</span><br>' + fmt(s.soft_dn,1) + '</div>' +
+        '<div><span>反向边界 R↑</span><br>' + fmt(s.hard_up,1) + '</div>' +
+        '<div><span>反向边界 R↓</span><br>' + fmt(s.hard_dn,1) + '</div>' +
+        '<div><span>关键价 K</span><br>' + fmt(s.key,1) + '</div>' +
+        '<div><span>1h 收盘</span><br>' + fmt(b.close,1) + '</div>' +
+        '<div><span>1h 高/低</span><br>' + fmt(b.high,1) + ' / ' + fmt(b.low,1) + '</div>' +
+      '</div></div>';
+  } catch (e) {
+    box.innerHTML = '<span class="err">请求失败：' + e + '</span>';
+  }
+};
+
+// 默认把 as-of 输入框设成最近一个整点（北京时区由浏览器本地时区给出）
+(function initWhen(){
+  const d = new Date(); d.setMinutes(0,0,0);
+  const p = (n) => String(n).padStart(2,'0');
+  document.getElementById('when').value =
+    d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) +
+    'T' + p(d.getHours()) + ':00';
+})();
+
+load();
+</script>
+</body>
+</html>

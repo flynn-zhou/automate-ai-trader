@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 运行时数据：绝不入库 ----
+# 里面是行情/交易库，动辄几十 MB，而且含真实成交与账户状态。
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.png
+data/*.csv
+data/*.json
+logs/
+
+# ---- 凭证：绝不入库 ----
+config/.env
+*.pem
+*.key
+.env
+.env.*
+!deploy/env.server.example
+
+# ---- 编辑器/系统 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- 备份文件（改代码时留的）----
+*.bak
+*.bak-*
+*.orig
+
+# ---- 工具归档：历史脚本，保留但默认不入库 ----
+# 需要时用 git add -f 单独纳入。
+_archive/

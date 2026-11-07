@@ -1,0 +1,19 @@
+[Unit]
+Description=automate-ai-trader (3s market feed + realtime board)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cryptobot
+Group=cryptobot
+WorkingDirectory=/home/cryptobot/ai-trader
+EnvironmentFile=-/etc/ai-trader/env
+ExecStart=/home/cryptobot/ai-trader/.venv/bin/python -m ai_trader.main
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/cryptobot/ai-trader/logs/ai-trader.log
+StandardError=append:/home/cryptobot/ai-trader/logs/ai-trader.log
+
+[Install]
+WantedBy=multi-user.target

@@ -147,34 +147,16 @@ k2 明细（品种 / 周期 / 行数）：
 2. 实时流的畸形数据会被丢弃并打 WARNING，日志里那种
    「丢弃畸形成交(第 N 条): p=0 q=0 X=NA」是币安推送的空数据，属正常防护，不用管。
 
-## 五、部署流程（照做，别自创）
+## 五、部署流程
 
-    # 1 打包（data/ 绝对不能进去）
-    tar -czf D:/workspace/ai-trader-dist.tar.gz \
-        --exclude=__pycache__ --exclude=live_state.json \
-        -C D:/workspace/automate-ai-trader \
-        ai_trader tests tools deploy config docs HANDOFF.md DECISION_MARKET.md
+> **已迁移到 `docs/DEPLOY.md`，那里是唯一权威。**
+>
+> 本节只留一句话指针，原因是旧内容有三处与服务器实测不符
+>（四个 systemd 单元并非全 active、健康检查走 cron 不走 timer、
+>install_server.sh 的默认 env 与生产不符），
+>留着会误导。完整流程、四条铁律、回滚、核对清单都在 DEPLOY.md。
 
-    # 2 传
-    scp -i D:/workspace/automate-k-trader.pem -P 2222 \
-        D:/workspace/ai-trader-dist.tar.gz root@127.0.0.1:/tmp/
-
-    # 3 解包 + 改属主
-    ssh -i ... -p 2222 root@127.0.0.1 "cd /home/cryptobot/ai-trader && \
-        tar -xzf /tmp/ai-trader-dist.tar.gz && \
-        chown -R cryptobot:cryptobot ai_trader tests tools deploy config docs"
-
-    # 4 md5 逐个比对（**服务 active 不等于部署成功**）
-    md5sum <改动的每个文件>
-    Get-FileHash <本地文件> -Algorithm MD5
-
-    # 5 重启并验证
-    systemctl restart ai-trader
-    ./.venv/bin/python tools/verify_alive.py
-
-**密钥不进仓库**：需要时暂存到 D:\workspace\_k.tmp 和 /tmp/_k2.tmp，
-合并进 /etc/ai-trader/env（600）后立刻删除。
-
+    docs/DEPLOY.md
 ## 六、PowerShell 侧的坑（会浪费很多时间）
 
 1. **不要往 ssh 命令里塞多行 Python**（`ssh host \"python3 -c '<多行>'\"`）——

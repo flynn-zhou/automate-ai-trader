@@ -55,15 +55,23 @@ def test_kline_evolution_design_is_marked_draft():
     src = _read("docs", "K线演化-设计讨论稿.md")
     assert "未定稿" in src, "没标注未定稿"
     assert "待定" in src, "没把待定项列出来"
-    # 核心：路径依赖，不能重算单根
-    assert "prev_event" in src, "缺 prev_event —— 这是「要看前一根才知道这根」的落地形式"
-    assert "since_event_idx" in src
-    # 意图必须是转移标签，不许自由文本
-    assert "转移" in src
-    # 独有的数据优势要写进去，否则等于放弃长处
-    assert "3s" in src and "is_buy" in src, "没把 3s 逐笔这个独有优势写进去"
-    # 周期对齐的坑必须写清
-    assert "15m" in src, "没写区间演化跑在 15m 这件事"
+    # 核心概念：观察线，不是支撑线
+    assert "观察线" in src, "缺观察线这个概念 —— 这是整个能力的定位"
+    assert "不是支撑" in src or "支撑不是线的属性" in src, \
+        "没写清观察线与支撑线的区别"
+    # 每条线必须带自己的周期，否则 EMA200(3m) 和 EMA200(1h) 会混成一个
+    assert "自己的周期" in src
+    # 路径依赖：存上一件同类事件，不是前一根
+    assert "since_last" in src, "缺 since_last_* —— 动态回溯的落地形式"
+    # 允许无意义，否则会给 neutral 的 K 强行贴标签
+    assert "neutral" in src
+    # 不挂区间演化
+    assert "不挂区间演化" in src or "只是观察位之一" in src, \
+        "没写清「区间演化只是一维、不是框架」"
+    # 防偷未来
+    assert "at_bar" in src and "forward" in src, "没把当下读数与事后确认隔开"
+    # 独有的数据优势
+    assert "3s" in src and "is_buy" in src
     # 口径与判断标准必须分开
     assert "口径" in src and "判断标准" in src
 

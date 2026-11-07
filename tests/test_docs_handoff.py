@@ -51,25 +51,34 @@ def test_old_handoff_archived_with_warning():
         "剥头皮 B 路径的结论没保留"
 
 
-def test_kline_evolution_design_is_marked_draft():
+def test_kline_evolution_design_is_finalized():
+    """设计已定稿，必须能直接照做；不再是讨论稿。"""
     src = _read("docs", "K线演化-设计讨论稿.md")
-    assert "未定稿" in src, "没标注未定稿"
-    assert "待定" in src, "没把待定项列出来"
+    assert "定稿" in src, "没标注已定稿"
+    # 定稿就得有实现顺序和验收标准，否则没法开工
+    assert "实现顺序" in src
+    assert "验收" in src
     # 核心概念：观察线，不是支撑线
     assert "观察线" in src, "缺观察线这个概念 —— 这是整个能力的定位"
     assert "不是支撑" in src or "支撑不是线的属性" in src, \
         "没写清观察线与支撑线的区别"
     # 每条线必须带自己的周期，否则 EMA200(3m) 和 EMA200(1h) 会混成一个
     assert "自己的周期" in src
-    # 路径依赖：存上一件同类事件，不是前一根
-    assert "since_last" in src, "缺 since_last_* —— 动态回溯的落地形式"
+    # 路径依赖：存「上一件同类事件」而不是前一根
+    assert "since_event_idx" in src, "缺 since_event_idx —— 动态回溯的落地形式"
+    assert "prev_event" in src, "缺 prev_event"
+    assert "上一件同类事件" in src, "没写清回溯不是定死前 N 根"
     # 允许无意义，否则会给 neutral 的 K 强行贴标签
     assert "neutral" in src
     # 不挂区间演化
     assert "不挂区间演化" in src or "只是观察位之一" in src, \
         "没写清「区间演化只是一维、不是框架」"
+    assert "四维" in src and "一维" in src, "四维读数与「区间演化只是一维」的表述丢了"
     # 防偷未来
-    assert "at_bar" in src and "forward" in src, "没把当下读数与事后确认隔开"
+    # v3 用三张表物理隔开，不再用 at_bar/forward 这两个字段名
+    assert "kbar_forward" in src, "没有事后确认的独立表"
+    assert "物理隔开" in src or "分三张表" in src, "没把当下读数与事后确认隔开"
+    assert "禁止参与当下判定" in src
     # 独有的数据优势
     assert "3s" in src and "is_buy" in src
     # 口径与判断标准必须分开
@@ -81,3 +90,32 @@ def test_kline_design_supersedes_old_draft():
     assert not os.path.isfile(_p("docs", "K线识别-讨论稿.md")), \
         "旧讨论稿还在，会和新稿冲突"
     assert os.path.isfile(_p("docs", "K线演化-设计讨论稿.md"))
+
+def test_design_doc_has_locked_decisions():
+    """三条决策用户已拍定，文档必须把它们写成定稿而不是待定。"""
+    src = _read("docs", "K线演化-设计讨论稿.md")
+    assert "已定事项" in src or "已定稿" in src, "没写成定稿"
+    assert "kbar_evolution" in src and "kbar_reaction" in src and "kbar_forward" in src
+    assert "结构位" in src, "第一批观察线漏了结构位（用户明确要求加）"
+    assert "(fam, seg)" in src or "fam, seg" in src, "触碰重置规则没写清"
+    # 周期必须是 1h，v2 写错过
+    assert "区间演化的周期是 1h" in src or "1h 周期的观察线" in src, \
+        "区间演化周期没写对（必须是 1h，不是 15m）"
+
+
+def test_design_doc_separates_at_bar_and_forward():
+    """当下读数与事后确认必须物理隔开，且明确禁止混用。"""
+    src = _read("docs", "K线演化-设计讨论稿.md")
+    assert "禁止参与当下判定" in src
+    assert "偷未来" in src or "偷看未来" in src
+
+
+def test_next_session_prompt_exists():
+    src = _read("docs", "NEXT-SESSION-PROMPT.md")
+    assert len(src.splitlines()) > 30
+    # 必须直接指派开发任务，而不是继续讨论
+    assert "实现" in src
+    assert "K线演化-设计讨论稿.md" in src
+    # 必须带上探针优先和只读生产库两条硬纪律
+    assert "探针" in src
+    assert "只读" in src

@@ -38,4 +38,9 @@ Thumbs.db
 
 # ---- 工具归档：历史脚本，保留但默认不入库 ----
 # 需要时用 git add -f 单独纳入。
-_archive/
+# 唯独 docs_outdated 例外：那里是【已经作废的规范】，
+# 必须入库才能让下一个会话看到"这份过期了、别按它读"。
+# 只放本地等于把知情的成本转嫁给未来的人。
+_archive/*
+!_archive/docs_outdated/
+!_archive/docs_outdated/**

@@ -4,6 +4,15 @@
 
     docs/HANDOFF-NEXT-SESSION.md
 
+## 历史日志（拆分了）
+
+原来的 1066 行 `HANDOFF.md` 已按阶段拆进 `docs/handoff/`，**正文一字未改**，
+根目录的 `HANDOFF.md` 现在只是一张指针表。
+
+- 只想看现状 → `docs/handoff/00-系统现状.md`
+- 想考古某条结论 → `docs/handoff/` 里按主题挑，编号跳跃是正常的
+- 拆分逻辑与校验 → `tools/split_handoff.py`（可重跑，会断言 1..N 行无缝覆盖）
+
 ## 全部文档
 
 | 文件 | 行数 | 作用 | 什么时候读 |
@@ -12,9 +21,14 @@
 | docs/INFRA.md | ~190 | 服务器、隧道、端口、**行情数据位置**、部署、PowerShell 坑 | 连不上或找不到数据 |
 | docs/DISCUSSIONS.md | ~286 | 最近四轮讨论：用户的问题 + 我的做法与结果，含我被证伪的想法 | 想知道为什么走这条路 |
 | CHECKLIST.md | 短 | 一条命令核对系统还活着 | 每次接手先跑 |
-| HANDOFF.md | 1065 | 历史开发日志，按轮次编号 | 考古某条结论怎么来的 |
+| **docs/handoff/** | 12 份 | 历史开发日志，按轮次编号拆分 | 考古某条结论怎么来的 |
+| docs/handoff/00-系统现状.md | 87 | 活文档：状态 / 下一步 / 参数 | 每次接手 |
 | REQUIREMENTS.md | — | 冻结的十条基线 + k-trader 反模式清单 | 改动前对照 |
 | DECISION_MARKET.md | 178 | 市场层面的决策记录 | 想改品种/周期时 |
+| _archive/docs_outdated/ | 2 | **已作废的规范**（v10 三线方案） | 只有想搞清"为什么废掉"时 |
+
+> ⚠️ `_archive/docs_outdated/` 里的东西**不要当现状引用**。那里的 v10 规范
+> 已被 v11 四线取代，按它读代码会对不上号。留着是为了记录推导过程。
 
 ## 三十秒上手
 

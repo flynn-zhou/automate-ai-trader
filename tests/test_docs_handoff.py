@@ -51,10 +51,25 @@ def test_old_handoff_archived_with_warning():
         "剥头皮 B 路径的结论没保留"
 
 
-def test_kline_discussion_is_marked_draft():
-    src = _read("docs", "K线识别-讨论稿.md")
-    assert "未定稿" in src or "讨论稿" in src
-    assert "五个问题" in src or "待定" in src, "没把待定问题列出来"
-    # 核心纪律：不可标注的东西必须转成可测的
-    assert "beta" in src.lower(), "没提 beta 剥离"
-    assert "3s" in src, "没把 3s 逐笔这个独有优势写进去"
+def test_kline_evolution_design_is_marked_draft():
+    src = _read("docs", "K线演化-设计讨论稿.md")
+    assert "未定稿" in src, "没标注未定稿"
+    assert "待定" in src, "没把待定项列出来"
+    # 核心：路径依赖，不能重算单根
+    assert "prev_event" in src, "缺 prev_event —— 这是「要看前一根才知道这根」的落地形式"
+    assert "since_event_idx" in src
+    # 意图必须是转移标签，不许自由文本
+    assert "转移" in src
+    # 独有的数据优势要写进去，否则等于放弃长处
+    assert "3s" in src and "is_buy" in src, "没把 3s 逐笔这个独有优势写进去"
+    # 周期对齐的坑必须写清
+    assert "15m" in src, "没写区间演化跑在 15m 这件事"
+    # 口径与判断标准必须分开
+    assert "口径" in src and "判断标准" in src
+
+
+def test_kline_design_supersedes_old_draft():
+    """旧稿必须删掉，避免两份讨论稿各说一套。"""
+    assert not os.path.isfile(_p("docs", "K线识别-讨论稿.md")), \
+        "旧讨论稿还在，会和新稿冲突"
+    assert os.path.isfile(_p("docs", "K线演化-设计讨论稿.md"))

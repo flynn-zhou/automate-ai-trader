@@ -109,6 +109,8 @@ def _engine_stub(ex=None, pos=None):
     # 桩上必须能找到它们的**产品真实现**（写空壳等于测自己写的桩）。
     for _n in ("_push", "_system_stop_state", "_cancel_system_stop_order",
                 "_maintain_system_protection", "_adopted_stop_state",
+                # BOOK-1：平仓分笔结算
+                "_settle_close", "_lots_of", "_push_lot",
                 "_cancel_adopted_stop_order", "_maintain_adopted_protection"):
         _raw = E.DecisionEngine.__dict__.get(_n)
         if isinstance(_raw, staticmethod):

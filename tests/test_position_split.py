@@ -114,8 +114,14 @@ def _engine_stub(adopted=None, pos=None, ex=None):
                   # 2026-11-25 晚：成交落账/平仓现在还会推飞书、撤地板单。
                   # 桩上绑产品真实现（空壳会让"接线是否发生"测成空白）。
                   "_push", "_system_stop_state", "_cancel_system_stop_order",
+                  # BOOK-1：平仓分笔结算
+                  "_settle_close", "_lots_of", "_push_lot", "_pending_fill_bar_ts",
                   "_maintain_system_protection"):
         _fn = E.DecisionEngine.__dict__[_name]
+        if isinstance(_fn, staticmethod):
+            # ★ staticmethod 不能 MethodType 绑（会自动多收 self，参数错位）
+            setattr(st, _name, _fn.__func__)
+            continue
         _fn = getattr(_fn, "__func__", _fn)
         setattr(st, _name, _types.MethodType(_fn, st))
     # F1（2026-11-24 全链路审查）：`_adopted_close` 现在要判断

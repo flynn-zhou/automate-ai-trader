@@ -1164,7 +1164,11 @@ def test_run_plan_fills_the_inverse_v_on_a_later_5m_bar():
     bars5 = list(ctx.bars5)
     bars5[2] = b5(2, PX, plan.order_price + 5.0, PX - 1, plan.order_price + 2.0)
     res = P.run_plan(plan, ctx.bars15, ctx.book, bars5=bars5)
-    assert res.state == T.FILLED, res.states()
+    # ★ EXIT-1（2026-11-25）：成交之后立刻可能被「收盘跌破」判出场 ——
+    #   这根 5m 收在触发价另一侧，正是用户要的「当根收盘跌破就等反弹离场」。
+    #   本用例钉的是**成交判在 5m 上**（时刻与证据），不是终态，
+    #   所以断言「进过 FILLED」而不是「停在 FILLED」。
+    assert T.FILLED in res.states(), res.states()
     fill = [t for t in res.transitions if t.to_state == T.FILLED][0]
     assert fill.bar_ts == hit_ts, (
         "成交应判在 5m 那根(%d)，实际 %d" % (hit_ts, fill.bar_ts))

@@ -126,6 +126,8 @@ def _lot(qty=0.032, entry=60880.0, stop=59894.81):
 _METHODS = ("_adopted_slot", "_is_adopted", "_adopted_stop_state",
             "_adopted_stop_cid", "_sync_adopted_stop_order",
             "_cancel_adopted_stop_order", "_adopted_close",
+            # BOOK-1：平仓分笔结算
+            "_settle_close", "_lots_of", "_push_lot",
             "_maintain_adopted_protection",
             # 挂失败的**退避记录**（生产实测 1725 条/小时的修法）
             "_stop_fail_once", "_nope")
@@ -143,6 +145,11 @@ def _engine(adopted=None, pos=None, ex=None, step=0.001):
     for name in _METHODS:
         raw = E.DecisionEngine.__dict__.get(name)
         if raw is None:
+            continue
+        if isinstance(raw, staticmethod):
+            # ★ staticmethod 不能 MethodType 绑：那样会自动多收一个 self，
+            #   参数整体错位（BOOK-1 的 _lots_of/_push_lot 就是静态方法）。
+            setattr(st, name, raw.__func__)
             continue
         fn = getattr(raw, "__func__", raw)
         setattr(st, name, types.MethodType(fn, st))

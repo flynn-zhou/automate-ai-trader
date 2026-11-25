@@ -780,16 +780,52 @@ class TradeDB:
                     #   任何人用 (exit-entry)*qty 重算都会得到 -9.95004，与库里对不上。
                     #   引擎端（engine.py 的 _close）本来就传了 qty=sold_qty，
                     #   是写入端把它丢了——参数白传。
-                    c.execute(
-                        "UPDATE trades SET exit_ts=?, exit_price=?, qty=?, pnl_gross=?, fee=?,"
-                        " pnl_net=?, mfe=?, mae=?, close_reason=?, stop_price=?, target_price=?"
-                        " WHERE id=(SELECT id FROM trades WHERE entry_ts=? AND side=?"
-                        "            AND exit_ts IS NULL ORDER BY id DESC LIMIT 1)",
-                        (d.get("exit_ts"), d.get("exit_price"), d.get("qty"),
-                         d.get("pnl_gross"),
-                         d.get("fee", 0), d.get("pnl_net"), d.get("mfe"), d.get("mae"),
-                         d.get("close_reason"), d.get("stop_price"), d.get("target_price"),
-                         d["entry_ts"], d["side"]))
+                    # ★★ BOOK-1（2026-11-25）：支持按 `id` 精确定位。
+                    #
+                    #   分笔结算之后，一笔仓在库里通常是**多行**（一个 lot 一行），
+                    #   而同一毫秒被接管的两笔成交 entry_ts 会完全相同。
+                    #   继续用 (entry_ts, side) 模糊匹配，就会把第二腿的
+                    #   平仓数据 UPDATE 到第一腿那行上 —— 两行的 entry_price
+                    #   不同，于是又造出一行「qty 与 entry 不自洽」的脏数据，
+                    #   正是这次要修的那个 bug。
+                    #   引擎手里有精确的 id 时必须用它；没有才退回模糊匹配。
+                    _tid = d.get("id")
+                    # ★ 必须用 cursor：`sqlite3.Connection` 没有 rowcount 属性，
+                    #   直接 c.rowcount 会抛 AttributeError，而它在 flush 线程里，
+                    #   表现成"平仓了但库里没有已平记录"——比不报错更吓人。
+                    _cur = c.cursor()
+                    if _tid:
+                        _cur.execute(
+                            "UPDATE trades SET exit_ts=?, exit_price=?, qty=?, pnl_gross=?,"
+                            " fee=?, pnl_net=?, mfe=?, mae=?, close_reason=?,"
+                            " stop_price=?, target_price=? WHERE id=?",
+                            (d.get("exit_ts"), d.get("exit_price"), d.get("qty"),
+                             d.get("pnl_gross"),
+                             d.get("fee", 0), d.get("pnl_net"), d.get("mfe"),
+                             d.get("mae"),
+                             d.get("close_reason"), d.get("stop_price"),
+                             d.get("target_price"), int(_tid)))
+                    else:
+                        _cur.execute(
+                            "UPDATE trades SET exit_ts=?, exit_price=?, qty=?, pnl_gross=?,"
+                            " fee=?, pnl_net=?, mfe=?, mae=?, close_reason=?,"
+                            " stop_price=?, target_price=?"
+                            " WHERE id=(SELECT id FROM trades WHERE entry_ts=? AND side=?"
+                            "            AND exit_ts IS NULL ORDER BY id DESC LIMIT 1)",
+                            (d.get("exit_ts"), d.get("exit_price"), d.get("qty"),
+                             d.get("pnl_gross"),
+                             d.get("fee", 0), d.get("pnl_net"), d.get("mfe"),
+                             d.get("mae"),
+                             d.get("close_reason"), d.get("stop_price"),
+                             d.get("target_price"),
+                             d["entry_ts"], d["side"]))
+                    if _cur.rowcount == 0:
+                        # 不是异常，但必须留痕：说明这一次平仓没有落到任何
+                        # 未平仓行上（时间戳撞了、或那行已经被关过）。
+                        # 静默成功会让库里的 open 行永远开着 → 对账硬停。
+                        logging.getLogger("trade_db").warning(
+                            "trade_close 没匹配到未平仓行：id=%s entry_ts=%s side=%s qty=%s",
+                            _tid, d.get("entry_ts"), d.get("side"), d.get("qty"))
                 elif kind == "working_order":
                     # 幂等 upsert，按 client_order_id。挂单会被反复更新
                     # （挂上 → 部分成交 → 成交/撤单），每次都是一次 upsert。

@@ -93,6 +93,8 @@ import bisect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from . import break_rules as _br
+
 # ---------------------------------------------------------------- 口径常量
 
 #: 慢路径确认用第几根（用户：「只认第 3 根」）。1-based 语义：站上之后数到第 3 根。
@@ -598,6 +600,8 @@ class RunResult:
     #:   棘轮永远凑不到 1R，而回放里凑得到 —— 两边结果不一致而且不报错。
     best_favorable_px: Optional[float] = None
 
+    fill_bar_ts: int = 0
+
     @property
     def ambiguous_same_bar(self) -> int:
         """同根歧义的条数（供统计用，不要混进正常成交）。"""
@@ -1040,7 +1044,8 @@ def run(thesis: Thesis,
         trace: bool = False,
         initial_state: str = EXPECTED,
         resume: Optional[Dict[str, Any]] = None,
-        kbar: Any = None) -> RunResult:
+        kbar: Any = None,
+        fill_bar_ts: int = 0) -> RunResult:
     """把一条 thesis 在一段 K 线上跑完，返回终态 + 转换 + 动作。
 
     Args:
@@ -1067,6 +1072,10 @@ def run(thesis: Thesis,
               全局下标去看「第 3 根之前」的收盘，判据口径不变。
         trace: 是否记录**每根**的三值判定（抖动分析要用）。
             注意它按根增长，几万根时别默认打开。
+        fill_bar_ts: ★ EXIT-1 用：成交所在那根的**开盘时刻**（5m 桶的 ts）。
+            增量推进（``start_at > 0``）或重启恢复时，本次调用看不到成交那一根，
+            锚点就找不到了 —— 所以必须由调用方（引擎知道持仓的 entry_ts）传进来。
+            传 0 表示"本次调用会亲眼看到成交"，由状态机自己在成交时记下。
 
     转换规则（逐根，按状态分派）：
         EXPECTED: 失效 → INVALIDATED（**根本没挂过单**）；claim 成立 → ARMED
@@ -1105,6 +1114,35 @@ def run(thesis: Thesis,
     #   算不出来，而且**不报错**（和本项目历史上那些静默缺陷同型）。
     # ★ S5 棘轮游标：从 resume 恢复（增量推进跨 step 必须接上）
     best_fav = None
+    #: ★ EXIT-1：已收盘的 5m 序列（按时间顺序累积）+ 成交那根的开盘时刻。
+    #:  ``break_rules.assess`` 需要"从成交那根起的收盘序列"才能找到锚点，
+    #:  只给它当前这根是算不出来的。没有 5m 数据（只喂了 15m）时保持空，
+    #:  此时**不判**收盘跌破 —— 拿 15m 冒充 5m 等于换了用户的规则。
+    _b5_hist: List[Any] = []
+    _fill_bar_ts: int = int(fill_bar_ts or 0)
+    #: 预排序的 5m 全序列（ts, bar），用于 O(log n) 取"从成交那根到当前根"的切片。
+    #: 不预建的话每根都要遍历全部 subs —— 400 桶 × 12 根 × 400 根 = 两百万次，
+    #: 回测直接慢一个数量级。
+    _b5_all: List[Any] = []
+    _b5_ts: List[int] = []
+    if entry_bars:
+        _b5_all = sorted(entry_bars, key=lambda b: int(b.ts))
+        _b5_ts = [int(b.ts) for b in _b5_all]
+
+    def _b5_since(end_ts: int):
+        """取「成交那根 → end_ts」这一段已收盘 5m，供 `break_rules.assess` 用。
+
+        返回 None 表示"现在还判不了"（还没成交，或没有 5m 数据）。
+        —— 拿 15m 的数据去判 5m 的规则等于换了用户的定义，宁可不判。
+        """
+        if not _fill_bar_ts:
+            return None
+        if _b5_all:
+            lo = bisect.bisect_left(_b5_ts, _fill_bar_ts)
+            hi = bisect.bisect_right(_b5_ts, int(end_ts))
+            return _b5_all[lo:hi] or None
+        seg = [b for b in _b5_hist if int(b.ts) <= int(end_ts)]
+        return seg or None
     if resume:
         _bf = resume.get("best_favorable_px")
         if _bf is not None:
@@ -1167,6 +1205,15 @@ def run(thesis: Thesis,
             if state in TERMINAL_STATES:
                 break
             sb_ts = int(sb.ts)
+            # ★ EXIT-1：只在**真有 5m 细周期**时累积（`seq` 退化成 15m 时不记，
+            #   否则收盘跌破会被拿 15m 的收盘价判出来）。
+            if subs:
+                _b5_hist.append(sb)
+            #: 判读用的"从成交那根到当前根"的真实 5m 切片。
+            #: ★ 必须在这里算（而不是在外面算一次）：成交那根的 `_fill_bar_ts`
+            #: 是在 fill 分支里才赋的值，在外面先算会拿到 None，
+            #: 于是成交当根就漏判了「收盘跌破」—— 而那正是事故里最关键的一根。
+            _b5_for_read = _b5_since(sb_ts)
 
             if state == EXPECTED:
                 # 声明在哪儿成立：细周期（claim_on_entry）或粗周期收盘
@@ -1291,6 +1338,12 @@ def run(thesis: Thesis,
                          sb_ts)
                     # 成交后同根立刻判退场（保守：不假设「成交那根就一定安全」）
                     _entry_px = _entry_ref_price(thesis, sb)
+                    # ★ EXIT-1：记下成交所在那根的**开盘时刻**。
+                    #   锚点只能从这一根往后找 —— 入场前的走势不是这笔仓的事。
+                    #   这里必须用 bar 的开盘时刻（sb_ts），不能用"现在几点"：
+                    #   assess 的过滤条件是 `ts >= since_ts`，用成交的精确毫秒
+                    #   会把成交那根自己排除掉，锚点永久晚一根。
+                    _fill_bar_ts = sb_ts
                     # ★ 棘轮游标起点 = 实际成交价
                     if best_fav is None:
                         best_fav = float(_entry_px)
@@ -1302,7 +1355,8 @@ def run(thesis: Thesis,
                             thesis, best_fav, entry=_entry_px),
                         best_favorable_px=best_fav,
                         book=book,
-                        close_ms=sb_ts + int(entry_interval_ms))
+                        close_ms=sb_ts + int(entry_interval_ms),
+                        bars5=_b5_for_read, fill_bar_ts=_fill_bar_ts)
                     if not _closed_fill:
                         best_fav = _update_best_fav(thesis, best_fav, sb)
                 continue
@@ -1318,7 +1372,8 @@ def run(thesis: Thesis,
                     ratchet_stop=breakeven_stop(thesis, best_fav),
                     best_favorable_px=best_fav,
                     book=book,
-                    close_ms=sb_ts + int(entry_interval_ms))
+                    close_ms=sb_ts + int(entry_interval_ms),
+                    bars5=_b5_for_read, fill_bar_ts=_fill_bar_ts)
                 # ★ 更新在判定**之后** —— 不许用本根自己的最好值给自己开路（根内前视）。
                 if not _closed:
                     best_fav = _update_best_fav(thesis, best_fav, sb)
@@ -1424,6 +1479,8 @@ def run(thesis: Thesis,
     res.best_favorable_px = best_fav
     res.armed_ref_close = armed_ref_close
     res.armed_at_sub_ts = armed_at_sub_ts
+    # ★ EXIT-1：把成交那根的锚点带出去（增量推进/重启要用它）
+    res.fill_bar_ts = int(_fill_bar_ts or 0)
     res.next_index = max(0, min(len(bars), _walked))
     # ★ 非终态收尾必须说清原因（以前完全静默）。
     if state not in TERMINAL_STATES:
@@ -1489,13 +1546,22 @@ def step(thesis: Thesis,
               "best_favorable_px": p.get("best_favorable_px"),
               "armed_ref_close": p.get("armed_ref_close"),
               "armed_at_sub_ts": p.get("armed_at_sub_ts")}
+    # ★ EXIT-1：成交那根的开盘时刻必须跨调用/跨重启传下去。
+    #   它在一次 step 内部是"亲眼看到的成交那根"，但下一次 step 只从
+    #   next_index 往后走，看不到那一根了 —— 不传就会把锚点丢掉，
+    #   收盘跌破判据静默失效（而失效的表现是"什么都不发生"，最难发现）。
+    if not kw.get("fill_bar_ts"):
+        kw["fill_bar_ts"] = int(p.get("fill_bar_ts") or 0)
     res = run(thesis, bars, book, claim, start_at=start, initial_state=state,
               resume=resume, **kw)
     newp = {"state": res.state, "next_index": int(res.next_index),
             "armed_at_bar": res.armed_at_bar,
             "best_favorable_px": res.best_favorable_px,
             "armed_ref_close": res.armed_ref_close,
-            "armed_at_sub_ts": res.armed_at_sub_ts}
+            "armed_at_sub_ts": res.armed_at_sub_ts,
+            # 首次成交时由 `run()` 返回；之后一路沿用
+            "fill_bar_ts": int(getattr(res, "fill_bar_ts", 0)
+                               or kw.get("fill_bar_ts") or 0)}
     return res, newp
 
 
@@ -1681,11 +1747,17 @@ def _close_position(thesis: Thesis, bar: Any, verdict: str,
                     ratchet_stop: Optional[float] = None,
                     best_favorable_px: Optional[float] = None,
                     book: Any = None,
-                    close_ms: Optional[int] = None) -> bool:
+                    close_ms: Optional[int] = None,
+                    bars5: Optional[Sequence] = None,
+                    fill_bar_ts: int = 0) -> bool:
     """持仓中：判止损 / 止盈 / 惊喜K线 / 预期失效平仓。返回是否已经平掉。
 
     `entry_ref`：**成交那一根**的实际成交价（其它根传 None）。惊喜K线判据
     要用它当基准，否则盘中成交的那根会把「本来就很宽的大K」误算成利润。
+
+    `bars5` / `fill_bar_ts`：EXIT-1 用。已收盘的 5m 序列 + 成交所在那根的
+    开盘时刻。没有 5m 数据时传 None —— 那时**不判**收盘跌破，
+    而不是拿 15m 冒充 5m（用户的定义是「5m 收盘」，用粗周期判等于换了个规则）。
     """
     stop = _stop_hit(bar, thesis)
     tgt = _target_hit(bar, thesis)
@@ -1780,6 +1852,79 @@ def _close_position(thesis: Thesis, bar: Any, verdict: str,
                     reason="stop", price=thesis.stop_price,
                     state_after=CLOSED_SL))
         return True
+    # ★★ EXIT-1（2026-11-25 用户口径）：「收盘跌破」与「有效跌破」。
+    #
+    #   用户原话：
+    #     「收盘跌破就是在5m的买点，收盘5m跌破位置，本来预期收针的，
+    #       但是现实是收盘跌破了，不是引针了；有效跌破是后面3根K线有过
+    #       确认动作，也就是从收盘跌破那根K线之后，不包含收盘跌破那根，
+    #       第三根还是跌破！」
+    #
+    #   规则的实现全部在 `break_rules.py`（纯函数，不碰 IO），这里只负责
+    #   把判读变成一条 `close` 动作、并决定用的是哪个价。
+    #
+    #   ★ 为什么排在止盈/止损/惊喜**之后**：
+    #     收盘跌破只有等那根收盘才知道，而同一根里价格可能早就把止损打穿了 ——
+    #     把它排到止损前面，等于用收盘才有的信息去抢一个盘中先发生的成交，
+    #     那是偷价，回测会虚高。
+    #   ★ 为什么排在观察线拒绝/失效**之前**：
+    #     前两者是"行情给出了别的答案"，而收盘跌破是"入场前提被否" ——
+    #     前提没了就不该再用前提推出来的目标价去等。
+    if bars5 and fill_bar_ts and float(thesis.order_price or 0.0) > 0:
+        _long = (thesis.direction == UP)
+        _read = _br.assess(
+            float(thesis.order_price), bars5,
+            since_ts=int(fill_bar_ts),
+            direction=("long" if _long else "short"))
+        if _read.state == _br.CONFIRMED:
+            # 有效跌破：确认之后不许再等回抽 —— 市场已经用 3 根 K 线表态了。
+            emit(CLOSED_THESIS, VIOLATED,
+                 "有效跌破：%s" % _read.describe(),
+                 {"bar_ts": ts, "exit_price": float(bar.c),
+                  "break_state": _read.state, "break_level": _read.level,
+                  "anchor_ts": _read.anchor_ts,
+                  "anchor_close": _read.anchor_close,
+                  "bars_since": _read.bars_since, "atr": _read.atr,
+                  "rule": ("入场前提是「关键位被探一下就被接住（收针）」。"
+                           "锚点那根收盘跌破它，锚点后第 %d 根仍跌破 → "
+                           "确认不是扫盘，不等回抽，市价离场" % _br.CONFIRM_BARS)},
+                 ts,
+                 Action(kind="close", thesis_id=thesis.thesis_id,
+                        reason="effective_break", price=float(bar.c),
+                        state_after=CLOSED_THESIS))
+            return True
+        if _read.state == _br.CLOSED_BELOW:
+            _px = None
+            if _read.bars_since == 0:
+                # 锚点根本身：跌破只在**这根收盘**成立，所以只能用收盘价判。
+                # （不许用本根的高点/低点回推"本来能在回抽位成交"——
+                #   那时候我们还不知道自己错了。）
+                _go, _why = _br.exit_now(_read, float(bar.c))
+                if _go:
+                    _px = float(bar.c)
+            else:
+                # 窗口已开：整根 K 线期间回抽单都挂着，碰到就是成交。
+                _hit = (float(bar.h) >= _read.exit_level) if _long \
+                    else (float(bar.l) <= _read.exit_level)
+                if _hit:
+                    _px = float(_read.exit_level)
+            if _px is not None:
+                emit(CLOSED_THESIS, VIOLATED,
+                     "收盘跌破后离场：%s" % _read.describe(),
+                     {"bar_ts": ts, "exit_price": _px,
+                      "break_state": _read.state, "break_level": _read.level,
+                      "exit_level": _read.exit_level,
+                      "anchor_ts": _read.anchor_ts,
+                      "anchor_close": _read.anchor_close,
+                      "bars_since": _read.bars_since, "atr": _read.atr,
+                      "rule": ("「本来预期收针、现实收盘跌破」→ 前提被否。"
+                               "认错但不追低：盯回抽位（关键位前方一步，"
+                               "保证成交）走人；等不到就由有效跌破兜底")},
+                     ts,
+                     Action(kind="close", thesis_id=thesis.thesis_id,
+                            reason="closed_below_entry", price=_px,
+                            state_after=CLOSED_THESIS))
+                return True
     # ★★ 观察线拒绝出场（2026-11-20 用户口径：「关键价都是观察线，观察反应，
     #    最终在 ema50 价格显示拒绝，我们出场」）。
     #

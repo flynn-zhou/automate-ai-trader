@@ -83,6 +83,9 @@ def _bind(st, *names):
 
 # 引擎里这些方法在挂单链上会被互相调用，桩上必须都能找到真实实现
 _ENGINE_METHODS = ("_is_adopted", "_pending_place", "_pending_close",
+                   # BOOK-1：平仓改成分笔结算，桩必须绑这三个真实方法，
+                   # 否则测出来的是桩的行为而不是产品代码的行为。
+                   "_settle_close", "_lots_of", "_push_lot", "_pending_fill_bar_ts",
                    "_pending_cancel", "_pending_size", "_pending_is_dry",
                    "_pending_warn_once", "_to_pending_bars",
                    "_step_adopted_exit", "_adopted_close", "_adopted_bars",

@@ -766,7 +766,202 @@ class DecisionEngine:
             # 危险之处在于方向——漏记成本永远是让亏损看起来更小，
             # 也就是让策略看起来更赚钱，这会把纸面样本的证据价值直接毁掉。
             "fee": float(open_trade.get("fee") or 0.0),
+            # ★ BOOK-1：分笔结算的载体。库里一行 = 一个 lot
+            #   （它的 entry_price 就是那笔成交的价）。加仓时往后追加。
+            #   不从这里带上，重启后的仓就会退化成"整笔一个 lot"，
+            #   于是又会把两笔不同价的成交压成均价 —— 正是 id=33 那个 bug。
+            "lots": [{"qty": abs(float(open_trade.get("qty") or 0.0)),
+                      "entry": float(open_trade.get("entry_price") or 0.0),
+                      "ts": int(open_trade.get("entry_ts") or 0),
+                      "fee": abs(float(open_trade.get("fee") or 0.0))}],
         }
+
+    # ------------------------------------------------------------------
+    # ★★ BOOK-1：分笔结算（2026-11-25 生产事故）
+    # ------------------------------------------------------------------
+    #
+    #   事故现场（trades 表 id=33）：
+    #       qty=0.02  entry_price=58437  exit_price=57454.60
+    #       pnl_gross=-12.048
+    #   而真实成交是 0.01@58437（我方挂单）+ 0.01@57677（用户手工加仓），
+    #   均价 58057。(-12.048) = (57454.60 - 58057) × 0.02 —— 也就是说
+    #   **盈亏算对了、entry_price 记错了**，同一行内部自相矛盾。
+    #
+    #   根因不是算错，是**记账粒度错了**：一行 trade 代表整笔仓，
+    #   但整笔仓由多笔不同价的成交拼成。`close_trade` 的 UPDATE 只按
+    #   (entry_ts, side) 匹配一行，于是 sold_qty=0.02 全砸在第一腿那行上，
+    #   而那行的 entry_price 只是第一腿的价。
+    #   同时 `_reconcile_positions` 加仓时又写了第二条行（id=34, 57677），
+    #   于是同一笔仓在库里出现两次：一次是"0.02 @ 58437"（假），
+    #   一次是"0.01 @ 57677"（真但没参与结算）。
+    #
+    #   修法：**一个 lot 一行**。lot = 一次成交（我方挂单成交、用户手工加仓、
+    #   部分减仓后的剩余）。持仓槽里带 `lots` 列表，平仓时按 lot 分别
+    #   UPDATE 各自那行 —— 每行的 entry_price 永远是它自己那笔成交的价，
+    #   qty 永远是它自己的量，`pnl_gross == (exit - entry) * qty * dir`
+    #   这条不变量逐行成立。
+    #
+    #   为什么不是"把 entry_price 也写进 SET"：
+    #   那是把两笔不同价的成交硬压成一个均价，R 倍数（按 entry 算）
+    #   仍然是错的，而且丢掉了"哪一腿赚、哪一腿亏"这个唯一能回答
+    #   「加仓到底对不对」的证据。
+
+    @staticmethod
+    def _lots_of(pos: dict) -> list:
+        """取持仓槽的 lot 列表；老数据没有 `lots` 就按整笔当一个 lot。"""
+        lots = pos.get("lots")
+        out = []
+        if isinstance(lots, (list, tuple)):
+            for l in lots:
+                try:
+                    q = float(l.get("qty") or 0.0)
+                except Exception:
+                    continue
+                if q > 0:
+                    out.append({
+                        "qty": q,
+                        "entry": float(l.get("entry") or 0.0),
+                        "ts": int(l.get("ts") or pos.get("entry_ts") or 0),
+                        "fee": abs(float(l.get("fee") or 0.0)),
+                    })
+        if out:
+            return out
+        return [{
+            "qty": abs(float(pos.get("qty") or 0.0)),
+            "entry": float(pos.get("entry") or 0.0),
+            "ts": int(pos.get("entry_ts") or 0),
+            "fee": abs(float(pos.get("fee") or 0.0)),
+        }]
+
+    @staticmethod
+    def _push_lot(pos: dict, qty: float, entry: float, ts: int,
+                  fee: float = 0.0) -> None:
+        """往持仓槽追加一个 lot，并保持 `qty`/`entry`/`fee` 是 lot 的汇总。
+
+        不变量：`pos["qty"] == Σ lot.qty`，`pos["entry"]` 是按量加权的均价，
+        `pos["fee"] == Σ lot.fee`。任何一个不成立，平仓就会算出
+        「量对了、价错了」或者反过来 —— 也就是 id=33 那一行。
+        """
+        if qty <= 0:
+            return
+        lots = pos.get("lots")
+        if not isinstance(lots, list):
+            # 老槽没有 lots：先把现有的整笔仓补成一个 lot，再追加新的。
+            lots = DecisionEngine._lots_of(pos)
+            pos["lots"] = lots
+        lots.append({"qty": abs(qty), "entry": float(entry),
+                     "ts": int(ts), "fee": abs(float(fee or 0.0))})
+        tq = sum(float(l["qty"]) for l in lots)
+        pos["qty"] = tq
+        pos["entry"] = (sum(float(l["qty"]) * float(l["entry"]) for l in lots) / tq
+                        if tq > 0 else float(entry))
+        pos["fee"] = sum(float(l["fee"]) for l in lots)
+
+    def _settle_close(self, pos: dict, sold_qty: float, exit_price: float,
+                      fill_fee: float, close_reason: str,
+                      exit_ts: int = 0, mfe_mae: bool = True,
+                      symbol: str = "", paper: int = 0,
+                      strategy: str = "") -> tuple:
+        """按 lot 结算本次平仓，返回 (毛, 费, 净) 汇总。
+
+        每一腿写成**独立的一行** `trades`：entry_price 是它自己的成交价、
+        qty 是它自己的量。汇总值与 `close_booking()` 完全一致
+        （均价 × 总量），所以盈亏口径没变，变的只是可追溯性。
+
+        部分平仓（`sold_qty` 小于持仓）时按 FIFO 消耗 lot，
+        并把没消耗掉的 lot 留在 `pos["lots"]` 里 —— 下一腿接着用。
+
+        `exit_price` 传 0/None 表示**平仓价未知**（对账发现交易所已无此仓、
+        又查不到我方平仓单的成交价）。此时每一腿按**自己的入场价**占位、
+        盈亏记 0 —— 绝不编一个价出来。这条路径以前只关一行，
+        剩下的腿会永远开着，重启后变成"库里有仓、交易所没有"的幽灵仓。
+        """
+        side = str(pos.get("side") or "long")
+        d = 1 if side.lower() == "long" else -1
+        lots = self._lots_of(pos)
+        total = sum(float(l["qty"]) for l in lots)
+        if total <= 0 or sold_qty <= 0:
+            return 0.0, 0.0, 0.0
+        # FIFO 分配：本次卖出量从最早的 lot 开始消耗
+        left = float(min(sold_qty, total))
+        # ★ 平仓费按**实际消耗掉的量**摊，不能按 `sold_qty` 摊：
+        #   现货卖出会被 step 取整、也可能出现"卖出量比账上的量多一点"的粉尘，
+        #   两者不等时按 sold_qty 摊会分摊不完（费少记）或摊过头（费多记）。
+        #   这一步的总额必须与 close_booking 逐分对上，否则每笔都比对一次告警。
+        consumed = left
+        plan = []
+        for l in lots:
+            if left <= 1e-12:
+                plan.append({"lot": l, "q": 0.0})
+                continue
+            q = min(float(l["qty"]), left)
+            left -= q
+            plan.append({"lot": l, "q": q})
+
+        exit_ts = int(exit_ts or (time.time() * 1000))
+        best = float(pos.get("best") or pos.get("entry") or 0.0)
+        worst = float(pos.get("worst") or pos.get("entry") or 0.0)
+        g_tot = f_tot = n_tot = 0.0
+        keep = []
+        for item in plan:
+            l, q = item["lot"], item["q"]
+            if q > 1e-12:
+                # ★ 平仓价未知（0/None）：按这一腿自己的入场价占位，盈亏 0。
+                _px = float(exit_price) if exit_price else float(l["entry"])
+                # 开仓费按这一腿自己承担的部分摊（部分平仓时按比例）
+                _of = float(l["fee"]) * (q / float(l["qty"])) \
+                    if float(l["qty"]) > 0 else 0.0
+                # 平仓费按实际卖出量摊
+                _cf = abs(float(fill_fee or 0.0)) * (q / consumed) \
+                    if consumed > 0 else 0.0
+                g = (_px - float(l["entry"])) * q * d
+                f = _of + _cf
+                n = g - f
+                g_tot += g
+                f_tot += f
+                n_tot += n
+                _mfe = (_mae) = 0.0
+                if mfe_mae:
+                    _mfe = round((best - float(l["entry"])) * d, 6)
+                    _mae = round((worst - float(l["entry"])) * d, 6)
+                try:
+                    self.db.close_trade({
+                        "symbol": symbol or self.tcfg.symbol, "side": side,
+                        "qty": q, "entry_ts": int(l["ts"]),
+                        "entry_price": float(l["entry"]),
+                        "exit_ts": exit_ts, "exit_price": _px,
+                        "stop_price": pos.get("stop"),
+                        "target_price": pos.get("target"),
+                        "pnl_gross": round(g, 6), "fee": round(f, 6),
+                        "pnl_net": round(n, 6),
+                        "mfe": _mfe, "mae": _mae,
+                        "open_reason": str(pos.get("open_reason") or "")[:300],
+                        "close_reason": str(close_reason)[:200],
+                        "paper": int(paper), "strategy": strategy,
+                    })
+                except Exception as e:                # noqa: BLE001
+                    logger.error("[结算] 第 %.6f@%.2f 这一腿关账失败：%s",
+                                 q, l["entry"], e, exc_info=True)
+                    try:
+                        self.db.log_risk("close_lot_book_failed",
+                                         "qty=%.6f entry=%.2f: %s"
+                                         % (q, l["entry"], str(e)[:180]))
+                    except Exception:
+                        pass
+                rest = float(l["qty"]) - q
+                if rest > 1e-12:
+                    keep.append(dict(l, qty=rest,
+                                     fee=float(l["fee"]) - _of))
+            else:
+                keep.append(l)
+        # 把没结算掉的 lot 留在槽里（部分平仓继续持有）
+        if keep:
+            pos["lots"] = keep
+            pos["qty"] = sum(float(l["qty"]) for l in keep)
+            pos["fee"] = sum(float(l["fee"]) for l in keep)
+        else:
+            pos.pop("lots", None)
+        return g_tot, f_tot, n_tot
 
     async def _cost_basis_from_trades(self, ex_qty: float) -> float:
         """用真实成交记录推算持仓成本。拿不到或不自洽时返回 0。
@@ -1084,18 +1279,16 @@ class DecisionEngine:
                                    "（%s）→ 毛 %+.4f / 费 %.4f / 净 %+.4f",
                                    _slot["side"], float(_slot["qty"]), _xp, _src,
                                    _pnl, float(_xfee or 0.0), _net)
-                    self.db.close_trade({
-                        "symbol": self.tcfg.symbol, "side": _slot["side"],
-                        "qty": _slot["qty"], "entry_ts": _slot["entry_ts"],
-                        "entry_price": _slot["entry"], "exit_ts": int(time.time() * 1000),
-                        "exit_price": float(_xp),
-                        "stop_price": _slot["stop"], "target_price": _slot["target"],
-                        "pnl_gross": _pnl, "fee": float(_slot.get("fee") or 0.0)
-                        + float(_xfee or 0.0), "pnl_net": _net,
-                        "mfe": 0.0, "mae": 0.0,
-                        "open_reason": _slot.get("open_reason", ""),
-                        "close_reason": "实盘对账：交易所已无此仓（%s）" % _src,
-                        "paper": int(_slot.get("paper") or 0)})
+                    # ★ BOOK-1：还原出来的价也要按腿关账 —— 一个槽可能是
+                    #   多笔不同价成交拼的，一行记不下（那正是 id=33 的形态）。
+                    self._settle_close(
+                        _slot, float(_slot["qty"]), float(_xp),
+                        float(_xfee or 0.0),
+                        "实盘对账：交易所已无此仓（%s）" % _src,
+                        exit_ts=int(time.time() * 1000),
+                        mfe_mae=False, symbol=self.tcfg.symbol,
+                        paper=int(_slot.get("paper") or 0),
+                        strategy=getattr(self.tcfg, "strategy", ""))
                     if _which == "adopted":
                         self.adopted_pos = None
                     else:
@@ -1111,18 +1304,19 @@ class DecisionEngine:
                     "position_closed_unpriced",
                     "%s: 交易所已无此仓，查不到我方平仓单的成交价 → 按入场价占位记账"
                     % _which)
-                self.db.close_trade({
-                    "symbol": self.tcfg.symbol, "side": _slot["side"],
-                    "qty": _slot["qty"], "entry_ts": _slot["entry_ts"],
-                    "entry_price": _slot["entry"], "exit_ts": int(time.time() * 1000),
-                    "exit_price": float(actual.get("entry") or _slot["entry"]),
-                    "stop_price": _slot["stop"], "target_price": _slot["target"],
-                    "pnl_gross": 0.0, "fee": 0.0, "pnl_net": 0.0, "mfe": 0.0, "mae": 0.0,
-                    "open_reason": _slot.get("open_reason", ""),
-                    "close_reason": "实盘对账：交易所已无此仓",
+                # ★ BOOK-1：多腿槽必须逐腿关，否则第二腿的行永远开着，
+                #   重启后 `_restore_open_positions` 会把它当成还有仓位 →
+                #   「库里有仓、交易所没有」的幽灵仓，随后又是一次接管。
+                #   `exit_price=0` = 价未知，按各腿自己的入场价占位、盈亏 0。
+                self._settle_close(
+                    _slot, float(_slot["qty"] or 0.0), 0.0, 0.0,
+                    "实盘对账：交易所已无此仓（价未知，按入场价占位）",
+                    exit_ts=int(time.time() * 1000), mfe_mae=False,
+                    symbol=self.tcfg.symbol,
                     # 按这笔仓【原本】的来历记账，不能一律记成真实交易：
                     # 从纸面切到实盘后，库里遗留的纸面仓会走到这条路径。
-                    "paper": int(_slot.get("paper") or 0)})
+                    paper=int(_slot.get("paper") or 0),
+                    strategy=getattr(self.tcfg, "strategy", ""))
                 if _which == "adopted":
                     self.adopted_pos = None
                 else:
@@ -1165,19 +1359,14 @@ class DecisionEngine:
                     "按交易所为准关账", _which, _slot.get("side"),
                     float(_slot.get("qty") or 0.0), _ex_side)
                 try:
-                    self.db.close_trade({
-                        "symbol": self.tcfg.symbol, "side": _slot["side"],
-                        "qty": _slot["qty"], "entry_ts": _slot.get("entry_ts"),
-                        "entry_price": _slot.get("entry"),
-                        "exit_ts": int(time.time() * 1000),
-                        "exit_price": float(actual.get("entry") or _slot.get("entry") or 0.0),
-                        "stop_price": _slot.get("stop"),
-                        "target_price": _slot.get("target"),
-                        "pnl_gross": 0.0, "fee": 0.0, "pnl_net": 0.0,
-                        "mfe": 0.0, "mae": 0.0,
-                        "open_reason": _slot.get("open_reason", ""),
-                        "close_reason": "实盘对账：方向与交易所相反，按交易所为准",
-                        "paper": int(_slot.get("paper") or 0)})
+                    # ★ BOOK-1：逐腿关账（价未知 → 按各腿入场价占位，盈亏 0）
+                    self._settle_close(
+                        _slot, float(_slot.get("qty") or 0.0), 0.0, 0.0,
+                        "实盘对账：方向与交易所相反，按交易所为准",
+                        exit_ts=int(time.time() * 1000), mfe_mae=False,
+                        symbol=self.tcfg.symbol,
+                        paper=int(_slot.get("paper") or 0),
+                        strategy=getattr(self.tcfg, "strategy", ""))
                 except Exception:
                     logger.error("[对账] 关账失败（方向冲突，继续）", exc_info=True)
                 if _which == "adopted":
@@ -1192,6 +1381,39 @@ class DecisionEngine:
                 db_qty += (float(_slot["qty"]) + float(_slot.get("dust") or 0.0)) * (
                     1 if _slot["side"] == "long" else -1)
             delta = ex_qty - db_qty
+            # ★★ OWN-1（2026-11-25 生产事故）：**归属优先于接管**。
+            #
+            #   对账每 5 分钟跑一次（`_step` 里 `now_ms - last >= 300000`），
+            #   而挂单成交落账挂在 5m 收盘状态机里（`_pending_book_fill`）。
+            #   两者谁先到纯看时序 —— 对账完全可能先到。
+            #
+            #   21:31:05 我方 `AI-pend-60381fb96c6eba86` 成交 0.01@58437；
+            #   21:35:06 对账先看到「交易所 +0.01 / 数据库空仓」，
+            #   按 §13.2 判成【人工仓接管】；21:35:07 状态机才发现已成交，
+            #   但此刻 `adopted_pos` 已经占住这笔量 → 挂单动作被 suppressed，
+            #   并把状态强行压回 EXPECTED。
+            #   后果：这笔仓**永久**脱离策略管理 —— 不读 5m 收盘阶梯、
+            #   不判策略出场，只享受接管仓的盘中价熔断，最后在 57454.6 被扫掉，
+            #   扫完立刻反弹到 58698。
+            #
+            #   判据只能问交易所：我方这张单到底成交了多少。
+            #   有成交 → 先按策略仓落账，再重算差额；差额被吃掉就什么都不接管。
+            #   这不是"多接管一道保险"，而是**归属优先于接管**这条不变量：
+            #   同一份量不许同时被记成「策略仓」和「人工仓」。
+            if abs(delta) > 1e-9 and await self._attribute_own_fills():
+                _db2 = 0.0
+                for _slot in (self.pos, self.adopted_pos):
+                    if not _slot:
+                        continue
+                    _db2 += (float(_slot["qty"])
+                             + float(_slot.get("dust") or 0.0)) * (
+                        1 if _slot["side"] == "long" else -1)
+                logger.warning(
+                    "[对账] 先落账了我方挂单成交：本地账 %+.6f → %+.6f，"
+                    "差额 %+.6f → %+.6f（不再判人工仓接管）",
+                    db_qty, _db2, delta, ex_qty - _db2)
+                db_qty = _db2
+                delta = ex_qty - db_qty
             # ★ "交易所比本地账少"必须用**符号关系**判，不能用 `delta < 0`：
             #   空头仓 delta 天然是负数（ex=-0.00127、db=0 → delta=-0.00127），
             #   用 sign(delta) 会把这笔正常的空头接管误判成"疑似部分被平"，
@@ -1335,24 +1557,37 @@ class DecisionEngine:
                     return
                 # ★ 每笔接管都写一条独立的 trade 记录（不合并成一条），
                 #   溯源时才能看到"用户 19:39 买了多少、21:10 又加了多少"。
+                #
+                # ★★ BOOK-1：这条记录的时间戳**必须**和下面 lot 的 ts 完全一致。
+                #   分笔结算靠 (entry_ts, side) 找回这一腿对应的行；两个
+                #   `int(time.time()*1000)` 分别取就会差 1ms，于是平仓时
+                #   找不到行、UPDATE 影响 0 行、那行永远开着 → 对账硬停。
+                _now = int(time.time() * 1000)
                 self.db.log_trade({
                     "symbol": self.tcfg.symbol, "side": side, "qty": qty_delta,
-                    "entry_ts": int(time.time() * 1000), "entry_price": entry,
+                    "entry_ts": _now, "entry_price": entry,
                     "stop_price": stop, "target_price": 0.0,
                     "open_reason": ADOPT_REASON, "paper": 0,
                     "strategy": self.tcfg.strategy,
                     "max_hold_bars": 10 ** 9 if self._is_chan()
                     else self.tcfg.max_hold_bars})
-                _now = int(time.time() * 1000)
+                # ★ 注意：`_now` 在上面（log_trade 之前）就取好了，
+                #   这里**不许**再取一次 —— lot.ts 必须等于那一行的 entry_ts，
+                #   否则平仓时按 (entry_ts, side) 找不到这一腿的行。
                 if self.adopted_pos:
-                    _oq = float(self.adopted_pos.get("qty") or 0.0)
-                    _oe = float(self.adopted_pos.get("entry") or 0.0)
-                    _nq = _oq + qty_delta
-                    self.adopted_pos["entry"] = (
-                        (_oe * _oq + entry * qty_delta) / _nq if _nq > 0 else entry)
-                    self.adopted_pos["qty"] = _nq
-                    logger.warning("[对账] 人工仓加仓：%.6f @ %.2f → 合计 %.6f，均价 %.2f",
-                                   qty_delta, entry, _nq, self.adopted_pos["entry"])
+                    # ★ BOOK-1：加仓是**新增一个 lot**，不是改写整笔的均价。
+                    #   以前这里只改 qty/entry，而库里已经写了第二条行
+                    #   （上面那个 log_trade），于是同一笔仓在库里出现两次：
+                    #   一条「0.02 @ 58437」（假，entry 只是第一腿的价）、
+                    #   一条「0.01 @ 57677」（真，但永远不参与结算）。
+                    #   现在 lot 列表是唯一口径：qty/entry/fee 全由它汇总。
+                    self._push_lot(self.adopted_pos, qty_delta, entry, _now,
+                                   fee=0.0)
+                    logger.warning("[对账] 人工仓加仓：%.6f @ %.2f → 合计 %.6f，"
+                                   "均价 %.2f（%d 个 lot）",
+                                   qty_delta, entry, self.adopted_pos["qty"],
+                                   self.adopted_pos["entry"],
+                                   len(self.adopted_pos.get("lots") or []))
                 else:
                     self.adopted_pos = {
                         "side": side, "qty": qty_delta, "entry": entry,
@@ -1372,7 +1607,10 @@ class DecisionEngine:
                         # 平仓时 fill.fee 那一侧的手续费曾经因为 ACK 回报
                         # 整段漏成 0（见 exchange/live.py 的 _fill_truth），
                         # 那是另一个 bug，已单独修。
-                        "fee": 0.0}
+                        "fee": 0.0,
+                        # ★ BOOK-1：lot 列表是唯一口径（见 _push_lot）。
+                        "lots": [{"qty": abs(qty_delta), "entry": float(entry),
+                                  "ts": _now, "fee": 0.0}]}
                     logger.critical("[对账] 接管人工仓：%s %.6f @ %.2f（熔断 %.2f）",
                                     side, qty_delta, entry, stop)
 
@@ -3406,7 +3644,7 @@ class DecisionEngine:
         #
         # ★ F1：部分平仓时开仓费必须**按比例**摊 —— 整笔开仓费属于整笔仓，
         #   把它全压在这一条部分腿上会让这笔看起来更亏，而剩下的仓
-        #   一分成本都不剩。所以先算出本腿该承担的那一份。
+        #   一分成本都不剩。摊薄由 `_settle_close` 按 lot 逐腿完成。
         _open_fee = abs(float(pos.get("fee") or 0.0))
         _fee_share = (_open_fee if not partial or pos_qty <= 0
                       else _open_fee * (sold / pos_qty))
@@ -3415,37 +3653,37 @@ class DecisionEngine:
             getattr(fill, "fee", 0.0), sold, side)
 
         # ★ F5：MFE/MAE 用持仓期间真实的最高/最低价。
-        #   以前这里恒写 0.0 —— 而"这笔出场是不是太早了"只能靠 MFE 回答，
+        #   以前这里恒写 0.0 —— 而"这笔出场是不是太早"只能靠 MFE 回答，
         #   正是用户最初那个问题（61550 没卖、61250 被平）。
         _dir = 1 if str(side).lower() == "long" else -1
-        _best = float(pos.get("best") or entry)
-        _worst = float(pos.get("worst") or entry)
-        _mfe = round((_best - entry) * _dir, 6)
-        _mae = round((_worst - entry) * _dir, 6)
 
-        try:
-            self.db.close_trade({
-                "symbol": self.tcfg.symbol, "side": side,
-                "qty": sold, "entry_ts": pos.get("entry_ts"),
-                "entry_price": entry, "exit_ts": int(time.time() * 1000),
-                "exit_price": exit_price,
-                "stop_price": pos.get("stop"), "target_price": pos.get("target"),
-                "pnl_gross": pnl, "fee": fee_total, "pnl_net": pnl_net,
-                "mfe": _mfe, "mae": _mae,
-                "open_reason": pos.get("open_reason", ""),
-                "close_reason": "接管仓%s（%s）"
-                                % ("减仓" if partial else "出场", reason),
-                "paper": int(pos.get("paper") or 0)})
-        except Exception as e:
-            logger.error("[接管] 平仓已成交但关账失败：%s", e, exc_info=True)
-            self.db.log_risk("adopted_close_book_failed", str(e)[:200])
+        # ★★ BOOK-1：按 lot 分笔结算。接管仓是多笔不同价成交拼起来的
+        #   （用户 19:39 买一点、21:10 再加一点），整笔一行记账必然出现
+        #   「qty 是总量、entry 是第一腿的价」这种自相矛盾的行。
+        _g, _f, _n = self._settle_close(
+            pos, sold, exit_price, getattr(fill, "fee", 0.0),
+            "接管仓%s（%s）" % ("减仓" if partial else "出场", reason),
+            exit_ts=int(time.time() * 1000), symbol=self.tcfg.symbol,
+            paper=int(pos.get("paper") or 0),
+            strategy=getattr(self.tcfg, "strategy", ""))
+        if abs(_g - pnl) > 1e-6 or abs(_f - fee_total) > 1e-6:
+            logger.error("[接管] 分笔结算与整体不一致：毛 %.6f vs %.6f，费 %.6f vs %.6f",
+                         _g, pnl, _f, fee_total)
+            try:
+                self.db.log_risk("adopted_close_lot_mismatch",
+                                 "毛 %.6f vs %.6f（qty=%.6f entry=%.2f）"
+                                 % (_g, pnl, float(pos.get("qty") or 0.0), entry))
+            except Exception:
+                pass
+        pnl, fee_total, pnl_net = _g, _f, _n
 
         if partial:
             # ---- 部分平仓：只减仓，不清槽 ----
             #   内存里的数量与成本同步改写，`best/worst` 保留（它们描述的
             #   是同一段持仓期间），`entry_ts` 保留（判断锚点不变）。
-            pos["qty"] = abs(float(pos.get("qty") or 0.0)) - sold
-            pos["fee"] = max(0.0, _open_fee - _fee_share)
+            #   ★ BOOK-1：qty/fee 已由 `_settle_close` 按剩余 lot 重算，
+            #     这里不再自己减一遍 —— 两边都减就是重复扣减。
+            pos["qty"] = abs(float(pos.get("qty") or 0.0))
             # 剩下那部分仓在库里必须有一条 open 行，否则重启后引擎认为
             # 这笔已经平完 —— 那就是"账实不符"的最短路径。
             try:
@@ -3912,7 +4150,8 @@ class DecisionEngine:
                         _start = _nb
                     prog["next_index"] = _start
                 res, newp = _T.step(th, b15, book, progress=prog,
-                                    entry_bars=b5, kbar=kbar_view)
+                                    entry_bars=b5, kbar=kbar_view,
+                                    fill_bar_ts=self._pending_fill_bar_ts(tid))
             except Exception as e:
                 logger.error("[挂单] 推进 %s 失败：%s", tid, e, exc_info=True)
                 self.db.log_risk("pending_step_error", "%s: %s" % (tid, str(e)[:200]))
@@ -4068,13 +4307,44 @@ class DecisionEngine:
                     "[挂单] %s 本根未成功挂出 → 状态退回 EXPECTED（不判成交、不平仓）",
                     tid)
             elif suppressed:
-                # 被人工仓压住：同理，**不能落成 ARMED**。状态机判成交只看 K 线，
-                # 一旦 ARMED 就会顺着价格推出 FILLED → 出场动作，
-                # 而交易所那头根本没有这张单（11-24 那 15 条幽灵动作）。
-                _p_state = _T.EXPECTED
-                _p_armed = None
-                _p_armed_sub = None
-                _p_ref = None
+                # ★★ OWN-1 第二半（2026-11-25 生产事故）：
+                #   「被人工仓压住」这个判断的前提是『这笔仓不是我的』。
+                #   而压制只该压**新挂单**，绝不该压**已经发生的成交**。
+                #
+                #   生产实测：21:35:06 对账把这笔成交判成人工仓 →
+                #   21:35:07 状态机本根判出 FILLED，却在这里被压回 EXPECTED，
+                #   于是 `_pending_book_fill` 永远不会被调用（它在下面按
+                #   `newp["state"] == FILLED` 触发）。结果是：
+                #   这笔仓永久留在"人工仓"名下、状态永久停在 ARMED。
+                #
+                #   所以压制之前先问一句交易所：我这张单到底成交了没有？
+                #   成交了就说明那个"人工仓"里有我的一份 —— 不能压。
+                _mine = 0.0
+                try:
+                    _mine = float(
+                        await pending_own_filled_qty(self.ex, tid) or 0.0)
+                except Exception as e:                # noqa: BLE001
+                    logger.warning("[挂单] %s 压制前查成交失败（按原逻辑压制）：%s",
+                                   tid, e)
+                if _mine > 0:
+                    logger.warning(
+                        "[挂单] %s 虽有人工仓，但交易所显示我方单已成交 %.6f "
+                        "→ 不压制（这笔量属于我方，必须推进到 FILLED 并落账）",
+                        tid, _mine)
+                    try:
+                        self.db.log_risk(
+                            "pending_suppress_overridden",
+                            "%s: 我方已成交 %.6f，撤销人工仓压制" % (tid, _mine))
+                    except Exception:
+                        pass
+                    # 把这段量从人工仓里要回来（否则同一份量记两次）
+                    self._claim_back_from_adopted(_mine, tid)
+                    suppressed = False
+                else:
+                    _p_state = _T.EXPECTED
+                    _p_armed = None
+                    _p_armed_sub = None
+                    _p_ref = None
 
             # ★ 动作落地之后才前移游标（不变量 2）
             #   `_persist_next` 非 None = 计划那根还没进缓冲、本轮空转：
@@ -4246,6 +4516,143 @@ class DecisionEngine:
         except Exception:
             return ""
 
+    async def _attribute_own_fills(self) -> int:
+        """把「我方挂单已成交但还没落账」的量落成策略仓，返回落账条数。
+
+        OWN-1 的执行体。调用于 `_reconcile_positions()` 判人工仓接管**之前**。
+
+        为什么要单独一次遍历而不是复用状态机的判断：
+          状态机判成交的依据是 5m 收盘，而对账是按 5 分钟墙钟跑的。
+          两者不同步，先到的那一方说了算 —— 而对账手里没有"我方的成交"这个概念，
+          它只看到"交易所有仓、本地没有"。所以要在这里替它补上。
+
+        判据只信交易所（`pending_own_filled_qty` 内部 `query_order(client_id=)`）：
+        本地有没有想过这笔成交不重要，交易所记录了我这张单成交了多少才算数。
+
+        顺带做一件**归属纠正**：如果这笔量此前已经被误判成人工仓
+        （`adopted_pos` 里躺着同一方向同数量的仓），必须把它从人工仓里扣掉。
+        否则两边各记一份，本地账 = 2 倍交易所，下一轮对账会判"交易所比本地少"
+        然后硬停 —— 用一个新故障掩盖旧故障。
+        """
+        try:
+            rows = self.pending.live(limit=200)
+        except Exception as e:
+            logger.warning("[对账] 取预期列表失败，跳过归属纠正：%s", e)
+            return 0
+        from . import pending_thesis_store as _PTS
+
+        moved = 0
+        for row in rows or ():
+            tid = str(row.get("thesis_id") or "")
+            if not tid:
+                continue
+            # 只有「我方可能已经成交」的状态值得问交易所。
+            if str(row.get("state") or "") not in ("ARMED", "FILLED"):
+                continue
+            # 已经在系统仓里记着的，不要重复落账。
+            if self.pos and self._thesis_in_pos(tid):
+                continue
+            try:
+                q = await pending_own_filled_qty(self.ex, tid)
+            except Exception as e:
+                logger.warning("[对账] 查 %s 的成交失败（跳过）：%s", tid, e)
+                continue
+            if not q or q <= 0:
+                continue
+            logger.warning(
+                "[对账] %s 我方单已成交 %.6f 但本地账里没有 → 先按策略仓落账", tid, q)
+            try:
+                await self._pending_book_fill(_PTS.thesis_of(row))
+            except Exception as e:
+                logger.error("[对账] 归属纠偏落账失败 %s：%s", tid, e, exc_info=True)
+                try:
+                    self.db.log_risk("own_fill_book_failed",
+                                     "%s: %s" % (tid, str(e)[:200]))
+                except Exception:
+                    pass
+                continue
+            moved += 1
+            self._claim_back_from_adopted(q, tid)
+        return moved
+
+    def _thesis_in_pos(self, tid: str) -> bool:
+        """当前系统仓是不是这条预期开出来的。"""
+        try:
+            if not self.pos:
+                return False
+            return str(self.pos.get("thesis_id") or "") == tid
+        except Exception:
+            return False
+
+    def _claim_back_from_adopted(self, qty: float, tid: str) -> None:
+        """把这笔量从人工仓里扣掉（此前可能被误判成接管的人工仓）。
+
+        只扣同方向、按 FIFO 顺序扣。扣完归零就清空该槽 ——
+        它本来就是我方的仓，继续挂在"人工仓"名下等于让银行替别人保管存款。
+        """
+        a = getattr(self, "adopted_pos", None)
+        if not a or not self.pos:
+            return
+        if self._norm_side(a.get("side")) != self._norm_side(self.pos.get("side")):
+            return
+        aq = float(a.get("qty") or 0.0)
+        if aq <= 0:
+            return
+        cut = min(aq, qty)
+        left = aq - cut
+        logger.warning(
+            "[对账] 归属纠正：人工仓 %.6f → %.6f（其中 %.6f 其实是我方 %s 的成交）",
+            aq, left, cut, tid[:28])
+        try:
+            self.db.log_risk(
+                "adopted_claim_back",
+                "%s: 人工仓 %.6f 扣回 %.6f，剩 %.6f（归属纠正，不是新成交）"
+                % (tid, aq, cut, left))
+        except Exception:
+            pass
+        if left <= 1e-9:
+            self.adopted_pos = None
+            # 那张人工仓的 trade 行现在是**归错**的：它记的量属于策略仓。
+            # 按入场价、零盈亏关掉并留下明确理由 —— 绝不编一个平仓价。
+            try:
+                self.db.log_risk(
+                    "adopted_row_voided",
+                    "%s: 接管记录作废（量为我方成交，已按策略仓记账）" % tid[:40])
+            except Exception:
+                pass
+        else:
+            a["qty"] = left
+
+    def _pending_fill_bar_ts(self, tid: str) -> int:
+        """成交所在那根 5m 的开盘时刻 —— EXIT-1 找锚点的起点。
+
+        ★ 为什么不靠状态机自己记：
+          `thesis.step()` 每次只从 `next_index` 往后推，成交那一根只有在
+          "亲眼看到成交"的那一轮里存在过。下一轮、重启之后都看不到它，
+          局部变量活不下来，而丢了它的表现是"收盘跌破判据什么也不做"——
+          不报错、不告警，回测和实盘的出场规则悄悄分叉。
+
+          所以锚点从**持仓的 entry_ts** 推：它是落库的、重启还在。
+          对齐到 5m 桶边界即可（`assess` 的过滤条件是 `ts >= since_ts`）。
+
+        已知精度上限：`_pending_book_fill` 落账时的 entry_ts 是"落账那一刻"，
+        可能比真实成交晚一根。晚一根的代价是锚点晚一根开始找 ——
+        最坏情况退化成"用下一根的收盘判跌破"，不会误判成没跌破。
+        状态机自己看到成交那条路径是精确的（`res.fill_bar_ts`）。
+        """
+        p = self.pos
+        if not p:
+            return 0
+        owner = str(p.get("thesis_id") or "")
+        # 只认这条预期自己开出来的仓；别把别的预期的仓拿来当锚点
+        if owner and owner != tid:
+            return 0
+        ts = int(p.get("entry_ts") or 0)
+        if ts <= 0:
+            return 0
+        _step = 300000
+        return ts - (ts % _step)
+
     async def _pending_book_fill(self, th) -> None:
         """挂单成交 → 写一条开仓 trade，并把仓位设进 `self.pos`。
 
@@ -4370,11 +4777,10 @@ class DecisionEngine:
         #   用户 2026-11-24：「假如已存在的单子是系统单子，属于加仓行为，
         #   当然要执行」—— 执行，而且必须记成系统仓，不是覆盖整笔仓。
         if self.pos and norm_side(self.pos.get("side")) == side:
-            _oq = float(self.pos.get("qty") or 0.0)
-            _oe = float(self.pos.get("entry") or 0.0)
-            _nq = _oq + book_qty
-            self.pos["entry"] = ((_oe * _oq + entry * book_qty) / _nq) if _nq > 0 else entry
-            self.pos["qty"] = _nq
+            # ★ BOOK-1：同向加仓 = 追加一个 lot（不同价的两次成交不能被压成均价，
+            #   否则 R 倍数和单腿盈亏都失真）。
+            self._push_lot(self.pos, book_qty, entry, now_ms, fee=open_fee)
+            _nq = float(self.pos.get("qty") or 0.0)
             # 止损/止盈取**更近的那一条**（更保守的一侧）：
             # 加仓后暴露变大，保护必须跟着收紧的方向走，不能放宽。
             for _k in ("stop", "target"):
@@ -4389,6 +4795,9 @@ class DecisionEngine:
                     self.pos[_k] = _new
             logger.warning("[挂单] %s 系统仓加仓：+%.6f @ %.2f → 合计 %.6f，均价 %.2f",
                            th.thesis_id, book_qty, entry, _nq, self.pos["entry"])
+            # ★ OWN-1：记下这段量属于哪条预期。对账要问「这笔仓是不是我方的」，
+            #   只靠 qty 猜不出来，必须有一个明确的归属标记。
+            self.pos["thesis_id"] = str(th.thesis_id)
         elif self.pos:
             # 反向成交 = 先平后反手，不属于"加仓"，拒绝自动处理交人工。
             logger.error("[挂单] %s 成交方向 %s 与现有系统仓 %s 相反，拒绝覆盖",
@@ -4409,6 +4818,11 @@ class DecisionEngine:
                         "bars": 0, "best": entry, "worst": entry, "trade_id": None,
                         "max_hold_bars": self.tcfg.max_hold_bars,
                         "open_reason": PENDING_FILL_REASON, "paper": 0,
+                        # ★ OWN-1：归属标记（见加仓那一段的注释）
+                        "thesis_id": str(th.thesis_id),
+                        # ★ BOOK-1：这一腿就是一个 lot
+                        "lots": [{"qty": abs(book_qty), "entry": float(entry),
+                                  "ts": now_ms, "fee": abs(float(open_fee or 0.0))}],
                         "fee": open_fee}
         logger.warning("[挂单] %s 成交落账：%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）",
                        th.thesis_id, side, book_qty, entry, stop, target)
@@ -5107,21 +5521,23 @@ class DecisionEngine:
         pnl, fee_total, pnl_net = close_booking(
             pos, exit_price, getattr(fill, "fee", 0.0), qty,
             pos.get("side"))
-        try:
-            self.db.close_trade({
-                "symbol": self.tcfg.symbol, "side": pos.get("side"),
-                "qty": qty, "entry_ts": pos.get("entry_ts"),
-                "entry_price": entry, "exit_ts": int(time.time() * 1000),
-                "exit_price": exit_price,
-                "stop_price": pos.get("stop"), "target_price": pos.get("target"),
-                "pnl_gross": pnl, "fee": fee_total, "pnl_net": pnl_net,
-                "mfe": 0.0, "mae": 0.0,
-                "open_reason": pos.get("open_reason", ""),
-                "close_reason": "挂单策略出场（%s）" % str(getattr(act, "reason", "")),
-                "paper": int(pos.get("paper") or 0)})
-        except Exception as e:
-            logger.error("[挂单] %s 平仓已成交但关账失败：%s", tid, e, exc_info=True)
-            self.db.log_risk("pending_close_book_failed", "%s: %s" % (tid, str(e)[:200]))
+        # ★★ BOOK-1：按 lot 分笔结算（每个 lot 自身 entry × 自身 qty）。
+        _g, _f, _n = self._settle_close(
+            pos, qty, exit_price, getattr(fill, "fee", 0.0),
+            "挂单策略出场（%s）" % str(getattr(act, "reason", "")),
+            exit_ts=int(time.time() * 1000), symbol=self.tcfg.symbol,
+            paper=int(pos.get("paper") or 0),
+            strategy=getattr(self.tcfg, "strategy", ""))
+        if abs(_g - pnl) > 1e-6 or abs(_f - fee_total) > 1e-6:
+            logger.error("[挂单] %s 分笔结算与整体不一致：毛 %.6f vs %.6f，费 %.6f vs %.6f",
+                         tid, _g, pnl, _f, fee_total)
+            try:
+                self.db.log_risk("pending_close_lot_mismatch",
+                                 "%s: 毛 %.6f vs %.6f（qty=%.6f entry=%.2f）"
+                                 % (tid, _g, pnl, float(pos.get("qty") or 0.0), entry))
+            except Exception:
+                pass
+        pnl, fee_total, pnl_net = _g, _f, _n
         # ★★ P3：把 R 倍数补上（2026-11-25 交易域审查）。
         #
         #   `pending_thesis_store.set_exit()` 从写出来那天起**零调用** ——
@@ -6584,22 +7000,31 @@ class DecisionEngine:
         self.db.log_fill({"ts": now_ms, "symbol": self.tcfg.symbol, "side": order_side,
                           "price": fill.price, "qty": sold_qty, "fee": fill.fee,
                           "fee_asset": "USDT", "paper": 1 if self.ex.name == "paper" else 0})
-        self.db.close_trade({
-            "symbol": self.tcfg.symbol, "side": p["side"], "qty": sold_qty,
-            "entry_ts": p["entry_ts"], "entry_price": p["entry"],
-            "exit_ts": now_ms, "exit_price": fill.price,
-            "stop_price": p["stop"], "target_price": p["target"],
-            "pnl_gross": round(gross, 6), "fee": round(fee_total, 6), "pnl_net": round(net, 6),
-            # MFE/MAE 用持仓期间的真实最高/最低价。
-            # 旧实现里 mae = (exit - entry) * -direction，那是【出场移动】，
-            # 不是最大不利偏移——两者在价格中途反复时完全不同。
-            # 这个字段没人读过，所以一直没暴露；但将来要用它标定止损档位，
-            # 假数据会直接把结论带偏。mae 按行业惯例为负（不利方向）。
-            "mfe": round((p["best"] - p["entry"]) * direction, 6),
-            "mae": round((p.get("worst", p["entry"]) - p["entry"]) * direction, 6),
-            "open_reason": p.get("open_reason", "")[:300], "close_reason": reason[:200],
-            "paper": 1 if self.ex.name == "paper" else 0,
-            "strategy": self.tcfg.strategy})
+        # ★★ BOOK-1：按 lot 分笔结算，每个 lot 写自己那一行。
+        #   汇总值必须和 `close_booking()` 完全一致（均价 × 总量）；
+        #   不一致说明 lot 的 qty/entry 汇总关系被破坏了 ——
+        #   那正是 id=33 那行「qty=0.02 / entry=58437 / pnl 按 58057 算」的形态。
+        _g, _f, _n = self._settle_close(
+            p, sold_qty, fill.price, fill.fee, reason,
+            exit_ts=now_ms, symbol=self.tcfg.symbol,
+            paper=1 if self.ex.name == "paper" else 0,
+            strategy=self.tcfg.strategy)
+        if abs(_g - gross) > 1e-6 or abs(_f - fee_total) > 1e-6:
+            logger.error(
+                "按笔结算与整体结算不一致：分笔(毛 %.6f 费 %.6f) vs 整体(毛 %.6f 费 %.6f)"
+                "｜持仓 %.6f @ %.2f，lots=%s", _g, _f, gross, fee_total,
+                float(p.get("qty") or 0.0), float(p.get("entry") or 0.0),
+                [(round(float(l["qty"]), 6), round(float(l["entry"]), 2))
+                 for l in self._lots_of(p)])
+            try:
+                self.db.log_risk(
+                    "close_lot_mismatch",
+                    "分笔毛 %.6f vs 整体毛 %.6f（qty=%.6f entry=%.2f）"
+                    % (_g, gross, float(p.get("qty") or 0.0),
+                       float(p.get("entry") or 0.0)))
+            except Exception:
+                pass
+        gross, fee_total, net = _g, _f, _n
 
         self.risk.day_pnl += net
         if net < 0:

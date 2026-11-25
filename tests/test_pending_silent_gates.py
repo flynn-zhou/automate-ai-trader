@@ -478,7 +478,10 @@ def _close_env(pos):
 
     st.ex = _Ex()
     st.tcfg = SimpleNamespace(symbol="BTCUSDT")
-    _bind(st, "_pending_close")
+    # 平仓路径现在还会：撤地板单、推飞书。桩上绑**产品真实现**，
+    # 不写空壳 —— 空壳会让"接线是否真的发生"变成测不到的空白。
+    _bind(st, "_pending_close", "_push", "_system_stop_state",
+          "_cancel_system_stop_order")
     return st
 
 

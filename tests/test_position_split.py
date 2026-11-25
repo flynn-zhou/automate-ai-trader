@@ -110,7 +110,11 @@ def _engine_stub(adopted=None, pos=None, ex=None):
                   # 那张保护性止损单，`_adopted_close` 会调它们。
                   "_adopted_stop_state", "_adopted_stop_cid",
                   "_sync_adopted_stop_order", "_cancel_adopted_stop_order",
-                   "_pending_plan_ts", "_pending_repair_params"):
+                   "_pending_plan_ts", "_pending_repair_params",
+                  # 2026-11-25 晚：成交落账/平仓现在还会推飞书、撤地板单。
+                  # 桩上绑产品真实现（空壳会让"接线是否发生"测成空白）。
+                  "_push", "_system_stop_state", "_cancel_system_stop_order",
+                  "_maintain_system_protection"):
         _fn = E.DecisionEngine.__dict__[_name]
         _fn = getattr(_fn, "__func__", _fn)
         setattr(st, _name, _types.MethodType(_fn, st))

@@ -293,7 +293,9 @@ def _pending_engine_stub(can_open=True, place_err=""):
                  "_gate_pending_unattended", "_gate_pending_size",
             "_gate_pending_margin", "_pending_need_margin",
             "_reclaim_margin",
-                 "_place_pending_order"):
+                 "_place_pending_order",
+            # 2026-11-25 晚：拒单路径会推飞书（节流），桩上绑产品真实现。
+            "_push"):
         raw = E.DecisionEngine.__dict__[name]
         if isinstance(raw, staticmethod):
             setattr(st, name, raw.__func__)

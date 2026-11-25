@@ -112,7 +112,13 @@ _ENGINE_METHODS = ("_is_adopted", "_pending_place", "_pending_close",
                    "_sync_adopted_stop_order", "_cancel_adopted_stop_order",
                    # SIG-PARAMS（2026-11-25）：游标锚点与旧行参数修复。
                    # `_step_pending` 现在每条预期都要调这两个才能跑完。
-                   "_pending_plan_ts", "_pending_repair_params")
+                   "_pending_plan_ts", "_pending_repair_params",
+                   # 2026-11-25 晚：策略仓地板单 + 飞书推送接进平仓/拒单路径。
+                   # `_pending_close` / `_close` 现在还要调这三个（桩上没有
+                   # 它们会 AttributeError —— 那是"桩缺方法"，不是产品缺陷，
+                   # 所以绑产品真实现，而不是在桩上写个空壳掩盖过去）。
+                   "_system_stop_state", "_cancel_system_stop_order",
+                   "_maintain_system_protection", "_push")
 
 
 class FakePending(object):

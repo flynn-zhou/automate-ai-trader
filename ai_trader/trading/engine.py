@@ -85,6 +85,25 @@ _FILLED_STATES = ("FILLED", "PARTIALLY_FILLED")
 #:   查一次就能把已有的那张单接管过来，而不是再挂一张。
 ADOPTED_STOP_CID_PREFIX = "AI-SL-"
 
+#: 策略仓（我们自己开的仓）交易所侧地板单的 clientOrderId 前缀。
+#: ★ 必须与接管仓的 `AI-SL-` **不同前缀**：两者的 entry_ts 完全可能相同
+#:   （同一秒两边都有仓），撞 id 会让"查是谁平的"查到错的那张单，
+#:   于是把真实平仓价记到另一笔交易上。
+SYSTEM_STOP_CID_PREFIX = "AI-SLP-"
+
+
+def _system_stop_cid(entry_ts) -> str:
+    """策略仓地板单的 clientOrderId：`AI-SLP-<entry_ts>`。
+
+    稳定（同一笔仓永远同一个 id）→ 重启后能认回同一张单，
+    不会每重启一次就多挂一张；也是事后反查"谁平的、平在哪"的钥匙。
+    """
+    try:
+        ts = int(float(entry_ts or 0))
+    except (TypeError, ValueError):
+        ts = 0
+    return "%s%d" % (SYSTEM_STOP_CID_PREFIX, ts)
+
 
 def pending_client_id(thesis_id) -> str:
     """挂单/撤单**共用**的 clientOrderId。两处必须调同一个函数。
@@ -1032,10 +1051,66 @@ class DecisionEngine:
             # ★ 两个都要关（2026-11-24 拆仓）：漏掉一个的后果不是"少一条记录"，
             #   而是重启之后那一笔会被当成"交易所有仓、我们没有" —— 于是
             #   系统仓被重新接管成人工仓，归因再次串掉。
+            #
+            # ★★ 2026-11-25：**先尽力还原真实平仓价**，再退回占位记账。
+            #
+            #   原来的实现一律写 `exit_price = 入场价`、`fee=0`、`pnl=0`
+            #   （见下），那等于把这笔交易记成"打平"。以前它很少被走到，
+            #   因为本系统的平仓都会先调 `_close()`/`_pending_close()`
+            #   自己记账，走到这里基本只剩"仓在别处消失"。
+            #
+            #   但一旦策略仓有了交易所侧地板单（reduceOnly STOP_MARKET），
+            #   **地板成交就是走这条路**：进程没来得及动作、价格瞬间穿过止损，
+            #   交易所替我们平了。这时候若还写"入场价 = 平仓价、盈亏 0"，
+            #   等于系统把一次真实亏损记成打平 —— 把风控做成了造假账。
+            #
+            #   所以按 client_id 反查那张单的真实成交价：
+            #     地板单 AI-SLP-<entry_ts>（策略仓）
+            #     接管仓 AI-SL-<entry_ts>（人工仓）
+            #   查得到就用真价 + 真手续费；查不到才退回占位，并留风险事件。
             for _which in ("pos", "adopted"):
                 _slot = getattr(self, "adopted_pos" if _which == "adopted" else "pos")
                 if not _slot:
                     continue
+                # 先试着还原真实平仓价（地板单/接管止损单成交）
+                _real = await self._resolve_closed_slot_price(_slot)
+                if _real:
+                    _xp, _xfee, _src = _real
+                    _pnl = (float(_xp) - float(_slot["entry"])) * float(_slot["qty"])
+                    if self._norm_side(_slot.get("side")) == "short":
+                        _pnl = -_pnl
+                    _net = _pnl - float(_slot.get("fee") or 0.0) - float(_xfee or 0.0)
+                    logger.warning("[对账] 还原真实平仓：%s %.6f @ %.2f"
+                                   "（%s）→ 毛 %+.4f / 费 %.4f / 净 %+.4f",
+                                   _slot["side"], float(_slot["qty"]), _xp, _src,
+                                   _pnl, float(_xfee or 0.0), _net)
+                    self.db.close_trade({
+                        "symbol": self.tcfg.symbol, "side": _slot["side"],
+                        "qty": _slot["qty"], "entry_ts": _slot["entry_ts"],
+                        "entry_price": _slot["entry"], "exit_ts": int(time.time() * 1000),
+                        "exit_price": float(_xp),
+                        "stop_price": _slot["stop"], "target_price": _slot["target"],
+                        "pnl_gross": _pnl, "fee": float(_slot.get("fee") or 0.0)
+                        + float(_xfee or 0.0), "pnl_net": _net,
+                        "mfe": 0.0, "mae": 0.0,
+                        "open_reason": _slot.get("open_reason", ""),
+                        "close_reason": "实盘对账：交易所已无此仓（%s）" % _src,
+                        "paper": int(_slot.get("paper") or 0)})
+                    if _which == "adopted":
+                        self.adopted_pos = None
+                    else:
+                        self.pos = None
+                        # 地板单已成交：清本地记录，免得下一轮拿旧 oid
+                        # 去撤一张已经不存在的单（会产生噪声 + 白一次请求）。
+                        if _real:
+                            self._system_stop = {}
+                    continue
+                # 还原不了才退回占位记账 —— 但**不再静默**：留一条风险事件，
+                # 因为这条路径记出来的盈亏是 0，不是真实结果。
+                self.db.log_risk(
+                    "position_closed_unpriced",
+                    "%s: 交易所已无此仓，查不到我方平仓单的成交价 → 按入场价占位记账"
+                    % _which)
                 self.db.close_trade({
                     "symbol": self.tcfg.symbol, "side": _slot["side"],
                     "qty": _slot["qty"], "entry_ts": _slot["entry_ts"],
@@ -1052,6 +1127,7 @@ class DecisionEngine:
                     self.adopted_pos = None
                 else:
                     self.pos = None
+                    self._system_stop = {}
         else:
             # 交易所有仓、而我们记的不一致。**先判这笔差额是谁造成的，
             # 再决定怎么记账** —— 顺序反了就会把系统自己的漏账成交
@@ -1309,6 +1385,15 @@ class DecisionEngine:
                 if self.adopted_pos:
                     _px = float(getattr(self.feed, "last_price", 0.0) or 0.0)
                     await self._maintain_adopted_protection(_px)
+
+                # 策略仓同理：重启后本地有仓（从 trades 表重建）而交易所侧
+                # 可能没有地板单 —— 这条路径必须在 `_step` 第一轮之前就补上。
+                if self.pos:
+                    _px2 = float(getattr(self.feed, "last_price", 0.0) or 0.0)
+                    try:
+                        await self._maintain_system_protection(_px2)
+                    except Exception as e:               # noqa: BLE001
+                        logger.error("[对账] 重启后补地板单失败（下一 tick 重试）：%s", e)
 
         # guard.notify 可能本身是 None：没配 AI_FEISHU_WEBHOOK 时
         # feishu_notifier() 返回 None，Guard 把它原样存进 self.notify。
@@ -1676,6 +1761,17 @@ class DecisionEngine:
         #      修法不是"两个地方都跑"（那才是同一根 K 判两次），
         #      而是**只留一个调用点，放在这里**：3 秒粒度、与策略无关、
         #      `_step_pending` 不再调用它。
+        # ★★ 策略仓地板单：**与接管仓无关**，必须每 tick 独立维护。
+        #
+        #   我第一版把它写在下面 `if self._is_adopted():` 里面 —— 那等于
+        #   「只有接管仓存在时才保护策略仓」，而没有接管仓恰恰是最常见的
+        #   情形。这种"放对了顺序、放错了作用域"的错误，源码看着很合理，
+        #   所以必须靠一行位置断言 + 一个行为测试钉住。
+        try:
+            await self._maintain_system_protection(price)
+        except Exception as e:                           # noqa: BLE001
+            logger.error("[地板] 维护失败（下一 tick 重试）：%s", e)
+
         if self._is_adopted():
             # ★★ 2026-11-25（用户裁决）保护单必须在**接管那一刻**就存在，
             #    不能等「接管之后第一根已收盘 15m」。
@@ -1721,6 +1817,15 @@ class DecisionEngine:
                 await self._cancel_adopted_stop_order("人工仓已不在")
             except Exception as e:
                 logger.error("[接管] 撤遗留止损单失败：%s", e)
+
+        # ★ 策略仓地板单的看门狗（同接管仓那条的道理，独立判断）：
+        #   仓在别处消失（强平/手工平/对账修正）而地板单还挂着 → 撤掉。
+        #   注意判据是 `self.pos` 为空，不看 `_is_adopted`：两者互不影响。
+        if not self.pos and self._system_stop_state().get("oid"):
+            try:
+                await self._cancel_system_stop_order("策略仓已不在")
+            except Exception as e:                      # noqa: BLE001
+                logger.error("[地板] 撤遗留地板单失败：%s", e)
 
         if self._is_chan():
             await self._step_trend(bars_by_iv, price, equity, now_ms)
@@ -4307,6 +4412,12 @@ class DecisionEngine:
                         "fee": open_fee}
         logger.warning("[挂单] %s 成交落账：%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）",
                        th.thesis_id, side, book_qty, entry, stop, target)
+        # 钱动了就要叫人（不节流）
+        self._push(
+            "【开仓·挂单成交】%s %s %.6f @ %.2f"
+            % (self.tcfg.symbol, side, book_qty, entry),
+            "止损 %.2f｜止盈 %.2f\n形态：%s\n预期：%s"
+            % (stop, target, th.kind, th.thesis_id))
 
     @staticmethod
     def _to_pending_bars(seq) -> list:
@@ -4614,6 +4725,9 @@ class DecisionEngine:
         logger.warning("[挂单] %s 被安全闸拦下，不挂单：%s", intent.thesis_id, g_why)
         self.db.log_risk("pending_blocked_by_guard",
                          "%s: %s" % (intent.thesis_id, g_why))
+        # 节流：熔断/连亏这类闸会一直拦，每轮推一条等于把频道静音
+        self._push("【拒单】被安全闸拦下", "%s\n%s" % (intent.thesis_id, g_why),
+                   key="pending_blocked_by_guard", min_gap_s=3600)
         return GateResult(gate=GATE_UNATTENDED, ok=False, detail=str(g_why or ""))
 
     async def _gate_pending_size(self, intent, ctx) -> Optional[GateResult]:
@@ -4626,6 +4740,9 @@ class DecisionEngine:
                            intent.thesis_id, why)
             self.db.log_risk("pending_unaffordable",
                              "%s: %s" % (intent.thesis_id, str(why)[:220]))
+            self._push("【拒单】资金不够建这个仓",
+                       "%s\n%s" % (intent.thesis_id, str(why)[:300]),
+                       key="pending_unaffordable", min_gap_s=3600)
             return GateResult(gate=GATE_SIZING, ok=False, detail=str(why or ""))
         ctx["qty"] = qty
         ctx["size_why"] = why
@@ -4720,6 +4837,10 @@ class DecisionEngine:
             why += "（%d 张撤单失败）" % failures
         logger.error("[挂单] %s %s", tid, why)
         self.db.log_risk("pending_margin_short", "%s: %s" % (tid, why))
+        # ★ 这条**必须**推：它是"我撤了别人的单还是没钱开"的唯一信号，
+        #   而且历史形态就是每 5 分钟一轮（-2019 死循环），所以按小时节流。
+        self._push("【拒单】可用保证金不足", "%s\n%s" % (tid, why),
+                   key="pending_margin_short", min_gap_s=3600)
         return GateResult(gate=GATE_MARGIN, ok=False, detail=why)
 
     def _pending_need_margin(self, qty, entry) -> float:
@@ -4837,6 +4958,8 @@ class DecisionEngine:
         if err:
             logger.error("[挂单] %s 下单失败：%s", tid, err)
             self.db.log_risk("pending_place_failed", "%s: %s" % (tid, err[:220]))
+            self._push("【拒单】下单失败", "%s\n%s" % (tid, err[:300]),
+                       key="pending_place_failed", min_gap_s=3600)
             return False, None, str(err)
         logger.info("[挂单] %s %s %.6f @ %.1f（止损 %.1f，%s） -> %s",
                     tid, api_side, qty, intent.entry, intent.stop, otype,
@@ -5033,6 +5156,17 @@ class DecisionEngine:
         logger.info("[挂单] %s %s 平 %.6f @ %.2f（%s，毛 %+.2f / 费 %.4f / 净 %+.2f）",
                     tid, side, qty, exit_price, getattr(act, "reason", ""),
                     pnl, fee_total, pnl_net)
+        # 进程内先出场 → 撤掉地板单（"谁先发生谁说了算"）
+        try:
+            await self._cancel_system_stop_order(
+                "挂单策略已平仓：%s" % str(getattr(act, "reason", ""))[:40])
+        except Exception as e:                           # noqa: BLE001
+            logger.warning("[地板] 挂单平仓后撤地板单失败（不影响交易）：%s", e)
+        # 钱动了就要叫人（不节流）
+        self._push(
+            "【平仓·挂单策略】%s %s 净 %+.2fU" % (self.tcfg.symbol, side, pnl_net),
+            "原因：%s\n成交 %.2f｜形态：%s\n毛 %+.2f｜费 %.4f"
+            % (getattr(act, "reason", ""), exit_price, tid, pnl, fee_total))
 
     def _plan_leverage(self) -> float:
         """计划杠杆。永续口径（现货那条 `return 1.0` 已删）。
@@ -5394,7 +5528,14 @@ class DecisionEngine:
                                       "max_hold_bars": plan.max_hold_bars},
                            signal_reason=sig["reason"])
         logger.info("开仓 %s %.3f @ %.1f 止损 %.1f 目标 %.1f 风险 %.2fU",
-                    side_txt, plan.qty, fill.price, plan.stop, plan.target, plan.risk_usdt)
+                    side_txt, plan.qty, fill.price, plan.stop, plan.target,
+                    plan.risk_usdt)
+        # 钱动了就要叫人（不节流：每次开仓都必须看到）
+        self._push(
+            "【开仓】%s %s %.6f @ %.2f"
+            % (self.tcfg.symbol, side_txt, got_qty, fill.price),
+            "止损 %.2f｜目标 %.2f｜风险 %.2fU\n理由：%s"
+            % (plan.stop, plan.target, plan.risk_usdt, plan.reason))
 
     # ---------------- 管仓 ----------------
     # ==================== BUS-C：守卫观察期（只记录，不执行）====================
@@ -5820,6 +5961,270 @@ class DecisionEngine:
         # （成功 → 不再挂；失败 → 重挂一张新的，而不是永远卡在旧 id 上）。
         self._adopted_stop = {}
 
+    # ---------- B2：策略仓在交易所侧的地板单 ----------
+    #
+    # ★ 与接管仓那张（`AI-SL-`）**并存但不同源**：
+    #     · 接管仓：人工开的仓，我们没有策略出场逻辑，那张单就是唯一保护；
+    #     · 策略仓：我们自己的仓，进程内有完整出场判断，这张单是**地板**。
+    #
+    # ★ 谁说了算（用户 2026-11-25 裁决后的落地口径）：
+    #     **谁先发生谁说了算**。进程内先出场 → 撤掉地板；
+    #     地板先成交（价格瞬间穿过、进程来不及） → 以它的成交价记账
+    #     （还原逻辑见 `_resolve_closed_slot_price`）。
+    #   两者都记账，不存在"两套止损互相不知道"的情况。
+
+    def _system_stop_state(self) -> dict:
+        st = getattr(self, "_system_stop", None)
+        return st if isinstance(st, dict) else {}
+
+    async def _cancel_system_stop_order(self, why: str = "") -> None:
+        """撤掉策略仓的地板单。失败只记日志，不抛（reduceOnly 开不出反向仓）。"""
+        oid = str(self._system_stop_state().get("oid") or "")
+        if not oid:
+            self._system_stop = {}
+            return
+        fn = getattr(self.ex, "cancel_order", None)
+        ok, err = False, ""
+        if fn is None:
+            err = "执行器不支持撤单"
+        else:
+            try:
+                ok = bool(await fn(order_id=oid))
+            except Exception as e:                           # noqa: BLE001
+                err = str(e)[:180]
+        if ok:
+            logger.info("[地板] 已撤掉交易所侧地板单 %s（%s）", oid, why or "-")
+        else:
+            logger.warning("[地板] 撤地板单失败 %s（%s）：%s", oid, why, err)
+        # 无论成败都清本地记录：下一轮按现状收敛（失败 → 重挂，而不是卡在旧 id）
+        self._system_stop = {}
+
+    async def _maintain_system_protection(self, price: float) -> None:
+        """确保**策略仓**在交易所侧有一张地板单。幂等，失败只记事件不抛。
+
+        收敛规则（与接管仓那张同构，但独立状态）：
+          · 没仓 / 纸面           → 撤单（纸面挂单不会自己触发，见下）
+          · stop<=0 / qty<=0      → 撤单
+          · 取整后不足一步长      → 撤单
+          · 止损已在现价内侧      → 不挂（进程内这一 tick 就会平）
+          · 与本地记录一致        → 什么都不做
+          · 否则                  → 撤旧挂新
+
+        ★ 为什么纸面模式必须跳过：纸面执行器的条件单要 `on_bar_5m` 才会触发，
+          策略仓这条链并不保证每根 5m 都回调 —— 挂上去只会造成
+          "以为有交易所保护、其实没有"的错觉，比不挂更危险。
+        """
+        if str(getattr(self.ex, "name", "") or "") != "live":
+            return
+        pos = self.pos
+        if not pos:
+            await self._cancel_system_stop_order("已无策略仓")
+            return
+        stop = float(pos.get("stop") or 0.0)
+        qty = abs(float(pos.get("qty") or 0.0))
+        if stop <= 0 or qty <= 0:
+            await self._cancel_system_stop_order(
+                "止损位或手数无效（stop=%.4f qty=%.6f）" % (stop, qty))
+            return
+        step = float(self._qty_step() or 0.0)
+        if step > 0:
+            qty = round(float(int(qty / step + 1e-9)) * step, 12)
+        if qty <= 0 or (step > 0 and qty < step - 1e-12):
+            await self._cancel_system_stop_order("手数取整后不足一个步长")
+            return
+
+        is_long = self._norm_side(pos.get("side")) == "long"
+        close_side = "SELL" if is_long else "BUY"
+        # 止损已经被穿过：币安会以 -2021「would immediately trigger」直接拒单。
+        # 这时不该挂，进程内这一 tick 就会平；挂了也只是白一次请求 + 一条 ERROR。
+        if price > 0 and ((is_long and price <= stop)
+                          or ((not is_long) and price >= stop)):
+            if self._system_stop_state().get("oid"):
+                await self._cancel_system_stop_order("止损已被穿过")
+            else:
+                # ★ 只在第一次提醒（状态为空时），否则每 3 秒一条风险事件
+                if not getattr(self, "_system_stop_immediate_logged", False):
+                    self._system_stop_immediate_logged = True
+                    logger.warning(
+                        "[地板] 止损 %.2f 已被现价 %.2f 穿过 → 不挂地板单，"
+                        "交给进程内立即平仓", stop, price)
+                    try:
+                        self.db.log_risk("system_stop_immediate",
+                                         "stop=%.2f price=%.2f（不挂，进程内平）"
+                                         % (stop, price))
+                    except Exception:                        # noqa: BLE001
+                        pass
+            return
+        self._system_stop_immediate_logged = False
+
+        cid = _system_stop_cid(pos.get("entry_ts"))
+        state = self._system_stop_state()
+        if (state.get("oid") and abs(float(state.get("px") or 0.0) - stop) < 1e-9
+                and abs(float(state.get("qty") or 0.0) - qty) < 1e-12):
+            return                                   # 已对齐，不发请求
+
+        place_fn = getattr(self.ex, "place_order", None)
+        if place_fn is None:
+            return
+        if state.get("oid"):
+            await self._cancel_system_stop_order(
+                "止损/手数变化 %.4f→%.4f / %.6f→%.6f"
+                % (float(state.get("px") or 0.0), stop,
+                   float(state.get("qty") or 0.0), qty))
+
+        # 重启幂等：内存空了但交易所可能已经有同一张单，先按 cid 认回来
+        q_fn = getattr(self.ex, "query_order", None)
+        if q_fn is not None:
+            try:
+                ex_order = await q_fn(client_id=cid)
+            except Exception:                            # noqa: BLE001
+                ex_order = None
+            if ex_order is not None and str(getattr(ex_order, "status", "")
+                                            ).upper() in ("NEW", "PARTIALLY_FILLED"):
+                self._system_stop = {
+                    "oid": str(getattr(ex_order, "order_id", "") or ""),
+                    "px": float(getattr(ex_order, "stop_price", 0.0) or 0.0),
+                    "qty": float(getattr(ex_order, "qty", 0.0) or 0.0),
+                }
+                st2 = self._system_stop_state()
+                if (st2.get("oid")
+                        and abs(float(st2.get("px") or 0.0) - stop) < 1e-9
+                        and abs(float(st2.get("qty") or 0.0) - qty) < 1e-12):
+                    logger.info("[地板] 认回已有的地板单 %s（%.2f）",
+                                st2["oid"], stop)
+                    return
+                if st2.get("oid"):
+                    await self._cancel_system_stop_order("重启后参数已变")
+
+        try:
+            order, err = await place_fn(
+                close_side, qty, order_type="STOP_MARKET", stop_price=stop,
+                reduce_only=True, client_id=cid,
+                working_type="CONTRACT_PRICE")
+        except Exception as e:                           # noqa: BLE001
+            order, err = None, str(e)[:200]
+        oid = str(getattr(order, "order_id", "") or "") if order else ""
+        if err or not oid:
+            logger.error("[地板] 挂地板单失败（%.2f / %.6f）：%s",
+                         stop, qty, err or "无返回 id")
+            try:
+                self.db.log_risk("system_stop_order_failed",
+                                 "%.2f / %.6f：%s" % (stop, qty, (err or "")[:180]))
+            except Exception:                            # noqa: BLE001
+                pass
+            self._system_stop = {}
+            return
+        self._system_stop = {"oid": oid, "px": stop, "qty": qty}
+        logger.warning("[地板] 交易所侧地板单已挂 %s %s %.6f 触发 %.2f（%s）",
+                       oid, close_side, qty, stop, cid)
+        try:
+            self.db.log_risk("system_stop_ordered",
+                             "%s %s %.6f @ 触发 %.2f（%s）"
+                             % (oid, close_side, qty, stop, cid))
+        except Exception:                                # noqa: BLE001
+            pass
+
+    async def _resolve_closed_slot_price(self, slot):
+        """交易所已无此仓时，反查**是谁把它平掉的、平在什么价**。
+
+        ★ 为什么需要（2026-11-25）：对账发现"交易所有仓 → 本地空仓"时，
+          原来的实现一律按**入场价**记平仓（见调用点的长注释）。加上
+          交易所侧地板单之后，地板成交正好走这条路，于是真实亏损会被
+          记成打平。
+
+        查两个 client_id（同源：`_adopted_stop_cid` 与策略仓地板单）：
+            AI-SLP-<entry_ts>  策略仓地板单
+            AI-SL-<entry_ts>   接管仓保护单
+
+        Returns:
+            ``(exit_price, fee, source)`` ；查不到返回 None（**不猜价**）。
+            `fee` 是平仓那一侧的 taker 费，拿不到就 0（宁可少算费，
+            也不编一个数 —— 少算费只会让净盈亏偏乐观一点，
+            编一个价会让整笔交易的归因全错）。
+        """
+        try:
+            entry_ts = int(slot.get("entry_ts") or 0)
+            if entry_ts <= 0:
+                return None
+            qty = abs(float(slot.get("qty") or 0.0))
+            for _cid, _src in ((_system_stop_cid(entry_ts), "策略仓地板单"),
+                               (self._adopted_stop_cid(slot), "接管仓保护单")):
+                if not _cid:
+                    continue
+                try:
+                    o = await self.ex.query_order(client_id=_cid)
+                except Exception as e:                       # noqa: BLE001
+                    logger.warning("[对账] 查平仓单 %s 失败：%s", _cid, e)
+                    continue
+                if o is None:
+                    continue
+                if str(getattr(o, "status", "") or "").upper() != "FILLED":
+                    continue
+                px = float(getattr(o, "avg_price", 0.0) or 0.0)
+                if px <= 0:
+                    # 极少数情况 avgPrice 缺失：拿成交额/成交量也拿不到就放弃
+                    continue
+                got = abs(float(getattr(o, "executed_qty", 0.0) or 0.0))
+                if qty > 0 and got > 0 and got + 1e-9 < qty:
+                    # 只成交了一部分：剩下的不是这张单平的，别拿它当整笔的价
+                    logger.warning("[对账] %s 只成交 %.6f/%.6f，不据此还原整笔",
+                                   _cid, got, qty)
+                    continue
+                fee = abs(float(px * got) * 0.0005)      # taker 0.05% 估
+                return px, fee, "%s %s" % (_src, _cid)
+        except Exception as e:                               # noqa: BLE001
+            logger.warning("[对账] 还原平仓价失败（退回占位记账）：%s", e)
+        return None
+
+    def _push(self, title: str, body: str, key: str = "",
+              min_gap_s: int = 0) -> None:
+        """往飞书推一条**给人看的**事件。绝不抛、绝不阻塞主流程。
+
+        ★ 为什么需要它（2026-11-25）：全仓唯一的 notify 调用在
+          `guard._event(alert=True)` 里，也就是**只有硬停/对账不一致**
+          才会推飞书。开仓成交、平仓、拒单这些「钱真的动了」的时刻
+          一律只进本地库 —— 人在手机上看不到，只能事后翻库才知道。
+          用户的原话是「干等也不是事」，根子在这。
+
+        两条纪律：
+          1. **通知不能反过来搞崩交易**。`feishu_notifier()` 返回的
+             `_send(title, body)` 会走 urllib、可能超时/抛异常；
+             一个超时不该让止损这一轮跑不掉（engine.py:1336-1357
+             记着同一条教训，那次是少传参数直接抛）。
+          2. **节流按 key，不按条数**。`-2019 保证金不足` 那种每 5 分钟
+             一轮的死循环，如果每轮都推，群里三小时就是 36 条同样的消息，
+             人就会把整个通知频道静音 —— 那时候真出事也没人看。
+
+        Args:
+            title: 一句话标题（飞书消息第一行）。
+            body: 明细。
+            key: 节流键。空 = 不节流（开仓/平仓这种必须每次都看到）。
+            min_gap_s: 同 key 的最小间隔秒数。
+        """
+        try:
+            if key and int(min_gap_s) > 0:
+                now = time.time()
+                _last = getattr(self, "_push_last", None)
+                if _last is None:
+                    _last = self._push_last = {}
+                if now - float(_last.get(key) or 0.0) < float(min_gap_s):
+                    return
+                _last[key] = now
+                # 键会无限增长：清掉早已过期的（几百个键的量级，不必精致）
+                if len(_last) > 256:
+                    _cut = now - float(min_gap_s) * 4
+                    self._push_last = {k: v for k, v in _last.items()
+                                       if float(v or 0.0) >= _cut}
+            g = getattr(self, "guard", None)
+            fn = getattr(g, "notify", None) if g is not None else None
+            if not callable(fn):
+                return          # 没配 webhook：静默跳过，不是错误
+            fn(title, body)
+        except Exception as e:                               # noqa: BLE001
+            # 只记日志，而且**不记 risk 事件**：通知失败本身不是交易风险，
+            # 落进 risk_events 只会污染"最近出过什么事"这个视图。
+            logger.warning("[通知] 推送失败（不影响交易）：%s", e)
+
     async def _maintain_adopted_protection(self, price: float) -> None:
         """确保接管仓在交易所侧**有**保护单。幂等，失败只记日志不抛。
 
@@ -6144,6 +6549,18 @@ class DecisionEngine:
 
         logger.info("平仓 %s %s 净 %.4fU (毛 %.4f 费 %.4f)",
                     p["side"], reason, net, gross, fee_total)
+        # ★ 进程内先出场 → 撤掉地板单（"谁先发生谁说了算"）。
+        #   仓已经平了，这张 reduceOnly 单再触发也开不出反向仓，
+        #   但它会白占保证金和挂单数，而且下次同一秒开仓会撞 clientOrderId。
+        try:
+            await self._cancel_system_stop_order("进程内已平仓：%s" % reason)
+        except Exception as e:                           # noqa: BLE001
+            logger.warning("[地板] 平仓后撤地板单失败（不影响交易）：%s", e)
+        # 钱动了就要叫人（不节流）
+        self._push(
+            "【平仓】%s %s 净 %+.4fU" % (self.tcfg.symbol, p["side"], net),
+            "原因：%s\n成交 %.2f｜毛 %.4f｜费 %.4f"
+            % (reason, float(exit_px or 0.0), gross, fee_total))
         # 清持仓【不能】排在查权益后面。
         #
         # 卖单已经成交、成交也已落库 —— 这一笔在事实上结束了，

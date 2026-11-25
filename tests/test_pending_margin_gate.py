@@ -93,7 +93,9 @@ def _env(ex, gate="买卖"):
     st._sizing_params = lambda: {"sizing.leverage": 22.0}
     # 只绑这一条链上真正用到的方法（产品代码里没有 getattr 兜底）
     for name in ("_gate_pending_margin", "_pending_need_margin",
-                 "_reclaim_margin", "_place_pending_order"):
+                 "_reclaim_margin", "_place_pending_order",
+                 # 2026-11-25 晚：保证金不足会推飞书（按小时节流）。
+                 "_push"):
         setattr(st, name, getattr(E.DecisionEngine, name).__get__(st))
     return st
 

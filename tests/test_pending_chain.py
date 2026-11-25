@@ -105,6 +105,17 @@ def _engine_stub(ex=None, pos=None):
         "side": "long", "qty": 0.005, "entry": 61689.8, "stop": 60735.71,
         "target": 65682.79, "entry_ts": 1795140000000, "open_reason": "挂单成交",
         "paper": 0}
+    # 2026-11-25 晚：平仓/成交路径新增了地板单与飞书推送，
+    # 桩上必须能找到它们的**产品真实现**（写空壳等于测自己写的桩）。
+    for _n in ("_push", "_system_stop_state", "_cancel_system_stop_order",
+                "_maintain_system_protection", "_adopted_stop_state",
+                "_cancel_adopted_stop_order", "_maintain_adopted_protection"):
+        _raw = E.DecisionEngine.__dict__.get(_n)
+        if isinstance(_raw, staticmethod):
+            setattr(st, _n, _raw.__func__)
+        else:
+            setattr(st, _n, lambda *a, _n=_n, **kw:
+                    getattr(E.DecisionEngine, _n)(st, *a, **kw))
     return st
 
 

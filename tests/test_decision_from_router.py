@@ -170,7 +170,10 @@ def _place_engine_stub(can_open=True, place_err=""):
             # MGN-2（2026-11-25）：可用保证金闸排在仓位闸之后（要用它的手数）。
             "_gate_pending_margin", "_pending_need_margin",
             "_reclaim_margin",
-                 "_place_pending_order"):
+                 "_place_pending_order",
+            # 2026-11-25 晚：四条拒单路径现在都会推飞书（节流）。
+            # 桩上绑**产品真实现** —— 写个空壳等于把"有没有推"测成空白。
+            "_push"):
         raw = E.DecisionEngine.__dict__[name]
         if isinstance(raw, staticmethod):
             setattr(st, name, raw.__func__)

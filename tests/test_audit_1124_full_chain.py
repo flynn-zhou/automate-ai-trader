@@ -126,7 +126,10 @@ def _engine(adopted=None, pos=None, ex=None, liq=58356.2, liq_pct=4.0455,
                  "_guard_position_for_adopted", "_guard_position_for_observe",
                  "_resolve_liq", "_live_liq_price", "_persist_adopted_stop",
                  "_step_adopted_exit", "_guard_observe", "_bar_ts",
-                 "_bar_ohlcv"):
+                 "_bar_ohlcv",
+                 # A1（2026-11-25 交易域审查）：交易所侧保护性止损单
+                 "_adopted_stop_state", "_adopted_stop_cid",
+                 "_sync_adopted_stop_order", "_cancel_adopted_stop_order"):
         raw = E.DecisionEngine.__dict__[name]
         if isinstance(raw, staticmethod):
             setattr(st, name, raw.__func__)

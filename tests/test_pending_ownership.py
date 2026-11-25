@@ -101,7 +101,12 @@ _ENGINE_METHODS = ("_is_adopted", "_pending_place", "_pending_close",
                    "_bar_ts", "_bar_ohlcv",
                    # F7（2026-11-24 全链路审查）：观察期与人工仓统一走
                    # `_resolve_liq()` 选爆仓价来源，不再各写一套。
-                   "_resolve_liq", "_stop_distance_pct")
+                   "_resolve_liq", "_stop_distance_pct",
+                   # A1（2026-11-25 交易域审查）：人工仓在交易所侧挂
+                   # reduceOnly 止损单，`_adopted_close`/`_step_adopted_exit`
+                   # 都要调这三个才能跑完（桩上没有它们会 AttributeError）。
+                   "_adopted_stop_state", "_adopted_stop_cid",
+                   "_sync_adopted_stop_order", "_cancel_adopted_stop_order")
 
 
 class FakePending(object):

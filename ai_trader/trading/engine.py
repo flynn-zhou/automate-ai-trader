@@ -69,6 +69,21 @@ PENDING_FILL_REASON = "挂单成交"
 #: 「部分成交」压成「成交」，`_pending_book_fill` 就会按全额落账。
 _FILLED_STATES = ("FILLED", "PARTIALLY_FILLED")
 
+#: 人工仓在交易所侧那张保护性止损单的 clientOrderId 前缀。
+#:
+#: ★ A1（2026-11-25 交易域审查）：这张单是**进程外的第二道保护**。
+#:
+#:   在这之前，一笔 22 倍杠杆的持仓，全部保护只有进程内每 3 秒一次的
+#:   轮询：进程挂了 / 服务器重启 / 网络断 / 行情源卡住 —— 仓位在交易所
+#:   侧就是裸的。1.6% 是止损位、4% 就直接爆仓。
+#:   而 `place_order` 本来就支持 `stop_price` + `reduce_only` +
+#:   `working_type`，且有单测覆盖，缺的只是"有人去挂"。
+#:
+#:   用 `<前缀><entry_ts>` 而不是随机 id，是为了让**重启后认得出同一张单**：
+#:   引擎重启时内存里没有 order id，但 clientOrderId 是稳定的，
+#:   查一次就能把已有的那张单接管过来，而不是再挂一张。
+ADOPTED_STOP_CID_PREFIX = "AI-SL-"
+
 
 def pending_client_id(thesis_id) -> str:
     """挂单/撤单**共用**的 clientOrderId。两处必须调同一个函数。
@@ -1480,6 +1495,20 @@ class DecisionEngine:
             return
         now_ms = int(time.time() * 1000)
         roll_day(self.risk, now_ms)
+
+        # ★★ A3（2026-11-25 交易域审查）：用**这一次** equity() 里
+        #   `position()` 已经拿到的真实爆仓价去刷新缓存，短 TTL。
+        #
+        #   改之前：`_live_liq_price` 自己缓存 5 分钟，而 `equity()` 每 tick
+        #   都已经调了一次 `position()`（为拿 position_qty 按账截断）——
+        #   同一份事实取两次、还把新鲜的那次丢掉，只留一个 5 分钟前的。
+        #   最该新鲜的数（P0 保命用的爆仓距离）反而是链上最旧的。
+        #
+        #   刷新逻辑单独抽在 `_seed_liq_cache_from_equity`：写在 `_step`
+        #   内联时没有任何测试能证明它真的跑到了（变异验证实测：把这一支
+        #   改成 `if False:` 测试依然全绿）。抽出来之后可以被直接断言。
+        self._seed_liq_cache_from_equity(eq, now_ms)
+
         if self.guard is not None:
             # 心跳由 update() 自己维护。
             # 原来这里先手工盖一次心跳、再 update(..., now_ms)，
@@ -1602,6 +1631,21 @@ class DecisionEngine:
                     self.db.log_risk("adopted_exit_error", str(e)[:200])
                 except Exception:
                     pass
+        elif self._adopted_stop_state().get("oid"):
+            # ★ A1 看门狗：人工仓已经不在了，但交易所侧还挂着我们那张
+            #   保护性止损单 —— 必须撤掉。
+            #
+            #   什么时候会走到这里：仓位在**别处**消失（交易所强平、
+            #   用户在手机上平掉、对账修正），没经过 `_adopted_close`。
+            #   那种情况下没人撤单，单子会一直挂着：reduceOnly 触发也开不出
+            #   反向仓（不会造成新的敞口），但会白占保证金和挂单数，
+            #   而且下一笔仓万一 entry_ts 撞上就会复用同一个 clientOrderId。
+            #   放在 `_step` 而不是 `_step_adopted_exit`：后者在无仓时
+            #   根本不会被调用。
+            try:
+                await self._cancel_adopted_stop_order("人工仓已不在")
+            except Exception as e:
+                logger.error("[接管] 撤遗留止损单失败：%s", e)
 
         if self._is_chan():
             await self._step_trend(bars_by_iv, price, equity, now_ms)
@@ -2337,9 +2381,51 @@ class DecisionEngine:
             snap["hold_h"] = (int(time.time() * 1000) - p["entry_ts"]) / 3600000.0
         return snap
 
+    def _seed_liq_cache_from_equity(self, eq, now_ms: int) -> None:
+        """用 `equity()` 顺手带回来的真实爆仓价刷新缓存（A3）。
+
+        为什么单独抽成一个方法：这段逻辑原来写在 `_step` 里，而 `_step`
+        依赖十几个协作者 —— 于是没有任何测试能证明它**真的执行了**。
+        抽出来之后，"缓存到底有没有被刷新"变成一个可以直接断言的函数，
+        而不是一句只在源码里看起来存在的赋值。
+
+        短 TTL（5 秒）而不是当成永久值：保证它只活过一个 tick，
+        下一个 tick 的 `equity()` 会再刷一次。`equity()` 失败时缓存
+        也不会因此无限期变陈旧 —— `_live_liq_price` 还有自己的兜底路径。
+        """
+        liq = 0.0
+        if isinstance(eq, dict):
+            try:
+                liq = float(eq.get("liq_price") or 0.0)
+            except (TypeError, ValueError):
+                liq = 0.0
+        if liq > 0:
+            self._liq_cache = (now_ms, liq, 5000)
+
     async def _confirm_stop_price(self, local_px: float) -> float:
-        """向交易所复核一次价格。拿不到就返回 0（表示无法确认，按本地价执行）。"""
-        fn = getattr(self.ex, "mark_price", None)
+        """向交易所复核一次价格。拿不到就返回 0（表示无法确认，按本地价执行）。
+
+        ★ A2（2026-11-25 交易域审查）：复核必须与**触发价同源**。
+
+          触发价是 `self.feed.agg.current(3000).close` —— 由成交推动的
+          3 秒聚合收盘价。以前复核调 `mark_price()`（标记价 = 指数价 +
+          基差平滑），两者不是一个东西：
+
+              快跌时 last 先动、mark 慢半拍 →
+              「本地已触发止损、交易所未触发」→ 判「行情陈旧」→ 拒绝平仓。
+              而那正是最该平的那一秒。
+
+          而且币安 STOP/STOP_MARKET 的默认触发口径是
+          `workingType=CONTRACT_PRICE`（最新成交价），不是标记价 ——
+          拿标记价复核一张按最新成交价触发的止损，本身就对不上。
+
+          改成取最新成交价之后，"两个价格不同"才真正等于
+          "其中一个是陈旧的"，这道闸才判对了东西。
+          `mark_price()` 仍保留给记账兜底（那里要权威价，不要可成交价）。
+        """
+        # 优先最新成交价；执行器没实现就退回标记价（纸面/测试替身）。
+        fn = (getattr(self.ex, "last_trade_price", None)
+              or getattr(self.ex, "mark_price", None))
         if fn is None:
             return 0.0
         try:
@@ -2798,6 +2884,10 @@ class DecisionEngine:
         plan = _plan_exit(decision, qty, self._qty_step(), price)
 
         if plan.is_noop:
+            # ★ A1：持有期间维持交易所侧那张保护性止损单。
+            #   放在这一支而不是函数入口：本 tick 若已经要平仓，
+            #   再挂一张单等于白挂一次又要撤一次。
+            await self._sync_adopted_stop_order(pos, price)
             if not log_quiet:
                 # ★ F6：把爆仓价**来源**写进决策。以前 `_liq_src` 只赋值、
                 #   从不输出，docstring 却写着"记进日志" —— 一行装成
@@ -2902,6 +2992,10 @@ class DecisionEngine:
                     "%.2f -> %.2f（%s）" % (old, plan.new_stop,
                                            decision.reason))
                 self._persist_adopted_stop(pos)
+                # ★ A1：止损被抬高之后，交易所侧那张单必须跟着改 ——
+                #   否则进程内说"止损 60500"、交易所侧还挂着 59895，
+                #   进程一挂，保护退回旧的、更松的位置。
+                await self._sync_adopted_stop_order(pos, price)
                 self._log_decision(
                     bars_by_iv, price, 0.0, now_ms, None, "watch",
                     "接管仓止损移动：%.2f -> %.2f（守卫 %s）"
@@ -3171,6 +3265,12 @@ class DecisionEngine:
                 self.db.log_risk("adopted_remain_unbooked", str(e)[:200])
             # 交易所的爆仓价会随持仓量变化，让下一跳重取真实值
             self._liq_cache = None
+            # ★ A1：手数变了，交易所侧那张单的 quantity 必须跟着改。
+            #   不改的话，减仓之后那张 reduceOnly 单比持仓还大 ——
+            #   reduceOnly 会截到持仓量，不会开出反向仓，但"单上的量
+            #   和真实仓不符"会让对账和人工核对都无法解释。
+            await self._cancel_adopted_stop_order("减仓后手数变化")
+            await self._sync_adopted_stop_order(pos, exit_price)
             try:
                 self.db.log_risk(
                     "adopted_reduced",
@@ -3191,6 +3291,11 @@ class DecisionEngine:
         else:
             self.pos = None
         self._liq_cache = None
+        # ★ A1：仓没了，交易所侧那张保护性止损单必须撤掉。
+        #   不撤的后果：仓已平、单还挂着（reduceOnly 触发也开不出反向仓，
+        #   但会永久占着保证金和"挂单数"），而且下一笔仓如果 entry_ts 撞上
+        #   就会复用同一个 clientOrderId。
+        await self._cancel_adopted_stop_order("人工仓已全部平掉")
         try:
             self.db.log_risk("adopted_closed",
                              "%s %.6f @ %.2f（%s）" % (close_side, sold,
@@ -5001,6 +5106,190 @@ class DecisionEngine:
         写了就是一行永远走不到的死代码，而"看起来保存了"比"没保存"更危险。
         """
         _ = pos   # 仅为签名一致；真实语义见 docstring
+
+    # ---------- A1：人工仓在交易所侧的保护性止损单 ----------
+    #
+    # ★ 这张单与进程内的守卫**是两套独立保护**，不是同一套逻辑的两个出口：
+    #     · 进程内（P0/P1）：3 秒轮询，判的是"该不该走"，用守卫的全部依据；
+    #     · 交易所侧（这里）：挂在交易所的条件单，进程死了也照触发。
+    #   两者并存是**故意的**：一张 reduceOnly 单无论如何都不会开出反向仓，
+    #   所以宁可两边都动、也不许"以为有人管其实没人管"。
+
+    def _adopted_stop_cid(self, pos) -> str:
+        """人工仓止损单的 clientOrderId：`AI-SL-<entry_ts>`。
+
+        稳定（同一笔仓永远同一个 id）→ 重启后能认回同一张单，
+        不会每重启一次就在交易所多挂一张。
+        币安要求 clientOrderId < 36 字符，这个形状恒为 13~19 字符。
+        """
+        try:
+            ts = int(float(pos.get("entry_ts") or 0))
+        except (TypeError, ValueError):
+            ts = 0
+        return "%s%d" % (ADOPTED_STOP_CID_PREFIX, ts)
+
+    def _adopted_stop_state(self) -> dict:
+        st = getattr(self, "_adopted_stop", None)
+        return st if isinstance(st, dict) else {}
+
+    async def _cancel_adopted_stop_order(self, why: str = "") -> None:
+        """撤掉我们挂的那张保护性止损单。失败只记事件，不抛。
+
+        为什么允许失败：撤不掉的最坏后果是"多一张触发不了的挂单"
+        （仓已经平了，reduceOnly 单触发也开不出反向仓），
+        比"因为撤单失败把主循环崩掉"轻得多。
+        """
+        oid = str(self._adopted_stop_state().get("oid") or "")
+        if not oid:
+            self._adopted_stop = {}
+            return
+        fn = getattr(self.ex, "cancel_order", None)
+        ok = False
+        err = ""
+        if fn is None:
+            err = "执行器不支持撤单"
+        else:
+            try:
+                ok = bool(await fn(order_id=oid))
+            except Exception as e:
+                err = str(e)[:180]
+        if ok:
+            logger.info("[接管] 已撤掉交易所侧止损单 %s（%s）", oid, why or "-")
+            try:
+                self.db.log_risk("adopted_stop_cancelled",
+                                 "%s（%s）" % (oid, why[:100]))
+            except Exception:
+                pass
+        else:
+            logger.error("[接管] 撤止损单失败 %s（%s）：%s", oid, why, err)
+            try:
+                self.db.log_risk("adopted_stop_cancel_failed",
+                                 "%s：%s" % (oid, err))
+            except Exception:
+                pass
+        # 无论成败都清掉本地记录：下一轮 `_sync` 会按现状重新收敛
+        # （成功 → 不再挂；失败 → 重挂一张新的，而不是永远卡在旧 id 上）。
+        self._adopted_stop = {}
+
+    async def _sync_adopted_stop_order(self, pos, price: float) -> None:
+        """让交易所侧的保护性止损单与内存里的止损/手数保持一致。
+
+        ★ A1（2026-11-25 交易域审查）。这是"进程死了仓位还在裸奔"的修法。
+
+        收敛规则（幂等，每 3 秒跑一次，只在真的变了才发网络请求）：
+
+          · 没有人工仓            → 撤单
+          · stop <= 0 / qty <= 0  → 撤单（没有可保护的目标）
+          · stop 已在现价内侧      → 不挂（进程内这一 tick 就会平，
+                                     挂上去等于立刻触发，多一层滑点）
+          · 张数/止损价与本地记录一致 → 什么都不做
+          · 否则                  → 撤旧挂新
+
+        ★ 只对实盘生效。纸面执行器的挂单要靠 `on_bar_5m` 才会触发，
+          而人工仓这条链根本不走 `on_bar_5m` —— 在纸面挂上去只会造成
+          "看起来有交易所保护、其实没有"的错觉。这比不挂更危险。
+        """
+        if str(getattr(self.ex, "name", "") or "") != "live":
+            return
+
+        if not pos:
+            await self._cancel_adopted_stop_order("已无人工仓")
+            return
+
+        stop = float(pos.get("stop") or 0.0)
+        qty = abs(float(pos.get("qty") or 0.0))
+        entry = float(pos.get("entry") or 0.0)
+        if stop <= 0 or qty <= 0:
+            await self._cancel_adopted_stop_order(
+                "停止位或手数无效（stop=%.4f qty=%.6f）" % (stop, qty))
+            return
+
+        step = float(self._qty_step() or 0.0)
+        if step > 0:
+            qty = round(float(int(qty / step + 1e-9)) * step, 12)
+        if qty <= 0 or (step > 0 and qty < step - 1e-12):
+            await self._cancel_adopted_stop_order("手数取整后不足一个步长")
+            return
+
+        is_long = norm_side(pos.get("side")) == "long"
+        close_side = "SELL" if is_long else "BUY"
+        # 已经触发过了就别挂：进程内这一 tick 就该平掉它。
+        if price > 0:
+            if (is_long and price <= stop) or ((not is_long) and price >= stop):
+                return
+
+        cid = self._adopted_stop_cid(pos)
+        state = self._adopted_stop_state()
+        if (state.get("oid") and abs(float(state.get("px") or 0.0) - stop) < 1e-9
+                and abs(float(state.get("qty") or 0.0) - qty) < 1e-12):
+            return                        # 已对齐，不发请求
+
+        place_fn = getattr(self.ex, "place_order", None)
+        if place_fn is None:
+            return
+
+        # 旧的还在 → 先撤掉再挂新的（不做"改单"，改单失败会留下两张单）
+        if state.get("oid"):
+            await self._cancel_adopted_stop_order(
+                "止损/手数变化 %.4f→%.4f / %.6f→%.6f"
+                % (float(state.get("px") or 0.0), stop,
+                   float(state.get("qty") or 0.0), qty))
+
+        # ★ 重启幂等：内存里没有 order id，但交易所可能已经有同一张单。
+        #   先按 clientOrderId 查一次，查到就直接接管，避免挂出第二张。
+        q_fn = getattr(self.ex, "query_order", None)
+        if q_fn is not None:
+            try:
+                ex_order = await q_fn(client_id=cid)
+            except Exception:
+                ex_order = None
+            if ex_order is not None and str(getattr(ex_order, "status", "")
+                                            ).upper() in ("NEW", "PARTIALLY_FILLED"):
+                self._adopted_stop = {
+                    "oid": str(getattr(ex_order, "order_id", "") or ""),
+                    "px": float(getattr(ex_order, "stop_price", 0.0) or 0.0),
+                    "qty": float(getattr(ex_order, "qty", 0.0) or 0.0),
+                }
+                st2 = self._adopted_stop_state()
+                if (st2.get("oid")
+                        and abs(float(st2.get("px") or 0.0) - stop) < 1e-9
+                        and abs(float(st2.get("qty") or 0.0) - qty) < 1e-12):
+                    logger.info("[接管] 接管已有的交易所侧止损单 %s（%.2f）",
+                                st2["oid"], stop)
+                    return
+                if st2.get("oid"):
+                    await self._cancel_adopted_stop_order("重启后参数已变")
+
+        try:
+            order, err = await place_fn(
+                close_side, qty, order_type="STOP_MARKET", stop_price=stop,
+                reduce_only=True, client_id=cid,
+                # 与触发价同源（A2）：币安按最新成交价触发，不是标记价。
+                working_type="CONTRACT_PRICE")
+        except Exception as e:
+            order, err = None, str(e)[:200]
+
+        oid = str(getattr(order, "order_id", "") or "") if order else ""
+        if err or not oid:
+            logger.error("[接管] 挂交易所侧止损单失败（%.2f / %.6f）：%s",
+                         stop, qty, err or "无返回 id")
+            try:
+                self.db.log_risk("adopted_stop_order_failed",
+                                 "%.2f / %.6f：%s" % (stop, qty, (err or "")[:180]))
+            except Exception:
+                pass
+            self._adopted_stop = {}       # 下一轮重试
+            return
+
+        self._adopted_stop = {"oid": oid, "px": stop, "qty": qty}
+        logger.info("[接管] 交易所侧止损单已挂 %s %s %.6f 触发 %.2f（进程外保护）",
+                    oid, close_side, qty, stop)
+        try:
+            self.db.log_risk("adopted_stop_ordered",
+                             "%s %s %.6f @ 触发 %.2f（%s）"
+                             % (oid, close_side, qty, stop, cid))
+        except Exception:
+            pass
 
     async def _manage(self, price, bars_by_iv) -> bool:
         p = self.pos

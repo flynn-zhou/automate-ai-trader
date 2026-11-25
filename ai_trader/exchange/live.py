@@ -201,14 +201,22 @@ class LiveExecutor(Executor):
     async def mark_price(self) -> float:
         """交易所权威标记价（premiumIndex.markPrice）。
 
-        为什么必须有：引擎的熔断止损判的是【本地行情缓存价】，
-        行情断线时它是陈旧的，用陈旧价误判会把健康仓位按市价卖掉，
-        卖掉后要等下一次金叉才能回场（可能几周）。
-        引擎在触发止损时会用本方法复核一次。
+        **用途：记账与风控口径，不是止损复核。**
 
-        注意端点选择：用 /fapi/v1/premiumIndex 而不是 /fapi/v1/ticker/price。
-        前者返回真正的 markPrice（与强平/风控同一口径），
-        后者是最近成交价，剧烈波动时会与标记价偏离。
+        ★ A2（2026-11-25 交易域审查）：这个 docstring 以前写着
+          "引擎在触发止损时会用本方法复核一次" —— 那句话现在**是错的**，
+          止损复核已经改用 `last_trade_price()`（见那个方法的说明）。
+          为什么必须改：币安 STOP/STOP_MARKET 的触发口径是
+          `workingType=CONTRACT_PRICE`（最新成交价），不是标记价；
+          而本地触发价也来自成交。拿标记价去复核一张按成交价触发的止损，
+          在快跌时会得出"本地已触发、交易所未触发"，于是判成"行情陈旧"
+          并且**拒绝平仓** —— 恰好在最该平的那一秒。
+
+          标记价仍是这里该用的东西：平仓记账要用权威价，
+          不能让一个偏掉的成交价污染账本（`_adopted_close` 的兜底价用它）。
+
+        端点选择：用 /fapi/v1/premiumIndex 而不是 /fapi/v1/ticker/price ——
+        前者与强平/风控同一口径，剧烈波动时不会与真实结算价偏离。
         """
         d = await self._req("GET", "/fapi/v1/premiumIndex",
                             {"symbol": self.cfg.trading.symbol}, signed=False)
@@ -218,13 +226,63 @@ class LiveExecutor(Executor):
         return float(getattr(self.feed, "last_price", 0.0) or 0.0)
 
     async def equity(self) -> dict:
+        """账户权益快照。**顺带把真实爆仓价带回来。**
+
+        ★ A3（2026-11-25 交易域审查）：这里本来就已经调了一次
+          `position()`（为了拿 `position_qty` 做按账截断），而
+          `position()` 会返回 `liquidationPrice`。也就是说：
+          **每个 tick 都已经付过这次 HTTP 的钱了**，但爆仓价被丢掉，
+          于是 P0（离爆仓还有几个止损宽度，唯一的保命判断）只能去
+          读一个 5 分钟 TTL 的缓存。
+
+          22 倍杠杆下这笔账很清楚：4.05% 的爆仓距离、1.6% 的止损，
+          「爆仓价」在 5 分钟里能因为总权益变动而挪动好几个百分点
+          （11-24 实测同一笔仓逐仓 4.15% / 全仓 5.48%）。
+          最该新鲜的一个数字，反而是链上最旧的一个。
+
+          所以这里把 `liq_price` 一起返回，调用方（`_step`）用它喂缓存，
+          正常运行时再也不需要为爆仓价单独发一次请求。
+        """
         d = await self._req("GET", "/fapi/v2/account")
         bal = float(d.get("totalWalletBalance", 0) or 0)
         unreal = float(d.get("totalUnrealizedProfit", 0) or 0)
         pos = await self.position()
         return {"balance": round(bal, 6), "unrealized": round(unreal, 6),
                 "equity": round(bal + unreal, 6),
-                "position_qty": pos["qty"], "position_side": pos["side"]}
+                "position_qty": pos["qty"], "position_side": pos["side"],
+                # ★ 与 `position()["liq_price"]` 同一个来源、同一次请求。
+                #   0 表示交易所未给出（无仓或该字段为空），调用方用 > 0 判有效。
+                "liq_price": float(pos.get("liq_price") or 0.0)}
+
+    async def last_trade_price(self) -> float:
+        """交易所的**最新成交价**（`/fapi/v1/ticker/price`）。
+
+        ★ A2（2026-11-25 交易域审查）：止损复核必须与触发价**同源**。
+
+          触发用的是本地行情（`feed.agg.current(3000).close`，成交驱动）；
+          复核原来用 `mark_price()`（`/fapi/v1/premiumIndex` 的
+          markPrice —— 指数价 + 基差平滑）。两个不是同一个东西：
+
+              快跌时 last 先到、mark 慢半拍，
+              于是「本地触发、交易所未触发」→ 判成「行情陈旧」→
+              **拒绝平仓**。而那正是最该平的那一秒。
+
+          更关键的是：币安 STOP/STOP_MARKET 的默认触发口径就是
+          `workingType=CONTRACT_PRICE` = **最新成交价**，不是标记价。
+          用标记价去复核一张按最新成交价触发的止损，本身就对不上。
+
+          所以复核也取最新成交价：同源之后，"两个价格不同"才真正
+          等于"其中一个是陈旧的"。`mark_price()` 继续保留给记账兜底用
+          （那里要的是权威价，不是可成交价）。
+        """
+        d = await self._req("GET", "/fapi/v1/ticker/price",
+                            {"symbol": self.cfg.trading.symbol}, signed=False)
+        px = float((d or {}).get("price", 0) or 0)
+        if px > 0:
+            return px
+        # 端点拿不到就退回本地最后价 —— 调用方靠 0 判"无法确认"，
+        # 所以这里只在本地也拿不到时才返回 0。
+        return float(getattr(self.feed, "last_price", 0.0) or 0.0)
 
     async def set_leverage(self, lev: float) -> None:
         lev = max(1.0, min(float(lev), float(self.cfg.trading.max_leverage)))

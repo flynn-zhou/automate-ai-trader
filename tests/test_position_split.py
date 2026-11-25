@@ -104,7 +104,11 @@ def _engine_stub(adopted=None, pos=None, ex=None):
     # ★ 必须用 MethodType 手工绑定：直接从 `__dict__` 取到的是**未绑定**函数，
     #   挂到实例上不会自动获得 self（这是普通属性，不是描述符）。
     import types as _types
-    for _name in ("_adopted_slot", "_is_adopted", "_norm_side"):
+    for _name in ("_adopted_slot", "_is_adopted", "_norm_side",
+                  # A1（2026-11-25 交易域审查）：平仓之后要撤/改交易所侧
+                  # 那张保护性止损单，`_adopted_close` 会调它们。
+                  "_adopted_stop_state", "_adopted_stop_cid",
+                  "_sync_adopted_stop_order", "_cancel_adopted_stop_order"):
         _fn = E.DecisionEngine.__dict__[_name]
         _fn = getattr(_fn, "__func__", _fn)
         setattr(st, _name, _types.MethodType(_fn, st))

@@ -420,14 +420,79 @@ class LiveExecutor(Executor):
                     "side": str(t.get("side") or "").upper(),
                     "qty": float(t.get("qty") or 0),
                     "price": float(t.get("price") or 0),
+                    # ★ userTrades 不带 clientOrderId（见 _attach_client_ids），
+                    #   这里取到的必然是空，真正的归属由 order_id 反查补上。
                     "client_id": str(t.get("clientOrderId") or ""),
+                    # orderId 是唯一能连回 clientOrderId 的键。
+                    "order_id": t.get("orderId"),
                 })
             except (TypeError, ValueError):
                 # 单笔字段异常不能让整次对账失明：丢掉这一笔，
                 # 归类会因为「凑不出差额」落到 unknown，仍是保守方向。
                 continue
+        await self._attach_client_ids(out)
         out.sort(key=lambda x: x["ts"], reverse=True)
         return out
+
+    async def _attach_client_ids(self, fills) -> None:
+        """给成交补上 `client_id`：``/fapi/v1/userTrades`` **没有这个字段**。
+
+        ★ 2026-11-25 生产实证（真钱自检单，最贵的一次证据）：
+
+          `/fapi/v1/userTrades` 的返回键是
+
+              baseQty buyer commission commissionAsset id maker
+              marginAsset orderId pair positionSide price qty
+              quoteQty realizedPnl side symbol time
+
+          —— **没有 `clientOrderId`**。所以原来那句
+          ``"client_id": str(t.get("clientOrderId") or "")`` 永远得到空串。
+
+          后果不是「少一个字段」，而是整条归因链反向：
+
+            1. 我们自己的成交 → client_id="" → `classify_delta` 判 manual
+            2. → 系统自己的仓被当「用户手工仓」接管（§13.2 接管、不硬停）
+            3. → 挂单预期看到有仓 → 压制自己 → 永远不落账、net_r 永远 0
+            4. 而「成交回报真丢了」这种必须硬停的故障，**永远不会硬停**
+
+        正确来源是 ``/fapi/v1/allOrders``（同一窗口，实测带 `clientOrderId`）。
+        用它建 `orderId -> clientOrderId` 映射再回填，一次请求。
+
+        ★ 补不上的成交把 `client_id` 置 None（**不是**空串）：
+          空串的含义是「交易所明确说这是用户手单」，None 的含义是「我们
+          不知道」。下游 `classify_delta` 必须把两者分开 —— 不知道就往
+          保守方向（unknown → 硬停），不能猜成 manual。
+        """
+        want = [f for f in fills if f.get("ts") and f.get("client_id") == ""]
+        if not want:
+            return
+        try:
+            end_ms = max(f["ts"] for f in want) + 1000
+            start_ms = min(f["ts"] for f in want) - 60000
+            rows = await self._req("GET", "/fapi/v1/allOrders",
+                                   {"symbol": self.cfg.trading.symbol,
+                                    "startTime": start_ms,
+                                    "endTime": end_ms, "limit": 1000})
+        except Exception as e:                      # noqa: BLE001
+            logger.warning("[实盘] 补成交归属失败（allOrders）：%s；"
+                           "本批 %d 笔成交归因未知", e, len(want))
+            for f in want:
+                f["client_id"] = None
+            return
+        by_id = {}
+        for o in (rows or []):
+            try:
+                by_id[str(int(o.get("orderId")))] = str(
+                    o.get("clientOrderId") or "")
+            except (TypeError, ValueError):
+                continue
+        for f in want:
+            cid = by_id.get(str(f.get("order_id")))
+            f["client_id"] = None if cid is None else cid
+        unknown = sum(1 for f in want if f["client_id"] is None)
+        if unknown:
+            logger.warning("[实盘] %d/%d 笔成交在 allOrders 里查不到归属"
+                           "（按 unknown 保守处理）", unknown, len(want))
 
     async def _fill_truth(self, r: dict, px: float, want_qty: float):
         """取真实成交量 / 成交价 / 手续费；取不到就按保守口径补齐。

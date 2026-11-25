@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS pending_theses (
     next_index      INTEGER NOT NULL DEFAULT 0,
     armed_at_bar    INTEGER,
     armed_ref_close REAL,
+    -- 挂单那一刻的 5m 子 K 时间戳（成交守卫的主锚点，见 thesis.step）
+    --
+    -- ★ 2026-11-25 补：这一列以前**不存在**，`armed_at_sub_ts` 只活在内存里，
+    --   重启/重建 `Thesis` 后永远是 None，于是守卫的时间戳分支在生产是
+    --   死代码 —— 只剩 `armed_at_bar` 这个**数组下标**在扛。
+    --   下标会随缓冲前移而漂移（事故现场就是 next_index 被重算到 386
+    --   而 armed_at_bar 是 399），时间戳不会。所以必须落库。
+    armed_at_sub_ts INTEGER,
     -- 成交与出场的事实（引擎侧写，状态机侧只读）
     filled_ts       INTEGER NOT NULL DEFAULT 0,
     filled_price    REAL NOT NULL DEFAULT 0,
@@ -107,6 +115,25 @@ class PendingThesisStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """给**已存在**的库补新列。幂等：重复跑不出错。
+
+        ★ 为什么不能只改 `SCHEMA`：`CREATE TABLE IF NOT EXISTS` 对已经存在的
+          表没有任何作用，生产库是 11-25 之前建的，改完 SCHEMA 那一列
+          依然不存在 —— 而 `upsert_thesis` 会因为「表里没这列」直接报错。
+          所以必须显式 ALTER。
+
+        ★ 为什么用 ALTER 补而不是重建表：补一列可以保留全部历史行
+          （这些预期的历史状态是事故复盘和重放量具的输入，不能丢）。
+        """
+        have = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(pending_theses)")}
+        if "armed_at_sub_ts" not in have:
+            self._conn.execute(
+                "ALTER TABLE pending_theses ADD COLUMN armed_at_sub_ts INTEGER")
+            self._conn.commit()
 
     def close(self) -> None:
         try:
@@ -120,14 +147,15 @@ class PendingThesisStore:
         cols = ", ".join(FIELDS)
         marks = ", ".join("?" for _ in FIELDS)
         sets = ", ".join("%s=excluded.%s" % (f, f) for f in FIELDS)
-        extra = ("state", "next_index", "armed_at_bar", "armed_ref_close",
-                 "ambiguous", "note", "updated_ts")
+        extra = ("state", "next_index", "armed_at_bar", "armed_at_sub_ts",
+                 "armed_ref_close", "ambiguous", "note", "updated_ts")
         cols2 = cols + ", " + ", ".join(extra)
         marks2 = marks + ", " + ", ".join("?" for _ in extra)
         sets2 = sets + ", " + ", ".join("%s=excluded.%s" % (f, f) for f in extra)
         vals = [row.get(f, 0) for f in FIELDS]
         vals += [row.get("state", "EXPECTED"), int(row.get("next_index", 0)),
-                 row.get("armed_at_bar"), row.get("armed_ref_close"),
+                 row.get("armed_at_bar"), row.get("armed_at_sub_ts"),
+                 row.get("armed_ref_close"),
                  1 if row.get("ambiguous") else 0, row.get("note", ""),
                  int(row.get("updated_ts") or time.time() * 1000)]
         self._conn.execute(
@@ -263,6 +291,7 @@ class PendingThesisStore:
 
 def row_of(thesis, *, state: str, next_index: int,
            armed_at_bar: Optional[int] = None,
+           armed_at_sub_ts: Optional[int] = None,
            armed_ref_close: Optional[float] = None,
            bar_ts: int = 0, ambiguous: bool = False,
            note: str = "") -> Dict[str, Any]:
@@ -283,7 +312,8 @@ def row_of(thesis, *, state: str, next_index: int,
         "surprise_pts": float(getattr(thesis, "surprise_pts", 0.0) or 0.0),
         "bar_ts": int(bar_ts or 0),
         "state": state, "next_index": int(next_index),
-        "armed_at_bar": armed_at_bar, "armed_ref_close": armed_ref_close,
+        "armed_at_bar": armed_at_bar, "armed_at_sub_ts": armed_at_sub_ts,
+        "armed_ref_close": armed_ref_close,
         "ambiguous": ambiguous, "note": note,
     }
 
@@ -307,4 +337,8 @@ def progress_of(row: Dict[str, Any]) -> Dict[str, Any]:
     """库里的行 → `thesis.step()` 认的 progress 字典。"""
     return {"state": row["state"], "next_index": int(row["next_index"]),
             "armed_at_bar": row["armed_at_bar"],
+            # ★ 旧行没有这一列值时补 None：`step()` 里 None 会退回
+            #   `armed_at_bar` 判据（见 thesis.step 的 elif 分支），
+            #   也就是补列之前的行为 —— 向后兼容，不会把老预期判错。
+            "armed_at_sub_ts": row.get("armed_at_sub_ts"),
             "armed_ref_close": row["armed_ref_close"]}

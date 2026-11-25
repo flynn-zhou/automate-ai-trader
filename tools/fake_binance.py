@@ -104,6 +104,7 @@ class FakeBinance:
         app.router.add_post("/fapi/v1/order", self._perp_order)
         app.router.add_get("/fapi/v1/openOrders", self._perp_open_orders)
         app.router.add_get("/fapi/v1/userTrades", self._perp_user_trades)
+        app.router.add_get("/fapi/v1/allOrders", self._perp_all_orders)
         app.router.add_get("/fapi/v1/order", self._perp_query_order)
         app.router.add_delete("/fapi/v1/order", self._perp_cancel_order)
         app.router.add_delete("/fapi/v1/allOpenOrders",
@@ -440,6 +441,24 @@ class FakeBinance:
         self.fills.append({"orderId": o["orderId"], "side": o["side"],
                            "qty": qty, "px": fill_px,
                            "reduceOnly": o["reduceOnly"]})
+        # ★ 忠实模拟真实交易所：`/fapi/v1/userTrades` 的返回里**没有**
+        #   `clientOrderId` 这个键（2026-11-25 生产实测）。归属只能靠
+        #   `orderId` 去 `/fapi/v1/allOrders` 反查。
+        #   桩也照这个形状写，否则测试会「通过」而线上继续错。
+        self.perp_trades.append({
+            "id": 7000 + len(self.perp_trades),
+            "orderId": o["orderId"],
+            "symbol": o["symbol"],
+            "side": o["side"],
+            "qty": "%.8f" % qty,
+            "price": "%.2f" % fill_px,
+            "quoteQty": "%.8f" % (qty * fill_px),
+            "commission": "%.8f" % (qty * fill_px * 0.0005),
+            "commissionAsset": "USDT",
+            "realizedPnl": "0",
+            "maker": False,
+            "time": self._now_ms(),
+        })
         return qty
 
     def _match_orders(self):
@@ -546,11 +565,55 @@ class FakeBinance:
             "updateTime": self._now_ms(),
         })
 
+    async def _perp_all_orders(self, request):
+        """历史订单（含已成交/已撤）：**带 `clientOrderId`**。
+
+        2026-11-25：`/fapi/v1/userTrades` 不返回 `clientOrderId`，归属只能
+        靠 `orderId` 到这里反查。生产上这是唯一能分清「我们的单」和
+        「用户手单」的地方。
+        """
+        self.calls.append(("GET", "/fapi/v1/allOrders"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        q = dict(parse_qsl(request.query_string))
+        rows = [dict(o) for o in self.order_book.values()]
+        # ★ 内部订单的时间键是 `updateTime`（见 `_place_pending`），
+        #   不是 `time` —— 按后者过滤会得到 0 条，而 0 条在下游表现为
+        #   「成交查不到归属」，看起来像归因功能没生效，其实是桩的问题。
+        if q.get("startTime"):
+            rows = [r for r in rows
+                    if int(r.get("updateTime") or 0) >= int(q["startTime"])]
+        if q.get("endTime"):
+            rows = [r for r in rows
+                    if int(r.get("updateTime") or 0) <= int(q["endTime"])]
+        out = []
+        for o in rows:
+            out.append({
+                "orderId": o["orderId"],
+                "clientOrderId": o["clientOrderId"],
+                "symbol": o.get("symbol", "BTCUSDT"),
+                "side": o["side"], "type": o["type"],
+                "status": o["status"],
+                "origQty": "%.8f" % float(o.get("origQty") or 0),
+                "executedQty": "%.8f" % float(o.get("executedQty") or 0),
+                "price": "%.2f" % float(o.get("price") or 0),
+                "stopPrice": "%.2f" % float(o.get("stopPrice") or 0),
+                "avgPrice": "%.2f" % float(o.get("avgPrice") or 0),
+                "reduceOnly": bool(o.get("reduceOnly")),
+                "time": int(o.get("updateTime") or 0),
+            })
+        return web.json_response(out)
+
     async def _perp_user_trades(self, request):
         """永续成交历史。
 
         支持 `orderId` 过滤（`_commission_of` 用它查单笔手续费）；
         不带 `orderId` 时返回全部（`user_trades()` 分页拉真账用）。
+
+        ★ 返回里**故意不带** `clientOrderId`：真实交易所就是这个形状
+          （2026-11-25 生产实测键列表）。谁能在这里"顺手补上"这个字段，
+          谁就让 `recent_fills` 的归属 bug 重新变成永远测不出来。
         """
         self.calls.append(("GET", "/fapi/v1/userTrades"))
         err = self._verify(request, request.query_string)

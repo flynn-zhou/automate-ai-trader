@@ -332,3 +332,53 @@ def test_cancel_without_close_still_leaves_terminal_state():
     w = st.pending.written
     assert w[0]["state"] == T.CLOSED_THESIS
     assert w[0]["state"] in T.TERMINAL_STATES
+
+
+# ------------------------------------------- 5. 接管仓在场时的空仓平仓
+#
+# 2026-11-25 16:45 真实事故：自检单成交后被错归因成人工仓（另一 bug，
+# 见 test_fill_attribution.py），`self.pos` 空、`self.adopted_pos` 有仓。
+# 预期推了一条 close，`_pending_close` 只看 `self.pos` 就判「幽灵成交」，
+# 日志写"没有仓位"，**真实持仓一直开着、无人管**。
+
+def test_close_with_adopted_position_does_not_cancel():
+    """接管仓还在 → 不许撤单、不许当幽灵，要记专门的 risk 事件。"""
+    st = _engine_stub(pos={})
+    st.adopted_pos = {"side": "long", "qty": 0.01, "entry": 58931.6,
+                      "open_reason": E.ADOPT_REASON}
+
+    # 桩上必须有 `_pending_cancel`：否则「不该撤单」这条即使守卫生效也
+    # 只能以 AttributeError 失败 —— 那是"被桩的错误抓住"，不是被断言抓住。
+    async def _cancel(act):
+        await st.ex.cancel_order(client_id="AI-pend-x")
+
+    st._pending_cancel = _cancel
+    act = SimpleNamespace(thesis_id="selfcheck-1", reason="selfcheck_cancel")
+    _run(E.DecisionEngine._pending_close(st, act, None))
+
+    assert st.ex.cancelled == [], (
+        "接管仓还在时不许撤单：撤掉的是真实持仓的保护，留下的裸仓没人管")
+    kinds = [k for k, _ in st.db.risks]
+    assert "pending_close_hits_adopted_position" in kinds, (
+        "必须留一条风险事件让人看到「系统仓空、接管仓有仓」，实际 %r"
+        % (kinds,))
+    assert "pending_close_without_position" not in kinds, (
+        "这不是幽灵成交，不该记成幽灵")
+
+
+def test_close_with_nothing_at_all_is_still_a_ghost():
+    """两处都空 = 真幽灵，行为保持不变（撤掉那张不该存在的挂单）。"""
+    st = _engine_stub(pos={})
+    st.adopted_pos = None
+
+    async def _cancel(act):
+        await st.ex.cancel_order(client_id="AI-pend-x")
+
+    st._pending_cancel = _cancel
+    act = SimpleNamespace(thesis_id="selfcheck-1", reason="selfcheck_cancel")
+    _run(E.DecisionEngine._pending_close(st, act, None))
+
+    assert len(st.ex.cancelled) == 1, "真空仓才撤单，实际 %r" % (st.ex.cancelled,)
+    kinds = [k for k, _ in st.db.risks]
+    assert "pending_close_without_position" in kinds
+    assert "pending_close_hits_adopted_position" not in kinds

@@ -238,13 +238,33 @@ def classify_delta(fills, delta: float):
       * 全是系统外的（用户手单）→ manual：§13.2 约定，接管但**不硬停**
       * 只要有一笔是我们自己的 → ours：我们发过单却不知道成交了，必须硬停
       * 凑不出差额 → unknown：宁可停，也不猜
+
+    ★ `client_id` 三态（2026-11-25 真钱自检单查出来的）：
+
+      ``"AI-…"``  我们的单        → ours
+      ``""``      交易所明说是手单 → manual
+      ``None``    **我们不知道**   → unknown（硬停）
+
+      原先只有两态，而 `/fapi/v1/userTrades` 根本不返回 `clientOrderId`，
+      于是「我们的单」长期落在 ``""`` 这一支上，被当成人手单接管 ——
+      更要命的是「成交回报丢了」这种必须硬停的真故障因此永不硬停。
+
+      所以三态必须分开：**不知道 ≠ 不是我们的**。方向只能选保守那一边，
+      因为误判成 ours 的代价是多停一次（人来解除就行），
+      误判成 manual 的代价是我们不知道自己的敞口还在不在。
     """
     used, ok = fills_explaining_delta(fills, delta)
     if not ok:
         return PROV_UNKNOWN, used
+    saw_unknown = False
     for f in used:
-        if str(f.get("client_id") or "").startswith(AI_CLIENT_PREFIX):
+        cid = f.get("client_id")
+        if cid is None:
+            saw_unknown = True
+        elif str(cid).startswith(AI_CLIENT_PREFIX):
             return PROV_OURS, used
+    if saw_unknown:
+        return PROV_UNKNOWN, used
     return PROV_MANUAL, used
 
 
@@ -3814,6 +3834,7 @@ class DecisionEngine:
             #   坏消息不静默：仍然打 WARNING + risk 事件（在 _pending_place 里）。
             _p_state = newp["state"]
             _p_armed = newp.get("armed_at_bar")
+            _p_armed_sub = newp.get("armed_at_sub_ts")
             _p_ref = newp.get("armed_ref_close")
             # ★★ 自相矛盾终态拦截（2026-11-25 真钱事故）。
             #
@@ -3842,6 +3863,7 @@ class DecisionEngine:
             if failed_place:
                 _p_state = _T.EXPECTED
                 _p_armed = None
+                _p_armed_sub = None
                 _p_ref = None
                 logger.warning(
                     "[挂单] %s 本根未成功挂出 → 状态退回 EXPECTED（不判成交、不平仓）",
@@ -3852,6 +3874,7 @@ class DecisionEngine:
                 # 而交易所那头根本没有这张单（11-24 那 15 条幽灵动作）。
                 _p_state = _T.EXPECTED
                 _p_armed = None
+                _p_armed_sub = None
                 _p_ref = None
 
             # ★ 动作落地之后才前移游标（不变量 2）
@@ -3863,6 +3886,7 @@ class DecisionEngine:
                 self.pending.upsert_thesis(_PTS.row_of(
                     th, state=_p_state, next_index=_next_index,
                     armed_at_bar=_p_armed,
+                    armed_at_sub_ts=_p_armed_sub,
                     armed_ref_close=_p_ref,
                     bar_ts=ts, ambiguous=bool(res.ambiguous),
                     note=",".join(placed) or ("place_failed" if failed_place else "")))
@@ -4769,6 +4793,30 @@ class DecisionEngine:
             #
             #   正确动作：这张单本来就不该存在，**撤掉它**。
             #   撤单是安全的：没有仓位，撤的是挂单，不可能亏钱。
+            #
+            # ★★ 只有「真的一无所有」才算幽灵（2026-11-25 二次实证）：
+            #
+            #   当天 16:45 自检单平仓时这里误判了一次：`self.pos` 是空的，
+            #   但那笔仓被对账接管进了 `self.adopted_pos`（人工仓），
+            #   于是日志写着「判定为幽灵成交」，**真实持仓却没被平掉**，
+            #   仓就那么裸着开在交易所上。
+            #
+            #   所以判据必须是「系统仓 + 接管仓都为 0」。接管仓非空时
+            #   绝不能撤单走人 —— 那等于一边说"没有仓"、一边把保护单撤了。
+            #   也不能替用户平掉（§13.2：接管仓不判策略出场），
+            #   所以记一条风险事件交给人看着，这是唯一不越权的处置。
+            _adopted_qty = abs(float(
+                (getattr(self, "adopted_pos", None) or {}).get("qty") or 0.0))
+            if _adopted_qty > 0:
+                logger.error("[挂单] %s 需要平仓，但系统仓为空、接管仓还有"
+                             " %.6f → 这不是幽灵成交，是成交被归到了人工仓；"
+                             "不动仓、不撤单，记风险事件等人处理",
+                             tid, _adopted_qty)
+                self.db.log_risk(
+                    "pending_close_hits_adopted_position",
+                    "%s 系统仓空 / 接管仓 %.6f / 差额待归因"
+                    % (tid, _adopted_qty))
+                return
             logger.warning("[挂单] %s 需要平仓但引擎认为空仓 →"
                            "判定为幽灵成交，撤掉交易所上这张单", tid)
             self.db.log_risk("pending_close_without_position", tid)

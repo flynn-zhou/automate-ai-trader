@@ -9,6 +9,16 @@
   var cur = {{ default_interval|tojson or '"3m"' }};
   var bars = [], cats = [], EMA_FULL = {}, chart = null, emaSeries = [];
 
+  // 用户当前的缩放窗口 {start,end}（百分比）。**必须自己存**：
+  // 这个页面每 3 秒重设一次 option，而 dataZoom 一旦不显式给出，
+  // ECharts 就回到默认（默认 = 尾部），表现是"拖到历史某根又弹回最新"。
+  // ⚠ 不能用 chart.getOption() 现取现用：在 setOption 里再回读，
+  //   拿到的是上一次渲染的结果，窗口会慢一拍。
+  var zwin = null;
+  // 轴签名 / 数据签名（见 renderLive 开头的注释）。
+  // sigAxis 变了才全量重建；只有 sigData 变就只合并 series。
+  var sigAxis = null, sigData = null;
+
   var EMA_PERIODS = [20, 50, 144, 169, 200];
   var EMA_COLORS = { 20: "#9aa1ac", 50: "#c3c9d4", 144: "#22c55e",
                      169: "#ef4444", 200: "#3b82f6" };
@@ -21,7 +31,16 @@
     if (!el || !window.echarts) return false;
     chart = echarts.init(el, null, { renderer: "canvas" });
     chart.on("finished", redraw);
-    chart.on("datazoom", function () { setTimeout(redraw, 0); });
+    // 用户拖/缩放后把窗口记下来，下一次 setOption 原样还回去。
+    // 用 getOption 在这里读是安全的：此刻不在 setOption 中间。
+    chart.on("datazoom", function () {
+      var o = chart.getOption();
+      var dz = o && o.dataZoom && o.dataZoom[0];
+      if (dz && dz.start != null && dz.end != null) {
+        zwin = { start: dz.start, end: dz.end };
+      }
+      setTimeout(redraw, 0);
+    });
     window.addEventListener("resize", function () {
       chart.resize(); setTimeout(redraw, 60);
     });
@@ -37,6 +56,34 @@
   function renderLive(j) {
     if (!j.ok) { $("feed-status").textContent = j.error || "读取失败"; return; }
     var L = j.live;
+
+    // ⚠ 签名分两段，缺一不可。
+    //
+    // axisSig = 「轴的身份」：周期 + 根数 + 最后一根的**时间**。
+    // dataSig = 最后一根的 ohlc（未收盘那根在动）。
+    //
+    // 上一版把**收盘价**写进了签名（`lb[最后一根][2]`），那是致命的：
+    // 实时图上最后一根是未收盘的那根，它的收盘价**就是此刻现价**，
+    // 每次轮询都在变 ⇒ 签名每轮都不同 ⇒ 短路从不触发 ⇒
+    // 每 3 秒照样全量 setOption(..., true) ⇒ tooltip 照样被销毁。
+    // 用户看到"悬停只有 2 秒"，根因就在这里，不在 hideDelay。
+    //
+    // 现在：轴变了才全量重建（一根 K 线一次）；轴没变、只是未收盘那根在动，
+    // 就**只合并 series** —— 不传 dataZoom / tooltip / grid，
+    // ECharts 不会重建这两个组件，悬停可以一直挂着直到你自己移开。
+    var lb = L.bars;
+    var lastBar = lb.length ? lb[lb.length - 1] : null;
+    var axisSig = cur + "|" + lb.length + "|" + (lastBar ? lastBar[0] : "");
+    var dataSig = lastBar
+      ? (lastBar[1] + "," + lastBar[2] + "," + lastBar[3] + "," + lastBar[4])
+      : "";
+    var axisChanged = (axisSig !== sigAxis);
+
+    paintPrice(j.price, j.change, j.change_pct);
+    if (!axisChanged && dataSig === sigData) { setStatus(j, L); return; }
+    sigAxis = axisSig;
+    sigData = dataSig;
+
     bars = L.bars.map(function (b) {
       return { t: b[0], o: b[1], c: b[2], l: b[3], h: b[4] };
     });
@@ -64,6 +111,7 @@
       while (arr.length < cats.length) arr.push(null);
       EMA_FULL[String(per)] = arr;
       emaSeries.push({
+        id: "EMA" + per,
         name: "EMA" + per, type: "line", data: arr, z: 6,
         showSymbol: false, smooth: false, animation: false, connectNulls: false,
         lineStyle: { color: EMA_COLORS[per], width: per >= 144 ? 1.6 : 1.2,
@@ -75,12 +123,15 @@
     var last = bars[n - 1], prev = bars[n - 2];
     var col = (prev && last.c < prev.c) ? "#ef4444" : "#22c55e";
 
-    chart.setOption({
+    var fullOpt = {
       backgroundColor: "transparent", animation: false,
       tooltip: {
         trigger: "axis", axisPointer: { type: "cross" },
         backgroundColor: "rgba(23,26,33,.95)", borderColor: "#2a2e37",
         textStyle: { color: "#e6e8eb", fontSize: 12 },
+        // 鼠标移开后多留一会儿。ECharts 默认 hideDelay 只有 100ms，
+        // 手一抖数据就没了；300ms 是"够看完一行数字"的下限。
+        hideDelay: 300,
         formatter: function (ps) {
           var p = ps[0]; if (!p) return "";
           var b = bars[p.dataIndex]; if (!b) return "";
@@ -121,13 +172,20 @@
       },
       dataZoom: [
         { type: "inside", xAxisIndex: 0,
-          start: Math.max(0, 100 - 12000 / n), end: 100 },
+          // zwin 存在就用它 —— 这是"用户拖到哪儿就停在哪儿"的实现。
+          // 没有 zwin（首次渲染 / 刚切周期）才用默认窗口：尾部约 120 根
+          // （12000/n 就是 100*120/n，写成除法的形式是历史原因）。
+          start: zwin ? zwin.start : Math.max(0, 100 - 12000 / n),
+          end: zwin ? zwin.end : 100 },
         { type: "slider", xAxisIndex: 0, height: 22, bottom: 12,
           backgroundColor: "#141821", borderColor: "#2a2e37",
           fillerColor: "rgba(59,130,246,.15)",
           handleStyle: { color: "#3b82f6" }, textStyle: { color: "#9aa1ac" } }
       ],
       series: [{
+        // id 必须给：增量合并时 ECharts 靠 id 匹配到同一个 series，
+        // 没有 id 就可能按索引错配（比如 EMA 少一条时整体前移一格）。
+        id: "k",
         name: (j.symbol || "BTCUSDT") + " " + L.interval,
         type: "candlestick", data: ohlc,
         itemStyle: { color: "#22c55e", color0: "#ef4444",
@@ -140,11 +198,35 @@
           data: [{ yAxis: last.c }]
         }
       }].concat(emaSeries)
-    }, true);
+    };
+
+    if (axisChanged) {
+      // 轴变了（来了一根新 K 线 / 换了周期）：全量重建一次。
+      // 这一步会销毁 tooltip —— 但一根 K 线只发生一次，
+      // 3m 就是 3 分钟一次，不是每 3 秒一次。
+      chart.setOption(fullOpt, true);
+    } else {
+      // 轴没变，只是未收盘那根在动：只合并数据。
+      // **不传** dataZoom / tooltip / grid / xAxis —— 传了就等于让 ECharts
+      // 去更新它们，tooltip 每次更新都会重新绑定，悬停就断了。
+      var patch = [{
+        id: "k", data: ohlc,
+        markLine: { data: [{ yAxis: last.c }] }
+      }];
+      Object.keys(EMA_FULL).forEach(function (per) {
+        patch.push({ id: "EMA" + per, data: EMA_FULL[per] });
+      });
+      chart.setOption({ series: patch });
+    }
 
     redraw();
-    paintPrice(j.price, j.change, j.change_pct);
 
+    setStatus(j, L);
+  }
+
+  /// 状态行单独提出来：数据没变时也要刷新它（时间戳要动），
+  /// 但**不能**因此重建图表。
+  function setStatus(j, L) {
     var emaKeys = Object.keys(L.ema || {});
     $("feed-status").textContent =
       (j.stale ? "⚠ 上游异常，显示上次成功数据" : L.interval + " · 每 3 秒轮询") +
@@ -192,6 +274,11 @@
       btn.classList.add("on");
       cur = btn.getAttribute("data-iv");
       EMA_FULL = {};
+      // 换周期必须清掉这三个：类别数变了，旧的百分比窗口会指到另一段时间，
+      // 而且必须强制走一次全量重建（新周期的 series 要整个换掉）。
+      zwin = null;
+      sigAxis = null;
+      sigData = null;
       poll();
     };
   });

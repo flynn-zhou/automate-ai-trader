@@ -140,7 +140,19 @@ async def test_exit_still_happens_when_equity_api_fails(env):
     eng.trend.seeded = True
 
     # 假装持有多仓（价格已跌破均线，应该出场）
-    eng.pos = {"side": "buy", "qty": 0.001, "entry": 110.0, "stop": 0.0,
+    # ★ side 必须是 "long"，不是 "buy"：引擎自己记账时写的是 `plan.side`
+    #   （"long"/"short"），"buy"/"sell" 只出现在下单接口参数里。
+    #   原来这里写 "buy" 能过，是因为对账把那笔仓判成"方向不一致"、
+    #   走接管重写成 long —— 也就是说这条测试一直在测接管路径的副作用，
+    #   而不是它自己声称的「查余额失败时出场照常执行」。
+    #   2026-11-24 修好 side 规范化之后真相露出来了，这里改正夹具。
+    #
+    # ★ stop 必须给一个真实值。唐奇安刻意 stop=0（不设硬止损），
+    #   而策略出场要等【4h 收盘】，现价跌到 50 而最后一根 4h 还收在 110
+    #   时 `want_exit` 按设计返回 None —— 那不是 bug，是回测口径。
+    #   这条测试要钉的是「出场判断被跳过了」，所以让它走熔断这条必然触发的
+    #   路：stop=82.5（110 的 25% 熔断）< 现价 50 之外。
+    eng.pos = {"side": "long", "qty": 0.001, "entry": 110.0, "stop": 82.5,
                "target": 0.0, "entry_ts": 0, "bars": 0, "best": 110.0,
                "trade_id": None, "max_hold_bars": 600,
                "open_reason": "t", "fee": 0.0, "signal": "trend_entry"}
@@ -160,7 +172,12 @@ async def test_exit_still_happens_when_equity_api_fails(env):
     except Exception:
         pass    # 异常本身可以接受，但出场不能因此被跳过
 
-    sells = [o for o in ex.orders if o[0] == "sell"]
+    # ★ 大小写都要认：走趋势 `_close` 时 side 是小写 "sell"，
+    #   走人工仓出场 `_adopted_close` 时是大写 "SELL"（与 `_pending_close`
+    #   同约定；生产执行器 `market_order` 内部会 `.upper()/.lower()` 规范化，
+    #   两种写法都能正确下单）。这条测试要钉的是「出场没被跳过」，
+    #   不是「用了哪种大小写」——按大小写判会变成一条假红。
+    sells = [o for o in ex.orders if str(o[0]).lower() == "sell"]
     assert sells, (
         "查余额失败导致出场被跳过：价格已从 110 跌破均线到 50，"
         "但一笔卖单都没发。崩盘时交易所 API 恰好最容易超时，"

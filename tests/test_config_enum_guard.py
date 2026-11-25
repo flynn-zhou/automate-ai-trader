@@ -79,18 +79,31 @@ def test_empty_strategy_falls_back_to_the_safe_side():
         "落到 scalp 等于静默跑一个已证伪的负期望策略" % cfg.trading.strategy)
 
 
-def test_empty_exec_market_falls_back_to_spot():
-    """空值落到现货：永续在 100U 上 1x 开不出仓。"""
+def test_empty_exec_market_falls_back_to_perp():
+    """空值落到合约（唯一合法值）。
+
+    ★ 2026-11-17 起只做合约，所以“空值回落”也只能回落到 perp。
+    这里顺便验证一件事：回落是“默认值”而不是“一个合法值”——
+    白名单里根本没有 spot，所以不可能回落到它。
+    """
     cfg = _load_with(AI_EXEC_MARKET="")
-    assert cfg.trading.exec_market == "spot", (
-        "空 AI_EXEC_MARKET 落到了 %r，必须是 spot" % cfg.trading.exec_market)
+    assert cfg.trading.exec_market == "perp", (
+        "空 AI_EXEC_MARKET 落到了 %r，必须是 perp" % cfg.trading.exec_market)
 
 
 def test_case_and_whitespace_are_normalised():
     """大小写和首尾空格自动归一，这一类事故从源头消掉。"""
     assert _load_with(AI_STRATEGY="  TrEnD  ").trading.strategy == "trend"
-    assert _load_with(AI_EXEC_MARKET=" SPOT ").trading.exec_market == "spot"
     assert _load_with(AI_EXEC_MARKET="Perp").trading.exec_market == "perp"
+    assert _load_with(AI_EXEC_MARKET="  PERP  ").trading.exec_market == "perp"
+    # spot 不再是合法值：归一之后仍然要拒绝（见 test_perp_only.py）
+    for raw in (" SPOT ", "Spot"):
+        try:
+            _load_with(AI_EXEC_MARKET=raw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("归一后的 %r 居然被接受了" % raw)
 
 
 def test_deliberate_scalp_is_still_allowed():
@@ -106,4 +119,4 @@ def test_defaults_are_the_adopted_side():
     """没配任何环境变量时，默认必须是采纳的那一侧。"""
     cfg = _load_with()
     assert cfg.trading.strategy == "trend"
-    assert cfg.trading.exec_market == "spot"
+    assert cfg.trading.exec_market == "perp"

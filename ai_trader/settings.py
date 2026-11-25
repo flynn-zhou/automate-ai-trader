@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""运行时可调参数（本金 / 每笔风险% / 杠杆），Web 上改立刻影响决策。
+"""运行时可调参数（本金 / 每笔风险% / 杠杆 / 惊喜K线阈值），Web 上改立刻影响决策。
 
 为什么要这个模块
 ----------------
@@ -31,6 +31,7 @@ import threading
 from .dbutil import synchronized
 from typing import Dict, Optional, Tuple
 
+from .config import DEFAULT_SURPRISE_PTS
 from .trading.sizing import SizingConfig, derive
 
 logger = logging.getLogger(__name__)
@@ -46,9 +47,15 @@ CREATE TABLE IF NOT EXISTS app_settings (
 K_CAPITAL = "sizing.capital"
 K_RISK = "sizing.risk_pct"
 K_LEVERAGE = "sizing.leverage"
+#: ★ 惊喜K线阈值（点）。用户要求它在 Web 上可改：
+#:   「500 会调整的，放在 web 配置里面」。
+K_SURPRISE = "strategy.surprise_pts"
 
-# 缺省值与 TradingCfg 保持一致（100U / 5% / 22x）
-DEFAULTS = {K_CAPITAL: 100.0, K_RISK: 5.0, K_LEVERAGE: 22.0}
+# 缺省值必须与 TradingCfg 保持一致。
+# ★ 2026-11-17：本金从 100.0 改成 50.0 —— 这里曾经跟不上 `config.paper_balance`，
+#   结果是“页面显示 50U、库空时按 100U 算仓位”。两个来源 ≈ 必定分叉。
+DEFAULTS = {K_CAPITAL: 50.0, K_RISK: 5.0, K_LEVERAGE: 22.0,
+            K_SURPRISE: DEFAULT_SURPRISE_PTS}
 
 
 class SettingsStore:
@@ -122,7 +129,10 @@ class SettingsStore:
         self.put(K_CAPITAL, float(getattr(trading_cfg, "paper_balance", DEFAULTS[K_CAPITAL])))
         self.put(K_RISK, float(getattr(trading_cfg, "risk_pct", DEFAULTS[K_RISK])))
         self.put(K_LEVERAGE, float(getattr(trading_cfg, "max_leverage", DEFAULTS[K_LEVERAGE])))
-        logger.info("仓位参数首次播种（来源 env/yaml）: %s", self.sizing())
+        self.put(K_SURPRISE, float(getattr(trading_cfg, "surprise_pts",
+                                          DEFAULTS[K_SURPRISE])))
+        logger.info("仓位参数首次播种（来源 env/yaml）: %s，惊喜K线 %s",
+                    self.sizing(), self.strategy())
         return True
 
     @synchronized
@@ -131,6 +141,16 @@ class SettingsStore:
         return {K_CAPITAL: float(self.get(K_CAPITAL, DEFAULTS[K_CAPITAL])),
                 K_RISK: float(self.get(K_RISK, DEFAULTS[K_RISK])),
                 K_LEVERAGE: float(self.get(K_LEVERAGE, DEFAULTS[K_LEVERAGE]))}
+
+    @synchronized
+    def strategy(self) -> Dict[str, float]:
+        """策略层的运行时参数（目前只有惊喜K线阈值）。
+
+        为什么不并进 `sizing()`：两者的**校验规则不一样**
+        （仓位三个数交给 `SizingConfig.__post_init__`，阈值是另一套范围）。
+        混在一起会让 `set_sizing()` 误以为它也要管阈值。
+        """
+        return {K_SURPRISE: float(self.get(K_SURPRISE, DEFAULTS[K_SURPRISE]))}
 
     # ---------- 校验 ----------
     @synchronized
@@ -143,6 +163,44 @@ class SettingsStore:
         except (ValueError, TypeError) as e:
             return False, str(e), None
         return True, "", cfg
+
+    #: 惊喜K线阈值的合法范围。
+    #:
+    #: 下界 **不能是 0**：0 意味着“每一根 5m 都算惊喜”，
+    #:   于是止盈优先级会把正常目标也提前砍掉 —— 等于把策略
+    #:   改成一个没验证过的启发式，而且页面上看不出来。
+    #: 上界 10000 点：价 8 万时约 12.8%，已超出单根 5m 的物理上限。
+    #:   再高就等于“永远不触发”，那是取消规则，不是配置它。
+    SURPRISE_MIN = 1.0
+    SURPRISE_MAX = 10000.0
+
+    def validate_surprise(self, pts) -> Tuple[bool, str]:
+        """惊喜K线阈值的校验。拒绝时返回为什么，不静默夹取。
+
+        ★ 只做“不是数就拒绝”，不做静默夹取：夹取会让用户以为自己设的是 A、
+        实际生效的是 B —— 这个项目已经吃亏过多次。
+        """
+        try:
+            v = float(pts)
+        except (TypeError, ValueError):
+            return False, "惊喜K线阈值必须是数字（单位：点）"
+        if v != v or v in (float("inf"), float("-inf")):
+            return False, "惊喜K线阈值不能是 NaN / inf"
+        if v < self.SURPRISE_MIN:
+            return False, ("惊喜K线阈值 %.1f 点太小：零或负数会让**每一根 5m**都算惊喜，"
+                           "等于把止盈提前砍掉" % v)
+        if v > self.SURPRISE_MAX:
+            return False, ("惊喜K线阈值 %.0f 点超出物理上限（10000 点 ≈ 12.8%% @ 8万），"
+                           "那不是配置它、是取消它" % v)
+        return True, ""
+
+    @synchronized
+    def set_surprise(self, pts) -> Tuple[bool, str]:
+        ok, why = self.validate_surprise(pts)
+        if not ok:
+            return False, why
+        self.put(K_SURPRISE, float(pts))
+        return True, ""
 
     # ---------- 套用 ----------
     @synchronized
@@ -163,6 +221,10 @@ class SettingsStore:
         trading_cfg.paper_balance = s[K_CAPITAL]
         trading_cfg.risk_pct = s[K_RISK]
         trading_cfg.max_leverage = s[K_LEVERAGE]
+        # ★ 惊喜K线阈值也就地写进去：状态机每次决策现读 `tcfg.surprise_pts`，
+        #   所以页面上改完下一根 5m 就生效，不需要重启。
+        s[K_SURPRISE] = self.strategy()[K_SURPRISE]
+        trading_cfg.surprise_pts = s[K_SURPRISE]
         return s
 
     # ---------- 四行派生（给 Web 展示）----------

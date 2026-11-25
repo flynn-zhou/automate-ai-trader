@@ -99,21 +99,6 @@ def test_plan_infeasible_blocks(pf):
         % (names,))
 
 
-def test_spot_10u_is_not_blocked(pf):
-    """对照用例：现货口径下 10U 是【能】开仓的，闸门不许误拦。
-
-    这条和上一条互为反例——只测"会拦"而不测"该放行时放行"，
-    一个永远报错的闸门也能通过全部断言。
-    """
-    from ai_trader.config import AppCfg
-    cfg = AppCfg()
-    cfg.trading.exec_market = 'spot'      # 现货: _min_notional() -> 5.0
-    eq = {'balance': 10.0, 'position_qty': 0.0, 'equity': 10.0}
-    pf.check_funds_and_plan(cfg, cfg.trading, 78000.0, _spec(), eq, None, None)
-    assert not _messages(pf), (
-        '现货下 10U 本可以开仓，闸门却拦了（误报）：%r' % (_messages(pf),))
-
-
 def test_healthy_account_passes(pf):
     """对照：钱够的时候不许误报——只会拦坏状态的闸门才可信。"""
     from ai_trader.config import AppCfg

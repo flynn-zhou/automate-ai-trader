@@ -124,9 +124,9 @@ def test_cost_basis_is_used_when_available() :
     eng, ex, tdb, feed = _mk(entry=0.0, cost_basis=50000.0)
     try:
         asyncio.get_event_loop().run_until_complete(eng.reconcile_live())
-        assert eng.pos is not None, "交易所持仓却没能接管，引擎会认为自己空仓"
-        assert eng.pos["entry"] == pytest.approx(50000.0), (
-            u"接管成本用了 %r，而真实成交记录给出的是 50000.0" % (eng.pos["entry"],))
+        assert eng.adopted_pos is not None, "交易所持仓却没能接管，引擎会认为自己空仓"
+        assert eng.adopted_pos["entry"] == pytest.approx(50000.0), (
+            u"接管成本用了 %r，而真实成交记录给出的是 50000.0" % (eng.adopted_pos["entry"],))
     finally:
         tdb.stop()
 
@@ -146,9 +146,9 @@ def test_last_price_is_the_fallback_and_it_is_recorded():
     import sqlite3
     eng, ex, tdb, feed = _mk(entry=0.0, cost_basis=0.0)
     asyncio.get_event_loop().run_until_complete(eng.reconcile_live())
-    assert eng.pos is not None
-    assert eng.pos["entry"] == pytest.approx(PX), (
-        u"没有真实成本时应退回现价 %r，实际 %r" % (PX, eng.pos["entry"]))
+    assert eng.adopted_pos is not None
+    assert eng.adopted_pos["entry"] == pytest.approx(PX), (
+        u"没有真实成本时应退回现价 %r，实际 %r" % (PX, eng.adopted_pos["entry"]))
     tdb.stop()          # 必须排空写队列再读，否则读到空表
     db = sqlite3.connect(tdb._path, timeout=5)
     try:
@@ -166,9 +166,9 @@ def test_no_entry_and_no_price_abandons_the_takeover():
     eng, ex, tdb, feed = _mk(entry=0.0, cost_basis=0.0, last_px=0.0)
     try:
         asyncio.get_event_loop().run_until_complete(eng.reconcile_live())
-        assert eng.pos is None, (
+        assert eng.adopted_pos is None, (
             u"既无开仓价也无行情价，却造出了一个仓位：%r\n"
-            u"这个仓位没有可信成本，止损价会算成 0 或乱数。" % (eng.pos,))
+            u"这个仓位没有可信成本，止损价会算成 0 或乱数。" % (eng.adopted_pos,))
     finally:
         tdb.stop()
 
@@ -177,34 +177,60 @@ def test_adopted_position_never_has_a_zero_stop():
     """不变量：不管成本从哪来，接管出来的止损价都不能是 0。
 
     0 的含义是「永远满足止损」——多头永不触发、空头开机即平，两种都是灾难。
+
+    ★ 2026-11-24 修正：这里以前断言 `entry * (1 - 25%)`，把缺陷当成了期望值。
+      生产实测（22 倍杠杆、0.032 BTC @ 60880、权益 114U）：
+          逐仓爆仓价 58356（距入场 4.15%）
+          25% 止损    45660 → 比爆仓价还低 12696 点
+      价格永远先爆仓，那个止损**一次都不可能触发**。
+      现在断言真正该成立的不变量：止损距离 < 爆仓距离。
     """
     import asyncio
     for cb in (0.0, 50000.0, 120000.0):
         eng, ex, tdb, feed = _mk(entry=0.0, cost_basis=cb)
         try:
             asyncio.get_event_loop().run_until_complete(eng.reconcile_live())
-            assert eng.pos is not None
-            stop = eng.pos["stop"]
+            assert eng.adopted_pos is not None
+            stop = eng.adopted_pos["stop"]
+            entry = eng.adopted_pos["entry"]
             assert stop > 0, (
                 u"cost_basis=%r 时接管出的止损价是 %r —— 保护静默消失" % (cb, stop))
-            assert stop == pytest.approx(eng.pos["entry"] * (1 - STOP_PCT / 100.0)), (
-                u"止损位没按熔断 %.0f%% 算：stop=%r entry=%r"
-                % (STOP_PCT, stop, eng.pos["entry"]))
+            # 止损必须落在入场价的【亏损侧】（多头在下）
+            assert stop < entry, (
+                u"多头止损不在成本下方：stop=%r entry=%r" % (stop, entry))
+            # 止损距离必须严格小于爆仓距离，否则止损永远不触发
+            liq_pct = eng._liq_distance_pct()
+            assert liq_pct > 0, u"算不出爆仓距离，无法校验止损有效性"
+            stop_pct = (entry - stop) / entry * 100.0
+            assert stop_pct < liq_pct, (
+                u"止损距离 %.3f%% 不小于爆仓距离 %.3f%% —— 这个止损永远不会触发"
+                % (stop_pct, liq_pct))
+            # 而且必须等于「爆仓距离 / 安全倍数」这一个唯一口径
+            assert stop_pct == pytest.approx(eng._stop_distance_pct(entry),
+                                             rel=1e-9), (
+                u"止损没有走 sizing 派生口径：%.4f%%" % stop_pct)
         finally:
             tdb.stop()
 
 
 def test_short_takeover_stop_is_above_entry():
-    """空头接管：止损必须落在开仓价【上方】。"""
+    """空头接管：止损必须落在开仓价【上方】，且仍在爆仓价内侧。"""
     import asyncio
     eng, ex, tdb, feed = _mk(qty=-QTY, entry=0.0, cost_basis=60000.0)
     try:
         asyncio.get_event_loop().run_until_complete(eng.reconcile_live())
-        assert eng.pos is not None, "交易所空头持仓没能接管"
-        assert eng.pos["side"] == "short"
-        assert eng.pos["stop"] == pytest.approx(60000.0 * (1 + STOP_PCT / 100.0)), (
-            u"空头止损应在成本上方：%r" % (eng.pos["stop"],))
-        assert eng.pos["stop"] > eng.pos["entry"], u"空头止损落在成本下方，方向反了"
+        assert eng.adopted_pos is not None, "交易所空头持仓没能接管"
+        assert eng.adopted_pos["side"] == "short"
+        stop = eng.adopted_pos["stop"]
+        entry = eng.adopted_pos["entry"]
+        assert stop > entry, u"空头止损落在成本下方，方向反了"
+        # ★ 同上：不再是 25%，而是「爆仓距离 / 安全倍数」，必须在内侧
+        stop_pct = (stop - entry) / entry * 100.0
+        liq_pct = eng._liq_distance_pct()
+        assert stop_pct < liq_pct, (
+            u"空头止损距离 %.3f%% 不小于爆仓距离 %.3f%% —— 永远不会触发"
+            % (stop_pct, liq_pct))
+        assert stop_pct == pytest.approx(eng._stop_distance_pct(entry), rel=1e-9)
     finally:
         tdb.stop()
 
@@ -226,9 +252,9 @@ def test_broken_risk_log_does_not_block_the_takeover():
     tdb.log_risk = _boom
     try:
         asyncio.get_event_loop().run_until_complete(eng.reconcile_live())
-        assert eng.pos is not None, (
+        assert eng.adopted_pos is not None, (
             u"风险记录写失败就把接管也放弃了 —— 引擎会认为自己空仓，"
             u"而交易所真的有币，止损打在一个不存在的仓上。")
-        assert eng.pos["stop"] > 0, u"接管出的止损价不能是 0"
+        assert eng.adopted_pos["stop"] > 0, u"接管出的止损价不能是 0"
     finally:
         tdb.stop()

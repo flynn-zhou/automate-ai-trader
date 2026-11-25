@@ -1,0 +1,15 @@
+[Unit]
+Description=每 5 分钟补算 ai-trader K线演化（5m 入场的前提），并在停摆超阈值时告警
+
+[Timer]
+# 每 5 分钟一次：用户定了「入场全部在 5m K」，
+# 演化层晚一小时就绪 = 挂单晚一小时 = 策略失效。
+# 落在 :00 :05 :10 …，与 5m K 线收盘对齐后立刻补。
+# 服务内部自带「整点跑一次全量重算层」的判断，所以这里只需要一个 5 分钟节奏。
+OnCalendar=*-*-* *:00/5:00
+AccuracySec=15s
+Persistent=true
+Unit=ai-trader-kbar.service
+
+[Install]
+WantedBy=timers.target

@@ -63,13 +63,27 @@ class FakeBinance:
         self.usdt = usdt
         self.btc = btc
         self.price = price
-        self.orders = []          # 收到的订单
+        self.orders = []          # 收到的订单（追加日志，所有类型都进这里）
         self.leverage = None      # 最后一次 set_leverage
         self.positions = {}       # perp: symbol -> {amt, entry}
         self.trades = []          # 现货成交历史（/api/v3/myTrades）
+        # ★ 永续成交历史（/fapi/v1/userTrades）。
+        #   这个接口之前**根本不存在**，而 `LiveExecutor._commission_of`
+        #   和 `user_trades()` 都要用它；缺了就是 404，而 404 会被引擎当成
+        #   “真账同步失败”记进 risk_events —— 测试里看起来像真实故障。
+        self.perp_trades = []
         self.calls = []           # 所有请求 (method, path)
         self.trades_available = True   # False = 模拟成交历史拿不到
         self.reject_next_order = None   # 注入失败用
+        # ---- 挂单（限价 / 止损）----
+        # 这一块原来完全没有：`_perp_order` 忽略 type、永远返回 FILLED 并立刻
+        # 改持仓，所以「挂单」在测试里根本无法表达。没有它，
+        # 「提前挂单、等价格来」这个机制一行都验不了。
+        self.order_book = {}      # orderId(int) -> 订单状态
+        self.fills = []           # 每一笔成交（含部分成交）
+        self._seq = 0
+        # 设了它，每次撮合只成交「剩余量 × 这个比例」，用来造 PARTIALLY_FILLED
+        self.partial_fill_ratio = None
         self._runner = None
         self._site = None
         self.port = 0
@@ -88,6 +102,12 @@ class FakeBinance:
         app.router.add_get("/fapi/v2/account", self._perp_account)
         app.router.add_get("/fapi/v2/positionRisk", self._perp_position)
         app.router.add_post("/fapi/v1/order", self._perp_order)
+        app.router.add_get("/fapi/v1/openOrders", self._perp_open_orders)
+        app.router.add_get("/fapi/v1/userTrades", self._perp_user_trades)
+        app.router.add_get("/fapi/v1/order", self._perp_query_order)
+        app.router.add_delete("/fapi/v1/order", self._perp_cancel_order)
+        app.router.add_delete("/fapi/v1/allOpenOrders",
+                              self._perp_cancel_all)
         app.router.add_post("/fapi/v1/leverage", self._perp_leverage)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -107,6 +127,11 @@ class FakeBinance:
 
     # ---------- 签名校验 ----------
     def _verify(self, request, raw_qs):
+        # 真实币安对 POST 也接受把参数放在 query string 里。这里 body 为空时
+        # 回落到 query —— 否则「POST 用 query 传参」会被误判成签名错误，
+        # 那是个和签名完全无关的假故障，排查起来非常费劲。
+        if not raw_qs:
+            raw_qs = request.query_string or ""
         key = request.headers.get("X-MBX-APIKEY", "")
         if key != self.api_key:
             return {"code": -2015, "msg": "Invalid API-key, IP, or permissions for action."}
@@ -330,6 +355,164 @@ class FakeBinance:
         return web.json_response({"symbol": "BTCUSDT", "leverage": self.leverage,
                                   "maxNotionalValue": "1000000"})
 
+    # ---------- 挂单账本 ----------
+    # 设计取舍：
+    # * LIMIT 成交价取**挂单价**，不取当前价。价格穿过挂单价时真实成交只会
+    #   更好或相等，取挂单价是保守下界 —— 回放不应该靠「假设成交在有利位置」
+    #   来赚分。
+    # * STOP_MARKET 触发后按**当前价**成交（它就是市价单）。
+    # * 一根 bar 里如果有多次价格变动，撮合只在 set_price() 时发生，
+    #   不试图还原 bar 内路径 —— 那是 K 线数据本身给不了的信息。
+
+    def _new_order_id(self):
+        self._seq += 1
+        return 2000 + self._seq
+
+    @staticmethod
+    def _now_ms():
+        return int(time.time() * 1000)
+
+    def _order_json(self, o):
+        return {
+            "orderId": o["orderId"],
+            "clientOrderId": o["clientOrderId"],
+            "symbol": o["symbol"],
+            "status": o["status"],
+            "price": "%.2f" % o["price"],
+            "avgPrice": "%.2f" % o["avgPrice"],
+            "stopPrice": "%.2f" % o["stopPrice"],
+            "origQty": "%.3f" % o["origQty"],
+            "executedQty": "%.3f" % o["executedQty"],
+            "cumQuote": "%.8f" % o["cumQuote"],
+            "type": o["type"],
+            "side": o["side"],
+            "timeInForce": o["timeInForce"],
+            "reduceOnly": o["reduceOnly"],
+            "workingType": o["workingType"],
+            "updateTime": o["updateTime"],
+        }
+
+    def _apply_fill(self, side, qty, px):
+        """按成交改持仓（和原来 MARKET 那段完全同一个算法）。"""
+        pos = self.positions.setdefault("BTCUSDT", {"amt": 0.0, "entry": 0.0})
+        signed = qty if side == "BUY" else -qty
+        if pos["amt"] == 0 or ((pos["amt"] > 0) == (signed > 0)):
+            # 同向加仓：加权平均入场价
+            total = abs(pos["amt"]) + abs(signed)
+            if total:
+                pos["entry"] = ((pos["entry"] * abs(pos["amt"])
+                                 + px * abs(signed)) / total)
+        pos["amt"] = pos["amt"] + signed
+        if abs(pos["amt"]) < 1e-12:
+            pos["amt"] = 0.0
+            pos["entry"] = 0.0
+
+    def _is_triggered(self, o, px):
+        """当前价格有没有让这张单该成交。"""
+        t = o["type"]
+        if t == "LIMIT":
+            return px <= o["price"] if o["side"] == "BUY" else px >= o["price"]
+        if t in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET"):
+            sp = o["stopPrice"]
+            if o["side"] == "BUY":
+                return px >= sp          # 买入止损：价格涨到触发价
+            return px <= sp              # 卖出止损：价格跌到触发价
+        return False
+
+    def _fill_order(self, o, px):
+        remaining = o["origQty"] - o["executedQty"]
+        ratio = self.partial_fill_ratio
+        # 每次成交「原量 × 比例」，不是「剩余量 × 比例」。
+        # 后者是几何衰减（0.5 → 0.25 → 0.125…），永远差一点填不满，
+        # 而这个旋钮的用途只是造出 PARTIALLY_FILLED，不该有收敛问题。
+        qty = remaining if ratio is None else min(remaining, o["origQty"] * ratio)
+        if qty <= 1e-9:
+            qty = remaining
+        fill_px = o["price"] if o["type"] == "LIMIT" else px
+        o["executedQty"] += qty
+        o["cumQuote"] += qty * fill_px
+        o["avgPrice"] = o["cumQuote"] / o["executedQty"]
+        o["updateTime"] = self._now_ms()
+        o["status"] = ("FILLED"
+                       if o["executedQty"] >= o["origQty"] - 1e-12
+                       else "PARTIALLY_FILLED")
+        self._apply_fill(o["side"], qty, fill_px)
+        self.fills.append({"orderId": o["orderId"], "side": o["side"],
+                           "qty": qty, "px": fill_px,
+                           "reduceOnly": o["reduceOnly"]})
+        return qty
+
+    def _match_orders(self):
+        """按当前价撮合所有挂着的单。价格每次变动都该调一次。"""
+        for o in list(self.order_book.values()):
+            if o["status"] not in ("NEW", "PARTIALLY_FILLED"):
+                continue
+            if self._is_triggered(o, self.price):
+                self._fill_order(o, self.price)
+
+    def set_price(self, px, match=True):
+        """推进价格；默认顺手撮合挂单。
+
+        测试必须能推价格，否则「限价挂着不成交 → 价格走过去了才成交」
+        这条最基本的路径没法验。
+        """
+        self.price = float(px)
+        if match:
+            self._match_orders()
+        return self.price
+
+    def _find_order(self, q):
+        if "orderId" in q:
+            try:
+                return self.order_book.get(int(q["orderId"]))
+            except (TypeError, ValueError):
+                return None
+        cid = q.get("origClientOrderId") or q.get("clientOrderId")
+        if cid:
+            for o in self.order_book.values():
+                if o["clientOrderId"] == cid:
+                    return o
+        return None
+
+    def _place_pending(self, p, side, otype, qty):
+        """建一张挂单，返回 (json响应, http状态)。"""
+        price = float(p.get("price") or 0.0)
+        stop = float(p.get("stopPrice") or p.get("stop") or 0.0)
+        if otype == "LIMIT" and price <= 0:
+            return {"code": -1102, "msg": "Mandatory parameter 'price' was not sent."}, 400
+        if otype in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET") and stop <= 0:
+            return ({"code": -1102,
+                     "msg": "Mandatory parameter 'stopPrice' was not sent."}, 400)
+        cid = p.get("newClientOrderId") or ""
+        if cid:
+            for o in self.order_book.values():
+                if o["clientOrderId"] == cid:
+                    return ({"code": -2010,
+                             "msg": "Duplicate client order id: %s" % cid}, 400)
+        o = {
+            "orderId": self._new_order_id(),
+            "clientOrderId": cid or ("fake-%d" % self._seq),
+            "symbol": p.get("symbol", "BTCUSDT"),
+            "side": side,
+            "type": otype,
+            "origQty": qty,
+            "executedQty": 0.0,
+            "price": price,
+            "stopPrice": stop,
+            "avgPrice": 0.0,
+            "cumQuote": 0.0,
+            "status": "NEW",
+            "timeInForce": p.get("timeInForce", "GTC"),
+            "reduceOnly": str(p.get("reduceOnly", "")).lower() == "true",
+            "workingType": p.get("workingType", "CONTRACT_PRICE"),
+            "updateTime": self._now_ms(),
+        }
+        self.order_book[o["orderId"]] = o
+        # 已经能成交的（限价单挂进来时就是价内）立刻成交，和真实交易所一致
+        if self._is_triggered(o, self.price):
+            self._fill_order(o, self.price)
+        return self._order_json(o), 200
+
     async def _perp_order(self, request):
         self.calls.append(("POST", "/fapi/v1/order"))
         raw = await request.text()
@@ -338,32 +521,98 @@ class FakeBinance:
             return web.json_response(err, status=400)
         p = dict(parse_qsl(raw))
         side = p["side"].upper()
+        otype = (p.get("type") or "MARKET").upper()
         qty = float(p["quantity"])
         px = self.price
-        self.orders.append({"market": "perp", "side": side, "qty": qty, "px": px})
+        self.orders.append({"market": "perp", "side": side, "qty": qty,
+                            "px": px, "type": otype})
 
         if self.reject_next_order:
             msg = self.reject_next_order
             self.reject_next_order = None
             return web.json_response({"code": -2010, "msg": msg}, status=400)
 
-        pos = self.positions.setdefault("BTCUSDT", {"amt": 0.0, "entry": 0.0})
-        signed = qty if side == "BUY" else -qty
-        new_amt = pos["amt"] + signed
-        if pos["amt"] == 0 or (pos["amt"] > 0) == (signed > 0):
-            # 同向加仓：加权平均入场价
-            total = abs(pos["amt"]) + abs(signed)
-            pos["entry"] = ((pos["entry"] * abs(pos["amt"]) + px * abs(signed)) / total
-                            if total else px)
-        pos["amt"] = new_amt
-        if abs(new_amt) < 1e-12:
-            pos["amt"] = 0.0
-            pos["entry"] = 0.0
+        if otype != "MARKET":
+            body, code = self._place_pending(p, side, otype, qty)
+            return web.json_response(body, status=code)
 
+        oid = self._new_order_id()
+        self._apply_fill(side, qty, px)
         return web.json_response({
-            "orderId": 2000 + len(self.orders), "symbol": "BTCUSDT",
+            "orderId": oid, "symbol": "BTCUSDT",
             "status": "FILLED", "side": side, "type": "MARKET",
             "origQty": "%.3f" % qty, "executedQty": "%.3f" % qty,
             "avgPrice": "%.2f" % px, "cumQuote": "%.8f" % (qty * px),
-            "updateTime": int(time.time() * 1000),
+            "updateTime": self._now_ms(),
         })
+
+    async def _perp_user_trades(self, request):
+        """永续成交历史。
+
+        支持 `orderId` 过滤（`_commission_of` 用它查单笔手续费）；
+        不带 `orderId` 时返回全部（`user_trades()` 分页拉真账用）。
+        """
+        self.calls.append(("GET", "/fapi/v1/userTrades"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        if not self.trades_available:
+            return web.json_response({"code": -2014, "msg": "API-key format invalid."},
+                                     status=400)
+        q = dict(parse_qsl(request.query_string))
+        rows = list(self.perp_trades)
+        if q.get("orderId"):
+            rows = [r for r in rows if str(r.get("orderId")) == str(q["orderId"])]
+        if q.get("startTime"):
+            rows = [r for r in rows if int(r.get("time") or 0) >= int(q["startTime"])]
+        if q.get("endTime"):
+            rows = [r for r in rows if int(r.get("time") or 0) <= int(q["endTime"])]
+        return web.json_response(rows)
+
+    async def _perp_open_orders(self, request):
+        self.calls.append(("GET", "/fapi/v1/openOrders"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        out = [self._order_json(o) for o in self.order_book.values()
+               if o["status"] in ("NEW", "PARTIALLY_FILLED")]
+        out.sort(key=lambda x: x["orderId"])
+        return web.json_response(out)
+
+    async def _perp_query_order(self, request):
+        self.calls.append(("GET", "/fapi/v1/order"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        o = self._find_order(dict(parse_qsl(request.query_string)))
+        if o is None:
+            return web.json_response(
+                {"code": -2013, "msg": "Order does not exist."}, status=400)
+        return web.json_response(self._order_json(o))
+
+    async def _perp_cancel_order(self, request):
+        self.calls.append(("DELETE", "/fapi/v1/order"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        o = self._find_order(dict(parse_qsl(request.query_string)))
+        # 真交易所：不存在的单、以及已成交/已撤的单，都回 -2011
+        if o is None or o["status"] in ("FILLED", "CANCELED"):
+            return web.json_response(
+                {"code": -2011, "msg": "Unknown order sent."}, status=400)
+        o["status"] = "CANCELED"
+        o["updateTime"] = self._now_ms()
+        return web.json_response(self._order_json(o))
+
+    async def _perp_cancel_all(self, request):
+        self.calls.append(("DELETE", "/fapi/v1/allOpenOrders"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        n = 0
+        for o in self.order_book.values():
+            if o["status"] in ("NEW", "PARTIALLY_FILLED"):
+                o["status"] = "CANCELED"
+                o["updateTime"] = self._now_ms()
+                n += 1
+        return web.json_response({"code": 200, "msg": "success", "n": n})

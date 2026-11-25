@@ -140,11 +140,22 @@ def plan_position(cfg: SizingConfig, stop_distance_pct: float) -> PositionPlan:
 
     if d.risk_per_trade <= 0:
         reasons.append("本金过小，无法分出 1U 风险")
-    if stop_distance_pct > d.max_stop_distance_pct:
+    # ★ 边界必须用容差比较。止损按设计**恰好等于**上限（仓位就是按
+    # d_max 定的），而 `(d + cost)/price*100` 在浮点下会大出 1e-14 ——
+    # 严格 `>` 会把本来合规的计划拒掉（实测 4/11）。
+    # 这不是放宽：3%% 的止损对 1.618%% 的上限照样被拒。
+    if stop_distance_pct > d.max_stop_distance_pct + 1e-4:
         reasons.append(
             "止损 %.3f%% 超过上限 %.3f%%（爆仓会先于止损触发）"
             % (stop_distance_pct, d.max_stop_distance_pct))
-    if liq_buffer < cfg.safety_multiple:
+    # ★ 同一个边界问题的第二处。
+    #
+    #   `liq_buffer = 爆仓距离 / 止损距离`，而止损上限本来就是
+    #   `爆仓距离 / 安全倍数` 算出来的 —— 所以恰好贴着边界时
+    #   liq_buffer **就是** safety_multiple（理论上相等）。
+    #   浮点下它会变成 2.4999999999，于是“恰好合规”被判成不合规。
+    #   用相对容差（1e-9 也行，但除法会放大误差，用相对更稳）。
+    if liq_buffer < cfg.safety_multiple * (1.0 - 1e-5):
         reasons.append(
             "爆仓缓冲 %.2f 倍 < 要求 %.2f 倍" % (liq_buffer, cfg.safety_multiple))
     if margin > d.margin_cap_amount:

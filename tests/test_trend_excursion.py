@@ -134,10 +134,33 @@ def _open_pos(eng):
     # 交易所必须如实持有这 0.001，否则周期对账会判定"交易所没仓位"，
     # 把本地仓位清掉——之后走的是空仓开新仓的分支，测的就不是持有了。
     eng.ex.held = 0.001
-    eng.pos = {"side": "buy", "qty": 0.001, "entry": ENTRY, "stop": 50.0,
+    # side 必须是 "long"/"short"，和 engine._open() 写进去的取值一致。
+    #
+    # ★ 这里原来是 "buy"（第 129 轮修正）。引擎里所有地方都按
+    #   `1 if side == "long" else -1` 取方向，写 "buy" 会被当成【空头】：
+    #     - mfe 算成 (120-100) * -1 = -20
+    #     - reconcile_live 的 db_qty 会变成 -0.001，与交易所 +0.001 判不一致
+    #   而这条测试以前能过，靠的正是后面那个副作用：对账把仓位【接管】成
+    #   side="long"，顺手把 side 改对了。也就是说测试实际验证的是
+    #   "接管之后 MFE 对不对"，而不是"持仓期间 MFE 跟踪对不对"。
+    #   接手仓改成不判策略出场之后，接管不再触发，这条假依赖才暴露出来。
+    eng.pos = {"side": "long", "qty": 0.001, "entry": ENTRY, "stop": 50.0,
                "target": 0.0, "entry_ts": 0, "bars": 0, "best": ENTRY,
                "worst": ENTRY, "trade_id": None, "max_hold_bars": 600,
                "open_reason": "t", "fee": 0.0, "signal": "trend_entry"}
+    # ★ 必须真的写一条未平仓记录（第 129 轮修正）。
+    #
+    # engine._close() 走的是 db.close_trade()，它按
+    #   WHERE entry_ts=? AND side=? AND exit_ts IS NULL
+    # 去 UPDATE 已存在的那一行 —— 它【从不 INSERT】。
+    # 所以"没有开仓记录"时平仓什么都不写，而这条测试原来能读到最后一行，
+    # 靠的是对账接管分支恰好 INSERT 了一条。那同样是假依赖：
+    # 它验证的是"接管那条记录"，不是"_close 把 MFE/MAE 写对了"。
+    eng.db.log_trade({
+        "symbol": "BTCUSDT", "side": "long", "qty": 0.001,
+        "entry_ts": 0, "entry_price": ENTRY, "stop_price": 50.0,
+        "target_price": 0.0, "open_reason": "t", "paper": 1,
+        "strategy": "trend", "max_hold_bars": 600})
 
 
 @pytest.mark.asyncio

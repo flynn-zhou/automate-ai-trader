@@ -10,11 +10,12 @@ import os
 import time
 from typing import Optional
 
-from flask import (Flask, current_app, jsonify, request,
+from flask import (Flask, current_app, jsonify, render_template, request,
                    send_from_directory)
 
 from ..config import INTERVAL_NAMES, INTERVALS_MS, AppCfg
 from ..feed import Feed
+from .kbar_api import kbar_bp
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ def _forming_1h(symbol):
 
 
 def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
-               guard=None, range_db=None, settings=None, store=None) -> Flask:
+               guard=None, range_db=None, settings=None, store=None,
+               loop=None) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config["CFG"] = cfg
     app.config["FEED"] = feed
@@ -59,6 +61,41 @@ def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
     app.config["JOURNAL"] = journal
     app.config["GUARD"] = guard
     app.config["MARKET_STORE"] = store or getattr(feed, "store", None)
+    # Flask 跑在 waitress 的线程池里，而执行器（aiohttp 会话）属于主线程的
+    # 事件循环。跨线程调协程必须走 run_coroutine_threadsafe，否则
+    # 要么 "no running event loop"，要么在错误的循环上创建任务。
+    # 引擎没起来时（只采集模式）这里是 None，页面照样能看，只是不能手动刷新。
+    app.config["LOOP"] = loop
+
+    # 模板过滤器：毫秒时间戳 → 本地时间字符串，秒数 → 人读的时长。
+    #
+    # 放在 create_app 里而不是模板内联，是因为内联写法（strftime + timedelta）
+    # 在 Jinja 里既难读又容易把毫秒/秒搞混——而这个页面上的时间戳
+    # 一个来错单位就会显示成 1970 年，且不会报错。
+    @app.template_filter("ts")
+    def _f_ts(ms):
+        if not ms:
+            return "—"
+        try:
+            import datetime as _dt
+            return _dt.datetime.fromtimestamp(int(ms) / 1000.0).strftime(
+                "%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError):
+            return "—"
+
+    @app.template_filter("dur")
+    def _f_dur(sec):
+        try:
+            s = int(sec or 0)
+        except (TypeError, ValueError):
+            return "—"
+        if s <= 0:
+            return "0 分"
+        if s < 3600:
+            return "%d 分" % (s // 60)
+        if s < 86400:
+            return "%d 时 %d 分" % (s // 3600, (s % 3600) // 60)
+        return "%d 天 %d 时" % (s // 86400, (s % 86400) // 3600)
 
     # 空令牌 = 全裸。这在生产上真实发生过：/etc/ai-trader/env 里
     # AI_WEB_TOKEN= 后面是空的，整个看板和所有接口匿名可访问，
@@ -194,6 +231,42 @@ def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
             return jsonify({"error": "no trade db"}), 404
         return jsonify({"curve": tdb.equity_curve(int(request.args.get("limit", 1000)))})
 
+    # ---------- 真实持仓回合（第 130 轮）----------
+    # 数据来自交易所 userTrades，不是 trades 表。两套账要能各自看，
+    # 看板这边只读 live_rounds，不去 join trades —— join 就等于把
+    # 「引擎记的那笔」和「交易所真正发生的那笔」抹成一个数，
+    # 而它们对不上这件事本身就是最该被看见的信息。
+    @app.get("/api/live/rounds")
+    def live_rounds_api():
+        if tdb is None:
+            return jsonify({"error": "no trade db"}), 404
+        limit = int(request.args.get("limit", 20))
+        return jsonify({
+            "rounds": tdb.recent_live_rounds(limit),
+            "summary": tdb.live_rounds_summary(limit),
+        })
+
+    @app.post("/api/live/rounds/refresh")
+    def live_rounds_refresh():
+        """手动触发一次真账同步。
+
+        为什么需要它：对账心跳是 300 秒一次，用户刚平完仓想马上看到
+        这一单的分数，等 5 分钟等于没这个功能。
+        """
+        eng = current_app.config.get("ENGINE")
+        lp = current_app.config.get("LOOP")
+        if eng is None or lp is None:
+            return jsonify({"ok": False,
+                            "error": "引擎未运行或事件循环不可用"}), 503
+        try:
+            import asyncio as _aio
+            fut = _aio.run_coroutine_threadsafe(eng._sync_live_ledger(), lp)
+            fut.result(timeout=30)
+        except Exception as e:
+            logger.warning("手动刷新真账失败: %s", str(e)[:160])
+            return jsonify({"ok": False, "error": str(e)[:160]}), 502
+        return jsonify({"ok": True})
+
     @app.get("/api/guard")
     def guard_state():
         if guard is None:
@@ -325,9 +398,11 @@ def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
         except (TypeError, ValueError, KeyError) as e:
             p = {"ok": False, "error": "试算参数不完整: %s" % e}
         return jsonify({"ok": True, "sizing": s, "derived": p,
+                        "strategy": settings.strategy(),
                         "live": {"risk_pct": cfg.trading.risk_pct,
                                  "max_leverage": cfg.trading.max_leverage,
-                                 "paper_balance": cfg.trading.paper_balance}})
+                                 "paper_balance": cfg.trading.paper_balance,
+                                 "surprise_pts": cfg.trading.surprise_pts}})
 
     @app.post("/api/config/sizing")
     def config_sizing_post():
@@ -350,13 +425,24 @@ def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
         ok, why = settings.set_sizing(capital, risk_pct, leverage)
         if not ok:
             return jsonify({"ok": False, "error": why}), 400
+
+        # ★ 惊喜K线阈值：**可选**。不传就不动它 ——
+        #   老调用方（脚本/旧页面）只传三个数，不能因为它们没传就把用户
+        #   在页面上设好的 1200 静默改回 500。但传了就必须合法：非法一律 400。
+        if body.get("surprise_pts") is not None:
+            ok2, why2 = settings.set_surprise(body.get("surprise_pts"))
+            if not ok2:
+                return jsonify({"ok": False, "error": why2}), 400
+
         applied = settings.apply_to(cfg.trading)
         logger.info("仓位参数已改并生效: %s", applied)
         p = settings.preview(capital, risk_pct, leverage)
         return jsonify({"ok": True, "sizing": applied, "derived": p,
+                        "strategy": settings.strategy(),
                         "live": {"risk_pct": cfg.trading.risk_pct,
                                  "max_leverage": cfg.trading.max_leverage,
-                                 "paper_balance": cfg.trading.paper_balance}})
+                                 "paper_balance": cfg.trading.paper_balance,
+                                 "surprise_pts": cfg.trading.surprise_pts}})
 
     # ---------- 后台（带登录）----------
     # 与公开的 /、/range、/config 并存，互不影响：
@@ -383,6 +469,33 @@ def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
     app.register_blueprint(auth_bp)
     app.register_blueprint(dash_bp)
     app.register_blueprint(live_bp)
+    # K 线演化的只读回看接口。单独一个蓝图，是因为它读的是 **kbar.db**
+    # 而不是实时行情：两套数据源混在一个蓝图里，迟早有人把演化数据
+    # 当成"现在的行情"用。
+    app.register_blueprint(kbar_bp)
+
+    # ---------------- 决策流看板（第 131 轮）----------------
+    #
+    # 为什么要有这一页：`decisions` 表每根 K 线都写一行（开仓/平仓/等待/跳过/
+    # 观望全记），但此前**没有任何页面读它** —— `/api/trade/decisions` 是个孤儿
+    # 接口，返回的 JSON 没有消费者。后果是「系统不停、决策不止」这件事在 Web 端
+    # 完全看不见：要知道系统为什么没开仓，只能登服务器翻库。
+    #
+    # 只新增、不改任何现有路由：路径取 /decisions（不是 /admin/decisions），
+    # 因为 dashboard.py 正被另一条线改，蓝图里加不了；这里自己挂 login_required，
+    # 效果与 /admin/* 一致（未登录 302 到登录页）。
+    #
+    # 页面里的令牌：该页与 /admin/* 一样需要登录，令牌只为它内部轮询
+    # /api/* 用（before_request 对所有 /api/* 要令牌）。匿名可访问的 / 与
+    # /static/* 不掺这个 —— 那边的红线是「令牌不能进公开页面 HTML」。
+    from .auth import login_required as _login_required
+
+    @app.get("/decisions")
+    @_login_required
+    def decisions_page():
+        return render_template(
+            "dash_decisions.html",
+            token=getattr(cfg.web, "auth_token", "") or "")
 
     def _sizing_view(s):
         """把 4 个仓位参数算成页面要显示的全部派生量。
@@ -429,6 +542,8 @@ def create_app(cfg: AppCfg, feed: Feed, engine=None, tdb=None, journal=None,
                             * s["sizing.risk_pct"] / 100.0))
                           if s.get("sizing.capital") else 0,
             "sz": _sizing_view(s),
+            "shop_surprise": (settings.strategy().get("strategy.surprise_pts", 0.0)
+                              if settings is not None else 0.0),
             "shop_mode": cfg.trading.mode,
             "shop_strategy": cfg.trading.strategy,
             "shop_market": cfg.trading.exec_market,

@@ -2,7 +2,7 @@
 """整条实盘启动链路的集成测试：main.run(mode=live) 真的从 0 跑到能决策。
 
 之前测的都是零件：
-  SpotExecutor 能下单（自己构造的）
+  LiveExecutor 能下单（自己构造的）
   reconcile_live 能接管（自己构造的）
   set_leverage 被调用（源码字符串 grep）
 
@@ -104,7 +104,7 @@ class StubStore:
 def _cfg(tmp_path, fake, **kw):
     cfg = AppCfg()
     cfg.trading.mode = "live"
-    cfg.trading.exec_market = "spot"
+    cfg.trading.exec_market = "perp"
     cfg.trading.strategy = "trend"
     cfg.trading.api_key = fake.api_key
     cfg.trading.api_secret = fake.api_secret
@@ -116,12 +116,19 @@ def _cfg(tmp_path, fake, **kw):
 
 
 def _patch(monkeypatch, fake):
-    RealSpot = main_mod.SpotExecutor
+    """把真实执行器换成指向假交易所的同一个类。
 
-    def PatchedSpot(feed, c, k, s, proxy=""):
-        return RealSpot(feed, c, k, s, base=fake.base(), proxy=proxy)
+    ★ 2026-11-17 只做合约：指向 `LiveExecutor`（以前是 `SpotExecutor`）。
+      `fake_binance` 本来就把 `/fapi/v1/*` 全部实现了（exchangeInfo /
+      premiumIndex / account / positionRisk / order / openOrders / leverage），
+      所以这条链路不需要新的假服务器。
+    """
+    RealLive = main_mod.LiveExecutor
 
-    monkeypatch.setattr(main_mod, "SpotExecutor", PatchedSpot)
+    def PatchedLive(feed, c, k, s, proxy=""):
+        return RealLive(feed, c, k, s, base=fake.base(), proxy=proxy)
+
+    monkeypatch.setattr(main_mod, "LiveExecutor", PatchedLive)
     monkeypatch.setattr(main_mod, "Feed", lambda c, st: StubFeed(c, st))
     monkeypatch.setattr(main_mod, "Store", StubStore)
 
@@ -141,8 +148,8 @@ def _risk_kinds(trade_db_path):
 
 
 @pytest.mark.asyncio
-async def test_live_spot_startup_has_no_engine_error(tmp_path, monkeypatch):
-    """现货实盘启动全程不得产生 engine_error——这是链路通不通的硬指标。"""
+async def test_live_perp_startup_has_no_engine_error(tmp_path, monkeypatch):
+    """合约实盘启动全程不得产生 engine_error——这是链路通不通的硬指标。"""
     fake = await FakeBinance(usdt=100.0, btc=0.0, price=77815.0).start()
     try:
         cfg = _cfg(tmp_path, fake)
@@ -150,8 +157,13 @@ async def test_live_spot_startup_has_no_engine_error(tmp_path, monkeypatch):
         await main_mod.run(cfg, seconds=2, with_web=False)
 
         paths = [p for (_m, p) in fake.calls]
-        assert "/api/v3/account" in paths, "启动时没有读账户余额"
-        assert "/api/v3/exchangeInfo" in paths, "启动时没有读交易对规格"
+        # ★ 合约的余额事实在 positionRisk + account 两边；启动对账首先要读持仓。
+        #   （不钉 `/fapi/v2/account`：那是主循环里 equity() 才走的，
+        #    而主循环第一步与 2s 时长有竞争，钉它等于钉时序。）
+        assert "/fapi/v2/positionRisk" in paths, "启动时没有读真实持仓"
+        # 交易对规格是**懒加载**的（第一笔下单时才读 exchangeInfo），
+        # 所以不能在启动阶段要求它——那是钉错了时序。
+        # 真正该钉的是：启动链路跑完了、没抛异常（见下面的 engine_error）。
 
         kinds = dict((k, d) for k, d in _risk_kinds(cfg.store.path))
         assert "engine_error" not in kinds, (
@@ -161,16 +173,23 @@ async def test_live_spot_startup_has_no_engine_error(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_live_spot_does_not_call_set_leverage(tmp_path, monkeypatch):
-    """现货没有杠杆——绝不能在现货执行器上调 set_leverage。"""
+async def test_live_perp_startup_sets_leverage(tmp_path, monkeypatch):
+    """★ 反转了：合约启动必须**调用** set_leverage。
+
+    以前这条验的是“现货没杠杆”。现货路径被删了，同一个关切点的
+    **反面**才是现在的不变式：真实资金 + 永续而不设杠杆，下单会按
+    交易所默认杠杆执行，而我们的仓位是按 `cfg.trading.max_leverage` 算出来的。
+    """
     fake = await FakeBinance(usdt=100.0, btc=0.0, price=77815.0).start()
     try:
         cfg = _cfg(tmp_path, fake)
         _patch(monkeypatch, fake)
         await main_mod.run(cfg, seconds=2, with_web=False)
 
-        assert "/api/v3/leverage" not in [p for (_m, p) in fake.calls]
-        assert not hasattr(main_mod.SpotExecutor, "set_leverage") or True
+        paths = [p for (_m, p) in fake.calls]
+        assert "/fapi/v1/leverage" in paths, (
+            "合约启动没设杠杆：下单会按交易所默认杠杆执行，"
+            "与我们算出来的仓位不一致；实际调用：%r" % (paths,))
     finally:
         await fake.stop()
 
@@ -182,15 +201,13 @@ async def test_live_startup_adopts_existing_position(tmp_path, monkeypatch):
     真实场景：上次进程开仓后崩了，或用户手工买过币。
     不接管的话系统以为空仓，会在有持仓的状态下再买一次。
     """
-    fake = await FakeBinance(usdt=0.0, btc=0.00128, price=77815.0).start()
+    fake = await FakeBinance(usdt=0.0, price=77815.0).start()
+    # ★ 永续的持仓事实在 positionRisk 里（现货那个 `btc=` 字段对合约无效）。
+    #   不设它，这条测试就是在测“空仓不被接管”——假绿。
+    fake.positions["BTCUSDT"] = {"amt": 0.002, "entry": 77815.0}
     try:
         cfg = _cfg(tmp_path, fake)
-        RealSpot = main_mod.SpotExecutor
-
-        def PatchedSpot(feed, c, k, s, proxy=""):
-            return RealSpot(feed, c, k, s, base=fake.base(), proxy=proxy)
-
-        monkeypatch.setattr(main_mod, "SpotExecutor", PatchedSpot)
+        _patch(monkeypatch, fake)
         monkeypatch.setattr(main_mod, "Feed", lambda c, st: StubFeed(c, st))
         monkeypatch.setattr(main_mod, "Store", StubStore)
 
@@ -201,15 +218,22 @@ async def test_live_startup_adopts_existing_position(tmp_path, monkeypatch):
             async def reconcile_live(self):
                 r = await super().reconcile_live()
                 captured["pos"] = dict(self.pos) if self.pos else None
+                # ★ 2026-11-24 拆仓后：接管来的仓进 `adopted_pos`，
+                #   `self.pos` 只放系统仓。所以两个槽都抓。
+                captured["adopted"] = (dict(self.adopted_pos)
+                                       if self.adopted_pos else None)
                 captured["exc"] = None
                 return r
 
         monkeypatch.setattr(main_mod, "DecisionEngine", SpyEngine)
         await main_mod.run(cfg, seconds=2, with_web=False)
 
-        pos = captured.get("pos")
+        pos = captured.get("adopted")
         assert pos is not None, "交易所有 BTC，启动对账却没有接管持仓"
-        assert pos["qty"] == pytest.approx(0.00128, rel=1e-3)
+        assert captured.get("pos") is None, (
+            "接管来的人工仓不该进 self.pos（那是系统仓的槽）—— "
+            "混进去就等于把用户手工仓洗成策略仓")
+        assert pos["qty"] == pytest.approx(0.002, rel=1e-9)
         assert pos["stop"] > 0, "接管后止损为 0，等于没有保护"
         assert pos["stop"] < pos["entry"], "多头止损价应该低于成本"
 

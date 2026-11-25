@@ -132,9 +132,10 @@ async def test_reconcile_adopts_unknown_position_without_zero_stop():
     eng.pos = None
     eng.db = db
     await eng.reconcile_live()
-    assert eng.pos is not None, "必须接管交易所的持仓"
-    assert eng.pos["stop"] > 0, "止损价不能是 0（会变成一开机就平仓）"
-    assert eng.pos["qty"] == pytest.approx(0.003)
+    assert eng.adopted_pos is not None, "必须接管交易所的持仓"
+    assert eng.pos is None, "来源不明的仓不许进系统仓槽（会被当成策略仓管理）"
+    assert eng.adopted_pos["stop"] > 0, "止损价不能是 0（会变成一开机就平仓）"
+    assert eng.adopted_pos["qty"] == pytest.approx(0.003)
 
     # 接管必须【真的写入一条成交记录】。
     # 原先只断言 eng.pos 有值——而引擎调的是不存在的方法签名，

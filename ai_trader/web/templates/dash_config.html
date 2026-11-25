@@ -26,6 +26,25 @@
                value="{{ settings['sizing.leverage'] }}">
       </div>
     </div>
+
+    <div class="grid" style="margin-top:14px">
+      <div>
+        <label class="k">惊喜K线阈值（点，单根 5m 顺向幅度）</label>
+        <input name="surprise_pts" type="number" step="50" min="1" max="10000"
+               list="surprise_typical"
+               value="{{ (strategy_pts or {}).get('strategy.surprise_pts', shop_surprise) }}">
+        <datalist id="surprise_typical">
+          <option value="500"></option>
+          <option value="700"></option>
+          <option value="1200"></option>
+        </datalist>
+        <div class="k" style="margin-top:6px">
+          单根 5m 的**顺向**幅度达到这个点数就立即止盈（不是累计）。
+          常用值 500 / 700 / 1200：500 已等于止损宽度的 3~6 倍，属于罕见大K线；
+          1650 以上基本等于关闭这条规则。
+        </div>
+      </div>
+    </div>
     <div class="row" style="margin-top:16px">
       <button>保存并立即生效</button>
       <span class="k">改动会写进数据库，引擎下一次决策就用新值，无需重启</span>

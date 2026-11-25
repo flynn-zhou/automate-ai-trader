@@ -59,31 +59,6 @@ def _min_tradeable_equity(eng, price, hi=30000.0):
     return hi
 
 
-def test_spot_100u_account_is_comfortably_tradeable():
-    """现货下 100U 能建仓，而且资金使用率接近满仓（回测假设的就是这个）。"""
-    eng = _engine("spot")
-    price = 77749.0
-    plan = eng._trend_plan(price, 100.0, {"name": "x", "reason": "y"})
-    assert plan.ok, "100U 现货建不了仓：%s" % plan.reason
-    assert plan.notional >= 99.0, (
-        "100U 只用了 %.2fU，远低于回测假设的满仓；回测数字会系统性偏高"
-        % plan.notional)
-    assert plan.notional <= 100.0 + 1e-6, "超配：%.2fU" % plan.notional
-
-
-def test_spot_floor_is_about_5u_not_55u():
-    """现货的生死线在 5~7U，不是永续那个 55U。
-
-    这条防的是「把永续的最小名义 55U 误用到现货上」——
-    那样 100U 账户回撤 45% 就永久停摆，而策略的最大回撤就是 46%。
-    """
-    eng = _engine("spot")
-    for price in (30000.0, 77749.0, 120000.0):
-        floor = _min_tradeable_equity(eng, price)
-        assert 4.5 <= floor <= 7.0, (
-            "价格 %.0f 时现货生死线 %.2fU 落在 5~7U 之外" % (price, floor))
-
-
 def test_perp_cannot_handle_a_100u_account():
     """永续在 100U 上结构性不可用 —— 这不是「更贵」，是「做不了」。
 
@@ -115,14 +90,23 @@ def test_plan_leaves_room_for_the_taker_fee():
         notional + notional*taker_fee > equity   -> 拒单
     把缓冲改成 0，这条要红；只查「不超配」是查不出来的。
     """
-    eng = _engine("spot")
-    fee = float(eng.tcfg.spot_taker_fee)
+    eng = _engine("perp")
+    fee = float(eng.tcfg.taker_fee)      # ★ 2026-11-17 只做合约：用永续 taker
+    checked = 0
     for price in (30000.0, 77749.0, 120000.0):
         for equity in (100.0, 257.0, 1275.0):
             plan = eng._trend_plan(price, equity, {"name": "x", "reason": "y"})
-            assert plan.ok
+            if not plan.ok:
+                # ★ 不是每个组合都开得出来了（例：价 120000 时一手就要 120U，
+                #   而 trend_leverage=1x）。不许拿这个当借口放掉下面的断言 ——
+                #   `checked` 计数保证「至少真的验过几个组合」，否则这条测试会空转。
+                continue
+            checked += 1
             need = plan.notional * (1.0 + fee)
             assert need <= equity + 1e-6, (
                 "价格 %.0f 权益 %.0f：名义 %.2fU 加上 taker 费共需 %.2fU，"
                 "超出权益 %.2fU，下单会被拒"
                 % (price, equity, plan.notional, need, need - equity))
+    assert checked >= 4, (
+        "只有 %d 个组合真的跑到断言（共 9 个）—— 太少就等于这条测试在空转"
+        % checked)

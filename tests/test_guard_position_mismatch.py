@@ -159,7 +159,7 @@ async def test_adopting_an_orphan_position_hard_halts():
     ex = _Ex(qty=0.001)
     e, db, g = _eng(ex, db_qty=None)
     await e.reconcile_live()
-    assert e.pos is not None, "构造前提：孤儿仓位应被接管"
+    assert e.adopted_pos is not None, "构造前提：孤儿仓位应被接管"
     ok, why = g.can_open()
     assert not ok, (u"交易所有 0.001 BTC 而数据库空仓，对账不一致，"
                     u"文档要求硬停，实际 can_open=%r" % (ok,))

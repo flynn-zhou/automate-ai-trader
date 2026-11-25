@@ -39,6 +39,10 @@
        class="{{ 'on' if request.endpoint == 'dash.home' }}">总览</a>
     <a href="{{ url_for('dash.range_page') }}"
        class="{{ 'on' if request.endpoint == 'dash.range_page' }}">区间演化</a>
+    <a href="{{ url_for('dash.live_rounds_page') }}"
+       class="{{ 'on' if request.endpoint == 'dash.live_rounds_page' }}">真实持仓</a>
+    <a href="{{ url_for('decisions_page') }}"
+       class="{{ 'on' if request.endpoint == 'decisions_page' }}">决策流</a>
     <a href="{{ url_for('dash.config_page') }}"
        class="{{ 'on' if request.endpoint == 'dash.config_page' }}">仓位配置</a>
     <a href="/?token={{ cfg_token }}" target="_blank">实时看板 ↗</a>

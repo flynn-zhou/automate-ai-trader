@@ -44,3 +44,26 @@ Thumbs.db
 _archive/*
 !_archive/docs_outdated/
 !_archive/docs_outdated/**
+
+# ---- 根目录数据文件与临时产物（2026-11-25 审查轮追加）----
+# 这些不是代码：从交易所拉下来的本地库、打包产物、部署核对清单。
+# data/ 下的同类文件早就在上面被忽略了，但根目录这几份漏网了。
+/*.db
+/*.db-wal
+/*.db-shm
+/*.tar.gz
+/server_md5.txt
+
+# ---- 路由看板自动生成的页面（内容由 .router 板推导，可随时重建）----
+.canvas/
+
+# ---- 一次性排查脚本 tools/_* ----
+# 每轮排障都会写一堆 _diag_/_q_prod_/_patch_/_verify_ 开头的一次性脚本。
+# 它们记录的是[当时怎么查的]，不是产品代码，也不该进仓库。
+# 真正的工具（backfill_kbar_*、ingest_kbar.py、probe_position_risk.py、
+# deploy_bus_a.py 等）不带下划线前缀，照常提交。
+# 注：历史上已经跟踪的那些 tools/_*.py 保留原样，不做追溯删除。
+tools/_*
+
+# ---- 带日期的配置备份 ----
+deploy/Caddyfile.20*

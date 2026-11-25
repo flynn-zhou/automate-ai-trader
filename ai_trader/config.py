@@ -36,6 +36,10 @@ class MarketCfg:
     http_proxy: str = ""            # 生产留空；本机经 clash 填 http://127.0.0.1:4780
 
 
+#: ★ 惊喜K线阈值的字面量（点）。只能定义在这一处，其他地方引用它。
+DEFAULT_SURPRISE_PTS = 500.0
+
+
 @dataclass
 class StoreCfg:
     path: str = str(ROOT / "data" / "market.db")
@@ -53,8 +57,13 @@ class WebCfg:
 class TradingCfg:
     mode: str = "paper"              # paper | live
     symbol: str = "BTCUSDT"
-    paper_balance: float = 100.0
-    # 单笔风险 = 本金 × risk_pct，向下取整。100U × 5% = 5U → 可连亏 20 次才归零。
+    # ★ 2026-11-17 用户裁决：仓位 / 本金固定 **50U**（原来是 100U）。
+    #   原话：「仓位固定 50U，其实我也没设置的是 100U，改一下，反正开仓机会少」。
+    #   50U × risk_pct 5% = **2.5U 单笔风险** → 可连亏 20 次才归零。
+    #   ★ 注意 `min_notional = 50.0`：50U 本金在 0.5% 止损下会开出
+    #     ~500U 名义（10x），最小下单不会挡路；止损放到 5% 才会被 50U 名义挡住。
+    paper_balance: float = 50.0
+    # 单笔风险 = 本金 × risk_pct，向下取整。50U × 5% = 2.5U → 可连亏 20 次才归零。
     # 这里曾是 35.0（3 条命），2026-11 按用户裁决改为 5。别再改回去：
     # 35% 单笔风险在 22x 下等于把「爆仓」当常规止损用。
     risk_pct: float = 5.0
@@ -80,7 +89,21 @@ class TradingCfg:
     # 所以费率不再是一个数，而是一个市场一个数，用 taker_fee_for() 取。
     taker_fee: float = 0.0005        # 永续（perp）
     spot_taker_fee: float = 0.0010   # 现货：币安 BNB 未抵扣的 taker 费率
+    # ★ 2026-11-17：挂单能力上线后，**maker 与 taker 必须分开**。
+    #
+    #   「提前挂单」的赢的一路走的就是限价单成交 = maker（0.02%），
+    #   而止损是触发式市价单 = taker（0.05%）。以前只有一个 taker，
+    #   等于把赢的那一路按 2.5 倍费率收费 —— 成本模型会算出偏悲观的结果，
+    #   而 `PricePlan` 的成本字段是按 0.02%/0.05% 建的，两边必须一致。
+    #
+    #   现货 VIP0 的 maker 与 taker 同价（0.10%），所以这里给两个不同的默认值。
+    maker_fee: float = 0.0002        # 永续（perp）maker
+    spot_maker_fee: float = 0.0010   # 现货 maker
     slippage_bps: float = 1.0
+
+    def fee_maker_for(self, is_spot: bool) -> float:
+        """按市场取 maker 费率（挂单成交）。"""
+        return self.spot_maker_fee if is_spot else self.maker_fee
 
     def taker_fee_for(self, is_spot: bool) -> float:
         """按市场取 taker 费率。现货和永续差一倍，不能混用。
@@ -91,9 +114,36 @@ class TradingCfg:
         return self.spot_taker_fee if is_spot else self.taker_fee
     api_key: str = ""                # 实盘凭证，只从环境变量读，不落配置文件
     api_secret: str = ""
-    # spot | perp。只做多的策略必须走现货：永续的资金费长期正费率（多头付钱）
-    # 年化 11.6%，实测六年下来现货 1x 的卡玛 0.61 明显优于永续 1.5x 的 0.43。
-    exec_market: str = "spot"
+    #: ★ 2026-11-17 用户裁决：**只做合约（永续），现货路径从代码上断开**。
+    #:
+    #: 原话：「我们是合约账户做交易，我不想看到现货相关的东西影响到我们了！」
+    #:
+    #: 为什么不是「把默认值改成 perp」就完事：`spot` 不只影响「用哪个执行器」，
+    #: 它通过 `engine._is_spot()` 改了 **7 处交易语义** ——
+    #: `_qty_step`（0.00001 vs 0.001，差 100 倍）、`_fee_buffer`（0.3% vs 0.1%）、
+    #: `_min_notional`（5U vs 55U）、`_plan_leverage`（锁死 1.0）、
+    #: 资金不足提示、`dust` 清理。留着这个值，任何一处漏改都会静默按现货记账。
+    #:
+    #: 所以：**白名单里只剩 perp**（见 `load()` 的 `_pick`），填 spot 直接拒绝启动。
+    #: 这与「拼错策略名拒绝启动」是同一条纪律：配错不能被静默当成另一个市场来跑。
+    #:
+    #: 历史沿革（保留，别再拿它当借口切回现货）：
+    #: 最初走现货是因为只做多策略的资金费长期正费率（多头付钱）年化 11.6%，
+    #: 实测六年现货 1x 卡玛 0.61 优于永续 1.5x 的 0.43。那条结论的前提是
+    #: 「只做多」+ 「1x」+ 「4h 趋势」。现在的 pending 策略**多空都做**，
+    #: 现货根本不能做空（11 条计划里约一半是 DOWN），前提不成立了。
+    #: ★ 挂单策略的「只出计划不挂单」开关。**默认 True**。
+    #:
+    #: 2026-11-17 用户裁决（上生产的步奏）：
+    #:   「先「只出计划不挂单」跑一轮，确认后开真单」
+    #:
+    #: 为什么默认必须是 True：这个开关的两侧代价完全不对称。
+    #:   默认 False（直接真单）而忘了配 -> 没验证过的策略直接下真钱；
+    #:   默认 True 而忘了配 -> 只是没下单，看板上会显示 dry-run。
+    #: 要开真单必须显式写 `AI_PENDING_DRY_RUN=0` —— “要不要下真单”这种事
+    #: 不该靠“没配”来决定。
+    pending_dry_run: bool = True
+    exec_market: str = "perp"
     cost_multiple: float = 3.0
     # ---- 策略选择 ----
     # scalp = 3s 微型动量（已被回测证伪：扣成本后负期望，仅保留作对照）
@@ -150,6 +200,23 @@ class TradingCfg:
     cooldown_min: int = 30
     qty_step: float = 0.001
     min_notional: float = 50.0
+    #: ★★ 惊喜K线阈值（点）：单根 5m **顺向**幅度到了就立即止盈。
+    #:
+    #: 2026-11-17 用户原话：
+    #:   「任何一根 5m 的持仓顺向涨跌幅达到 500U，都要立即止盈，
+    #:     因为很难得！我们不是长线，遇到这种惊喜K线必须走」
+    #:   「500 会调整的，放在 web 配置里面，我经常看到的就是 500，700，1200
+    #:    这种 5m 的大K线！」
+    #:
+    #: ★ 为什么是「点」不是「U」：仓位是 50U 本金 + 按风险反推的 qty，
+    #:   同一个百分比在不同仓位上折出来的 U 完全不同；
+    #:   用点数做判据，策略才不会随仓位漂移。
+    #:
+    #: ★★ 这里是**唯一的字面量**。`pending_plan.PendingParams` 引用它，
+    #:   Web 配置的 `strategy.surprise_pts` 库里没值时也落回它。
+    #:   两处各写一个 500 是这个项目反复出事的那类错（同一事实两个来源）：
+    #:   改了一处、另一处还在按旧值跑，而且不报错。
+    surprise_pts: float = DEFAULT_SURPRISE_PTS
     max_hold_bars: int = 600          # 仅在没有 σ 数据时的兜底
     max_hold_hours: float = 24.0      # 持仓硬上限（小时），远超则强平
     reach_min_bars: int = 60          # 可达性门：目标至少要能在这个根数内被行情够到         # 3s 桶数 = 30 分钟
@@ -249,17 +316,27 @@ def load(path: str = "") -> AppCfg:
     # 否则配了 AI_STRATEGY=donchian 会直接拒绝启动——这是刻意的：
     # 拼错策略名被静默当成另一个策略跑，比启动失败危险得多。
     cfg.trading.strategy = _pick("AI_STRATEGY", cfg.trading.strategy,
-                                  ("trend", "scalp", "donchian"))
+                                  ("trend", "scalp", "donchian", "pending"))
     cfg.trading.donchian_entry = int(
         os.environ.get("AI_DONCHIAN_ENTRY", cfg.trading.donchian_entry))
     cfg.trading.donchian_exit = int(
         os.environ.get("AI_DONCHIAN_EXIT", cfg.trading.donchian_exit))
     cfg.trading.api_key = os.environ.get("AI_API_KEY", cfg.trading.api_key)
     cfg.trading.api_secret = os.environ.get("AI_API_SECRET", cfg.trading.api_secret)
+    #: ★ 只接受 perp：现货不能做空，而 pending 策略约一半计划是 DOWN。
+    #: 填 "spot" 会被 `_pick` 直接拒绝启动（不是警告、不是回退）。
     cfg.trading.exec_market = _pick("AI_EXEC_MARKET", cfg.trading.exec_market,
-                                    ("spot", "perp"))
+                                    ("perp",))
     cfg.trading.trend_hysteresis_pct = float(
         os.environ.get("AI_TREND_HYST", cfg.trading.trend_hysteresis_pct))
+    # ★ 「只出计划不挂单」开关。只有显式的真值才关闭 dry-run ——
+    #   拼错（`AI_PENDING_DRY_RUN=ture`）会落回 True，也就是**更安全**的那一侧。
+    #   这与 `_pick` 的纪律一致：不确定的时候不冒险。
+    _dry = str(os.environ.get("AI_PENDING_DRY_RUN", "") or "").strip().lower()
+    if _dry:
+        cfg.trading.pending_dry_run = _dry not in ("0", "false", "no", "off")
+    cfg.trading.surprise_pts = float(
+        os.environ.get("AI_SURPRISE_PTS", cfg.trading.surprise_pts))
     cfg.log_level = os.environ.get("AI_LOG_LEVEL", cfg.log_level)
     Path(cfg.store.path).parent.mkdir(parents=True, exist_ok=True)
     return cfg
@@ -268,6 +345,13 @@ def load(path: str = "") -> AppCfg:
 # 1h 加在 4h 之前：唐奇安策略的主周期是 1h（2026-11-02 五道关验证通过）。
 # 加它的直接后果是本地聚合器多维护一个桶，看板 /api/bars?interval=1h 也能查。
 # ★ 3s 仍是原子周期，只是列表变长——agg.py 的断言管的就是"3s 必须排第一"。
-INTERVALS_MS: List[int] = [3000, 15000, 60000, 180000, 900000, 3600000, 14400000]
+#
+# 5m（300000）在 2026-11-09 由用户确认加入。加它是为了让 5m 成为**原生周期**：
+# 从 3s 桶聚合出来，落进生产 market.db，K 线演化层就能跟着实时长，
+# 不必再靠离线重建整周期。放在 180000 之后保持单调递增。
+# ⚠ 顺序有意义：列表必须严格递增，agg 按它建桶；3000 必须留在第一个。
+INTERVALS_MS: List[int] = [3000, 15000, 60000, 180000, 300000, 900000,
+                           3600000, 14400000]
 INTERVAL_NAMES = {3000: "3s", 15000: "15s", 60000: "1m", 180000: "3m",
-                  900000: "15m", 3600000: "1h", 14400000: "4h"}
+                  300000: "5m", 900000: "15m", 3600000: "1h",
+                  14400000: "4h"}

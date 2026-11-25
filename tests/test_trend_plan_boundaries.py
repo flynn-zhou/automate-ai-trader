@@ -59,7 +59,8 @@ def _eng(price=5000.0):
     """
     cfg = load()
     cfg.trading.strategy = "trend"
-    cfg.trading.exec_market = "spot"
+    # ★ 2026-11-17 只做合约
+    cfg.trading.exec_market = "perp"
     cfg.trading.symbol = "BTCUSDT"
     cfg.trading.trend_stop_pct = 25.0
     e = DecisionEngine.__new__(DecisionEngine)
@@ -72,22 +73,24 @@ def _eng(price=5000.0):
 
 
 def _plan_at_exactly_min_notional():
-    """造一个 real_notional 恰好等于 _min_notional() 的计划。
+    """造一个 real_notional 恰好等于 `_min_notional()` 的计划。
 
-    现货：_min_notional()=5.0，_fee_buffer()=0.003，qty_step=1e-5。
-    取 price=5000：qty=0.001 时 real_notional = 5.0 恰好相等。
-    qty=floor(equity/1.003/5000/1e-5)*1e-5 = 0.001
-      <=> equity/1.003/5000 in [0.001, 0.00101)
-      <=> equity in [5.015, 5.065)
-    取 equity=5.02。
+    ★ 2026-11-17：不再硬写“现货 5U + 价 5000 + 步长 1e-5”。现在规格只有一套
+    （步长 0.001、最小名义 55U），硬写的数在下一次改配置时会变成一条说谎的测试。
+    所以这里**用引擎自己的三个事实反推**：步长、最小名义、缓冲。
     """
     e = _eng(5000.0)
-    p = e._trend_plan(5000.0, 5.02, {"ok": True, "name": "trend_up"})
-    assert e._min_notional() == pytest.approx(5.0), "前提变了：现货最小下单不是 5U"
-    assert p.qty == pytest.approx(0.001), (
-        u"构造失败：qty=%r，本意是 0.001" % (p.qty,))
-    assert p.notional == pytest.approx(5.0), (
-        u"构造失败：notional=%r，本意是恰好 5.0" % (p.notional,))
+    step, px = e._qty_step(), 5000.0
+    unit = step * px                       # 一手的名义
+    lots = int(-(-e._min_notional() // unit))   # ceil：最少几手才够最小名义
+    want = lots * unit                     # 恰好 >= 最小名义
+    # 反推权益：qty = floor(equity/(1+缓冲)/px/step)*step 要等于 lots*step
+    equity = want * (1.0 + e._fee_buffer()) * 1.0002
+    p = e._trend_plan(px, equity, {"ok": True, "name": "trend_up"})
+    assert p.qty == pytest.approx(lots * step), (
+        u"构造失败：qty=%r，本意是 %r" % (p.qty, lots * step))
+    assert p.notional == pytest.approx(want), (
+        u"构造失败：notional=%r，本意是 %r" % (p.notional, want))
     return p
 
 
@@ -100,9 +103,9 @@ def test_order_exactly_at_min_notional_is_allowed():
     """
     p = _plan_at_exactly_min_notional()
     assert p.ok is True, (
-        u"名义恰好 5.0U（等于最小下单）被拒了：%s\n"
+        u"名义 %r（等于最小下单）被拒了：%s\n"
         u"交易所在 notional >= minNotional 时是允许的，拒掉等于丢掉一笔合法订单。"
-        % (p.reason,))
+        % (p.notional, p.reason))
 
 
 def test_one_step_below_min_notional_is_rejected():
@@ -110,12 +113,17 @@ def test_one_step_below_min_notional_is_rejected():
 
     没有这条，上面那条可能因为「永远 ok」而永远绿。
     """
+    p_at_min = _plan_at_exactly_min_notional()
     e = _eng(5000.0)
-    # qty=0.00099 -> notional = 4.95 < 5.0
-    p = e._trend_plan(5000.0, 5.02 * 0.99, {"ok": True, "name": "trend_up"})
-    if p.qty * 5000.0 >= 5.0:
-        pytest.skip("构造没落在最小下单下方，跳过（qty=%r）" % (p.qty,))
-    assert p.ok is False, u"名义 %r 低于最小下单却 ok" % (p.qty * 5000.0,)
+    # 同一个构造，但把权益砍到只够少一手
+    lots = int(round(p_at_min.qty / e._qty_step()))
+    assert lots >= 2, "最小名义连两手都不到，无法构造“少一手”的对照"
+    px = 5000.0
+    equity = (lots - 1) * e._qty_step() * px * (1.0 + e._fee_buffer()) * 1.0002
+    p = e._trend_plan(px, equity, {"ok": True, "name": "trend_up"})
+    assert p.qty * px < e._min_notional(), (
+        "构造没落在最小下单下方（qty=%r）" % (p.qty,))
+    assert p.ok is False, u"名义 %r 低于最小下单却 ok" % (p.qty * px,)
     assert "最小下单" in p.reason, u"拒绝原因没说是最小下单：%r" % (p.reason,)
 
 
@@ -126,18 +134,27 @@ def test_leverage_exactly_at_the_cap_is_allowed():
     现实中因为要先除以 (1+手续费缓冲)，这个等号很难自然出现——
     所以这条测的是【契约】，不是常见路径。
     """
-    e = _eng(5000.0)
+    at_min = _plan_at_exactly_min_notional()
+    e, px, equity = _eng(5000.0), 5000.0, None
     cap = float(e.tcfg.max_leverage)
-    # 直接构造：equity 让 real_notional/equity 恰好等于 cap
-    # real_notional = qty*price，找一个让比值为 cap 的 equity 不现实（有取整）。
-    # 所以退一步：验证「用 cap 算出来的 notional/equity 一定 <= cap 且能下单」。
-    p = e._trend_plan(5000.0, 5.02, {"ok": True, "name": "trend_up"})
+    # ★ 构造必须用「真的开得出来」的计划（最小名义那一组）。
+    #   以前用 equity=5.02 是现货口径；合约下它连一手都不到，
+    #   p.leverage 会是 0.0，于是“把上限设成 0” —— 测的就不是边界了。
+    # ★ 权益要拉开余量。用“刚好最小名义”那一组去测杠杆上限
+    #   是错的：把上限降到 0.9988 会让取整少一手，于是拒单原因变成
+    #   “最小名义不够”—— 那就测不到杠杆门槛了。放大 10 倍后，
+    #   取整波动只占一个零头，拒单只能来自杠杆本身。
+    lots = int(round(at_min.qty / e._qty_step()))
+    equity = 10.0 * lots * e._qty_step() * px * (1.0 + e._fee_buffer()) * 1.0002
+    p = e._trend_plan(px, equity, {"ok": True, "name": "trend_up"})
+    assert p.ok, "构造失败：%s" % p.reason
+    assert p.leverage > 0.0, "构造失败：杠杆为 0，没有仓位"
     assert p.leverage <= cap + 1e-9, (
         u"杠杆 %r 超过了上限 %r" % (p.leverage, cap))
     # 关键：不能因为「杠杆刚好顶到上限」就拒单
     e2 = _eng(5000.0)
     e2.tcfg.max_leverage = p.leverage       # 把上限设成刚好等于算出来的杠杆
-    p2 = e2._trend_plan(5000.0, 5.02, {"ok": True, "name": "trend_up"})
+    p2 = e2._trend_plan(px, equity, {"ok": True, "name": "trend_up"})
     assert p2.ok is True, (
         u"杠杆恰好等于上限 %r 时被拒了：%s\n"
         u"上限的语义是「不超过」，等于上限应当放行。" % (p.leverage, p2.reason))

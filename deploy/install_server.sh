@@ -20,6 +20,8 @@ AI_WEB_PASS=
 AI_SECRET_KEY=
 AI_DB_PATH=/home/cryptobot/ai-trader/data/market.db
 AI_HTTP_PROXY=
+# K 线演化增量编排时记进 kbar_meta，用于复现来源。留空只少 command 一项。
+AI_KBAR_BUILD_CMD=
 AI_SYMBOL=BTCUSDT
 AI_TRADE_MODE=paper
 AI_PAPER_BALANCE=100
@@ -27,8 +29,13 @@ AI_PAPER_BALANCE=100
 # 默认值现在都取"被采纳的那一侧"，但显式写出来的好处是
 # 一眼能看出这台机器跑的是什么配置。
 AI_STRATEGY=trend
-AI_EXEC_MARKET=spot
+# ★ 只做合约（2026-11-17 用户裁决）。spot 会被拒绝启动。
+AI_EXEC_MARKET=perp
 AI_TREND_HYST=0.2
+# 惊喜K线阈值（点，单根 5m 顺向幅度）。Web 配置可改。
+AI_SURPRISE_PTS=500
+# 挂单策略：1 = 只出计划不挂单。0 = 真单。先跑 1。
+AI_PENDING_DRY_RUN=1
 # 唐奇安通道参数（AI_STRATEGY=donchian 时生效）。
 # 150/75 是 7.15 年 1h 数据上唯一通过全部五道关的那一组，
 # 换成邻居参数会掉一档（100/50：每笔 +0.87%，滚动正窗只有 5/7）。
@@ -48,12 +55,21 @@ chmod 600 /etc/ai-trader/env
 cp "$DEST/deploy/ai-trader.service" /etc/systemd/system/
 cp "$DEST/deploy/ai-trader-snapshot.service" /etc/systemd/system/
 cp "$DEST/deploy/ai-trader-snapshot.timer" /etc/systemd/system/
+# ★ K 线演化管道。不装它的后果不是报错，而是：
+#   kbar.db 从不增长 → S5 三道出场闸永不触发，
+#   计划源也构不出开仓窗口（窗口依赖区间 tag）。
+#   看板上只会显示“策略没信号”，和真没信号一模一样。
+cp "$DEST/deploy/ai-trader-kbar.service" /etc/systemd/system/
+cp "$DEST/deploy/ai-trader-kbar.timer" /etc/systemd/system/
 chmod +x "$DEST/deploy/healthcheck.sh"
 chown -R cryptobot:cryptobot "$DEST"
 
 systemctl daemon-reload
 systemctl enable --now ai-trader >/dev/null
 systemctl enable --now ai-trader-snapshot.timer >/dev/null
+# K 线管道每 5 分钟一次（用户口径：出场全看 5m）。
+chmod +x "$DEST/tools/kbar_tick.sh"
+systemctl enable --now ai-trader-kbar.timer >/dev/null
 systemctl restart ai-trader
 
 # cron：每 10 分钟健康自检

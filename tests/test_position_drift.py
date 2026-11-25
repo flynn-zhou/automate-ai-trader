@@ -144,12 +144,16 @@ async def test_drift_is_not_detected_without_periodic_reconcile(env):
     # 引擎现在的持仓是怎么来的？两种可能：
     #   a) 对账发现漂移，接管了那 0.002 BTC   -> 正确
     #   b) 它以为空仓，于是【又买了一次】      -> 就是我们要防的事故
-    assert eng.pos is not None, "引擎完全没有察觉交易所已有持仓"
-    assert eng.pos["qty"] == pytest.approx(ex.real_qty, rel=1e-6), (
+    # ★ 2026-11-24 拆仓后：这份漂移来源不明（不是我们下的单），
+    #   接管进 `adopted_pos`（人工仓槽），`self.pos` 保持空 ——
+    #   这正是不许它被当成"我们自己的仓"的结构性保证。
+    assert eng.adopted_pos is not None, "引擎完全没有察觉交易所已有持仓"
+    assert eng.pos is None, "来源不明的仓不许进系统仓槽（会被当成策略仓管理）"
+    assert eng.adopted_pos["qty"] == pytest.approx(ex.real_qty, rel=1e-6), (
         "引擎记录 %.6f BTC，交易所实际 %.6f BTC。"
         "它没有对账，而是按「空仓」又开了一次仓——"
         "实盘里这意味着仓位翻倍而止损只保护一半。已下过的单：%r"
-        % (eng.pos["qty"], ex.real_qty, ex.orders))
+        % (eng.adopted_pos["qty"], ex.real_qty, ex.orders))
     assert not ex.orders, (
         "引擎在交易所已有 %.6f BTC 的情况下又下了单：%r"
         % (ex.real_qty, ex.orders))
@@ -176,7 +180,8 @@ async def test_confirm_periodic_reconcile_actually_runs(env):
 
     await eng._step(snap)
     assert calls["n"] == 1, "首次 _step 就应该对账一次"
-    assert eng.pos is not None and eng.pos["qty"] == pytest.approx(0.002, rel=1e-6)
+    assert (eng.adopted_pos is not None
+            and eng.adopted_pos["qty"] == pytest.approx(0.002, rel=1e-6))
     assert not ex.orders, "接管后不应该再下单"
 
     # 5 分钟内不会再对账（避免每根 K 线都打一次交易所）

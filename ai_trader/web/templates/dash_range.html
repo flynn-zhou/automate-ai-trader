@@ -46,6 +46,9 @@ window.onerror = function(msg, src, line, col, err){
   "use strict";
   var TOKEN = {{ token|tojson }};
   var chart = echarts.init(document.getElementById("chart"), null, {renderer:"canvas"});
+  // 上一次渲染的数据签名。一样就跳过 setOption —— 否则每 3 秒重建一次
+  // option，tooltip 跟着被销毁（"悬停信息活 3 秒"就是这么来的）。
+  var lastSig = null;
   function $(id){ return document.getElementById(id); }
   function fmt(v,d){ return (v==null||isNaN(v)) ? "--" : Number(v).toFixed(d==null?1:d); }
   function q(u){ return u + (u.indexOf("?")>=0?"&":"?") + "token=" + encodeURIComponent(TOKEN); }
@@ -74,6 +77,18 @@ window.onerror = function(msg, src, line, col, err){
       .then(function(d){
         if (!d.ok){ $("msg").textContent = d.error || "读取失败"; return; }
         if (d.empty){ $("msg").textContent = d.hint || "该品种暂无区间数据"; chart.clear(); return; }
+
+        // ⚠ 数据没变就**不要重建图表**。
+        // 原来每 3 秒（setInterval 见文件末尾）无条件 setOption(..., true)，
+        // tooltip 会被一起销毁 —— 观感就是"悬停信息活 3 秒"。
+        // 签名取「根数 + 最后一根 ts + 未完成那根的 ts」，任一变化才重绘。
+        var sigNow = d.bars.length + "|" + (d.bars.length ? d.bars[d.bars.length-1][0] : 0) +
+                     "|" + (d.tail ? d.tail.ts : 0) + "|" + $("days").value;
+        if (sigNow === lastSig){
+          $("msg").textContent = "已是最新 · " + new Date().toLocaleTimeString("zh-CN");
+          return;
+        }
+        lastSig = sigNow;
 
         // bars_1h 行 = (ts, ts8, o, h, l, c, v)
         //   => b[0]=ts  b[1]=ts8字符串  b[2]=open  b[3]=high  b[4]=low  b[5]=close
@@ -152,7 +167,9 @@ window.onerror = function(msg, src, line, col, err){
           backgroundColor:"transparent", animation:false,
           tooltip:{trigger:"axis", axisPointer:{type:"cross"},
                    backgroundColor:"rgba(23,26,33,.95)", borderColor:"#2a2e37",
-                   textStyle:{color:"#e6e8eb", fontSize:12}},
+                   textStyle:{color:"#e6e8eb", fontSize:12},
+                   // 鼠标移开后多留一会儿（默认只有 100ms，手一抖就没了）
+                   hideDelay:300},
           legend:{data:["K线","EMA20","软上沿S↑","软下沿S↓","反向边界R↑","反向边界R↓","关键价K"],
                   textStyle:{color:"#9aa1ac"}, top:6, itemWidth:14, itemHeight:8},
           // right 必须留 72：yAxis 在右侧，标 "80232.7" 约需 55px，
@@ -207,7 +224,12 @@ window.onerror = function(msg, src, line, col, err){
       .catch(function(e){ $("msg").textContent = "请求失败: "+e; });
   }
 
-  $("go").onclick = load;
+  // 换品种 / 换天数必须强制重绘：签名里已经带了 days，但品种不在里面，
+  // 同一个天数下换品种若不重绘，屏幕上会停着上一个品种的线。
+  function forceLoad(){ lastSig = null; load(); }
+  $("go").onclick = forceLoad;
+  $("symbol").onchange = forceLoad;
+  $("days").onchange = forceLoad;
   window.addEventListener("resize", function(){ chart.resize(); });
   load();
   // 每 3 秒重取：未收盘那根 1h 的 close 就是现价，不轮询它永远不动。

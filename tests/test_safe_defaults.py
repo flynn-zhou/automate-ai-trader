@@ -25,10 +25,14 @@ def test_default_strategy_is_trend_not_scalp():
         "默认值一旦指向它，任何漏配环境都会静默亏钱。")
 
 
-def test_default_exec_market_is_spot_for_long_only():
-    """只做多策略默认走现货：永续的资金费是长期纯损耗。"""
+def test_default_exec_market_is_perp():
+    """★ 只做合约。以前这里默认现货，理由是「只做多 + 资金费纯损耗」。
+
+    那个理由的前提（只做多）已经不成立：pending 策略多空都做，
+    而现货根本不能做空（11 条真实计划里约一半是 DOWN）。
+    """
     c = AppCfg()
-    assert c.trading.exec_market == "spot"
+    assert c.trading.exec_market == "perp"
 
 
 def test_default_mode_is_not_live():

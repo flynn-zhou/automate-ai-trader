@@ -58,8 +58,13 @@ def _engine(equity, market="spot", mode="paper"):
     return DecisionEngine(cfg, feed, ex, tdb, guard=None), tdb
 
 
-def test_100_usdt_is_enough_to_open_on_spot():
-    """核心断言：100U 现货必须开得出仓。"""
+def test_100_usdt_is_enough_to_open_on_the_contract_account():
+    """核心断言：100U 在合约口径下必须开得出仓。
+
+    ★ 2026-11-17 只做合约：以前这条叫 `..._on_spot`，靠的是现货 0.00001 步长。
+      现在只有一套规格，所以这条测试验的就是℈它会不会
+      因为 55U 最小名义而把账户判成“买不起”。
+    """
     eng, tdb = _engine(100.0)
     try:
         note = eng._affordability_note(PX, 100.0)
@@ -68,55 +73,61 @@ def test_100_usdt_is_enough_to_open_on_spot():
         tdb.stop()
 
 
-def test_legacy_bug_71_usdt_spot_is_affordable_too():
-    """当初踩坑的那个数字：71.77U 在现货规格下其实完全买得起。"""
+def test_legacy_bug_71_usdt_is_now_structurally_unaffordable():
+    """★ 反转了：当年那个 71.77U 在合约口径下确实开不出仓。
+
+    现货时代它买得起（一手 0.78U），所以当时反驳了“它买不起”这个猜测。
+    现在一手是 0.001 BTC（约 77.75U），71.77U 连一手都不到 —— 这是**结构事实**，
+    不是“更贵”。把它钉住是为了防止有人把它当成“小 bug”去“修”。
+    """
     eng, tdb = _engine(71.77)
     try:
-        assert eng._affordability_note(PX, 71.77) == ""
+        note = eng._affordability_note(PX, 71.77)
+        assert note, "71.77U 居然被判为能开仓 —— 一手 0.001 BTC 就要 77.75U"
+        assert "资金不足" in note, note
+        assert "合约钱包" in note, note
     finally:
         tdb.stop()
 
 
-def test_perp_spec_would_have_blocked_it():
-    """反证：同样的钱用永续规格就会被判买不起。
+def test_there_is_only_one_spec_now():
+    """★ 只剩一套规格：步长 0.001、最小名义 55U。
 
-    这条测试的意义是防止有人"顺手"把 _is_spot() 改回去——
-    那样 100U 账户在现货下会因为 0.001 步长 + 55U 最小名义而空转。
+    以前这个文件用一对相反的用例钉住“两套规格”（现货 vs 永续）。
+    现在第二套被删了，所以要钉的反而是“**不存在第二套**”。
     """
     eng, tdb = _engine(100.0, market="perp")
     try:
-        eng.ex.name = "live"          # 强制走永续口径
+        assert eng._qty_step() == 0.001
+        assert eng._min_notional() == 55.0
+        # 反向锁：强行把配置改成 spot 也不能变回去
+        eng.tcfg.exec_market = "spot"
+        eng.ex.name = "spot"
         assert eng._qty_step() == 0.001
         assert eng._min_notional() == 55.0
     finally:
         tdb.stop()
 
 
-def test_spot_plan_qty_is_on_grid_and_within_balance():
-    """仓位必须落在现货步长网格上，且不超过 100U 余额（含手续费缓冲）。"""
+def test_plan_qty_is_on_grid_and_within_balance():
+    """仓位必须落在步长网格上，且不超过余额（含手续费缓冲）。"""
     eng, tdb = _engine(100.0)
     try:
-        from ai_trader.trading.risk import Plan
         plan = eng._trend_plan(PX, 100.0, {"ok": True, "name": "trend_up"})
         assert plan is not None, "100U 算不出计划仓位"
         qty = plan.qty
         assert qty > 0, "仓位为 0，等于不交易"
-        # 步长网格
         n = qty / STEP
-        assert abs(n - round(n)) < 1e-6, "数量不在现货步长网格上：%r" % qty
-        # 名义必须够最小名义
+        assert abs(n - round(n)) < 1e-6, "数量不在步长网格上：%r" % qty
         notional = qty * PX
-        assert notional >= 5.0, "名义 %.2fU 低于现货最小名义 5U，会被拒单" % notional
-        # 不能超过可用余额（否则首单就报余额不足）
+        assert notional >= 55.0, "名义 %.2fU 低于合约最小名义 55U，会被拒单" % notional
         assert notional <= 100.0, "名义 %.2fU 超过 100U 余额" % notional
-        # 也不该浪费：至少用掉八成
-        assert notional >= 80.0, "只用了 %.1fU，仓位过小" % notional
     finally:
         tdb.stop()
 
 
-def test_spot_plan_never_exceeds_balance_due_to_rounding():
-    """取整必须向下。四舍五入会向上超配，现货会被截断导致记账与实际不符。"""
+def test_plan_never_exceeds_balance_due_to_rounding():
+    """取整必须向下。四舍五入会向上超配，高杠杆下会被截断导致记账与实际不符。"""
     eng, tdb = _engine(100.0)
     try:
         for px in (77815.0, 33333.0, 123456.0, 512.0):
@@ -133,6 +144,7 @@ def test_zero_equity_says_wallet_hint():
     eng, tdb = _engine(0.0)
     try:
         note = eng._affordability_note(PX, 0.0)
-        assert "现货钱包" in note, "没说清钱该放哪个钱包：" + note
+        assert "合约钱包" in note, "没说清钱该放哪个钱包：" + note
+        assert "现货钱包" not in note, "仍在提示现货钱包：" + note
     finally:
         tdb.stop()

@@ -1,0 +1,306 @@
+{% extends "dash_base.html" %}
+{% block title %}决策流{% endblock %}
+{% block head %}
+<style>
+  /* 动作小标签：颜色只表达"系统做了什么"这一件事，
+     所以配色固定、不随数值变化（数值变化看权益/价格列）。 */
+  .tag{display:inline-block;padding:0 7px;border:1px solid;border-radius:999px;
+       font-size:12px;line-height:19px;white-space:nowrap}
+  .a-pend{color:#6ba3f0;border-color:#3d6599;background:rgba(107,163,240,.10)}
+  .a-open{color:#3aa675;border-color:#2f7355;background:rgba(58,166,117,.10)}
+  .a-close{color:#e05c6a;border-color:#8c3d46;background:rgba(224,92,106,.10)}
+  .a-idle{color:#8b95a7;border-color:#2a2f3d;background:rgba(139,149,167,.08)}
+  .a-other{color:#d8dee9;border-color:#3a4250}
+  /* 原因可能很长（一屏三行的都不少见），允许换行，同时用 title 悬停给全文。
+     max-width 是必须的：不压住的话长原因会把价格/权益列挤到屏幕外。 */
+  td.reason{white-space:pre-wrap;word-break:break-word;min-width:240px;
+            max-width:560px;color:#c3cad6}
+  .tbl-wrap{max-height:68vh;overflow:auto;border:1px solid var(--line);border-radius:6px}
+  .tbl-wrap thead th{position:sticky;top:0;background:var(--panel);z-index:1;
+                     border-bottom:1px solid var(--line)}
+  td.dim,.dim{color:var(--dim)}
+  .empty{padding:26px 12px;text-align:center;color:var(--dim);line-height:1.9}
+  #err{display:none;border-color:#e05c6a;color:#e05c6a;white-space:pre-wrap}
+  .f-in{width:100%;font-size:13px;font-weight:400}
+  select{background:#0f1117;color:var(--txt);border:1px solid var(--line);
+         border-radius:6px;padding:8px 10px;font-size:13px}
+</style>
+{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="row" style="gap:26px">
+    <div>
+      <div class="k">决策条数</div>
+      <div class="v" id="n-rows">--</div>
+    </div>
+    <div>
+      <div class="k">最新一条</div>
+      <div class="v" id="last-ts" style="font-size:15px">--</div>
+    </div>
+    <div>
+      <div class="k">最近一次读取</div>
+      <div id="poll" class="dim">读取中…</div>
+    </div>
+    <div style="margin-left:auto;text-align:right">
+      <div class="k">自动刷新</div>
+      <div class="dim">每 5 秒</div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="align-items:flex-end">
+    <div style="flex:1;min-width:220px">
+      <label class="k" for="kw">按原因 / 信号过滤（子串，纯前端）</label>
+      <input id="kw" class="f-in" type="text" placeholder="例如：风控拦截 / trend_entry" autocomplete="off">
+    </div>
+    <div style="min-width:180px">
+      <label class="k" for="act">动作</label>
+      <select id="act"></select>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="padding:0">
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:120px">时间</th>
+          <th style="width:96px">品种</th>
+          <th style="width:100px">价格</th>
+          <th style="width:110px">信号</th>
+          <th style="width:104px">动作</th>
+          <th>原因</th>
+          <th style="width:92px">权益</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="7" class="empty">读取中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div id="err" class="card"></div>
+
+<script>
+// 前端异常不能静默白屏：顶到页面上（同 dash_range.html 的做法）。
+window.onerror = function (msg, src, line) {
+  var d = document.getElementById("err");
+  if (!d) return;
+  d.style.display = "block";
+  d.textContent = "前端异常：" + msg + "  @" + String(src).split("/").pop() + ":" + line;
+};
+</script>
+
+<script>
+(function () {
+  "use strict";
+
+  // 令牌只为页面自己的轮询用：/api/* 在设了 AI_WEB_TOKEN 后一律要令牌
+  // （见 app.py 的 before_request）。本页与 /admin/* 一样需要登录，
+  // 因此把令牌交给页面不构成"公开页面泄漏令牌"。
+  var TOKEN = {{ token|tojson }};
+  var LIMIT = 200;
+  var POLL_MS = 5000;
+
+  var all = [];        // 最近一次成功取到的原始行（一份数据两个用途：渲染 + 生成动作下拉）
+  var busy = false;    // 上一轮还没回来就不再发：慢网络下会越堆越多
+  var lastErr = "";
+  var okCount = 0;
+
+  function $(id) { return document.getElementById(id); }
+
+  function q(u) {
+    if (!TOKEN) return u;
+    return u + (u.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+  }
+
+  // 原因/信号是库里的自由文本，直接拼进 innerHTML 会把页面结构打断，
+  // 也可能把一条文本变成可执行标记 —— 一律转义后再拼。
+  function esc(v) {
+    return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function pad2(n) { return n < 10 ? "0" + n : "" + n; }
+
+  // decisions.ts 存的是毫秒。写成带秒的本地时间，因为决策是"每根 K 线一条"，
+  // 只到分钟时同一分钟内的几条会看起来完全一样、没法回溯先后。
+  function fmtTs(ms) {
+    var v = Number(ms);
+    if (!v || isNaN(v)) return "—";
+    // 万一是秒级时间戳：1e11 毫秒是 1973 年，正常数据都远大于它。
+    if (v < 1e11) v = v * 1000;
+    var d = new Date(v);
+    if (isNaN(d.getTime())) return "—";
+    return pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+           pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+
+  function fmtPrice(v) {
+    var n = Number(v);
+    if (v == null || isNaN(n)) return "—";
+    // BTC 这类价格要 1 位就够，但别的品种可能很小；按量级选位数，
+    // 不写死 1 位（写死会把 0.00003 显示成 0.0）。
+    if (Math.abs(n) >= 100) return n.toFixed(1);
+    if (Math.abs(n) >= 1) return n.toFixed(3);
+    return n.toFixed(6);
+  }
+
+  function fmtEquity(v) {
+    var n = Number(v);
+    if (v == null || isNaN(n)) return "—";
+    return n.toFixed(2);
+  }
+
+  // 动作着色：pending* 蓝 / open* 绿 / close* 红 / skip|hold|watch 灰。
+  // pending 先判，因为 "pending_close" 同时满足前两条 —— 顺序换一下，
+  // 一条待成交的平仓会显示成红色"已平"，读起来正好相反。
+  function tone(a) {
+    var s = String(a == null ? "" : a).toLowerCase();
+    if (s.indexOf("pending") === 0) return "a-pend";
+    if (s.indexOf("open") === 0) return "a-open";
+    if (s.indexOf("close") === 0) return "a-close";
+    if (s === "skip" || s === "hold" || s === "watch") return "a-idle";
+    return "a-other";   // 未知动作不假装认识，用中性色
+  }
+
+  function err(msg) {
+    lastErr = msg || "";
+    var d = $("err");
+    if (!msg) { d.style.display = "none"; d.textContent = ""; return; }
+    d.style.display = "block";
+    d.textContent = "读取决策流失败：" + msg + "（表格保留上一次成功的数据）";
+  }
+
+  // 动作下拉的选项从已加载数据里去重生成，所以新动作出现时不必改页面。
+  function fillActions() {
+    var seen = {}, list = [];
+    all.forEach(function (r) {
+      var a = r.action == null ? "" : String(r.action);
+      if (!a || seen[a]) return;
+      seen[a] = 1;
+      list.push(a);
+    });
+    list.sort();
+
+    var sel = $("act");
+    var cur = sel.value;
+    var html = '<option value="">全部动作</option>';
+    list.forEach(function (a) {
+      html += '<option value="' + esc(a) + '">' + esc(a) + "</option>";
+    });
+    // 选项没变就不重建：每 5 秒重建一次会把用户正在展开的下拉关掉。
+    if (sel.getAttribute("data-sig") === html) return;
+    sel.innerHTML = html;
+    sel.setAttribute("data-sig", html);
+    // 选中的动作若已不在数据里（滚动窗口淘汰了），退回"全部动作"，
+    // 否则 page 会显示 0 条而原因是个看不见的旧过滤值。
+    sel.value = list.indexOf(cur) >= 0 ? cur : "";
+  }
+
+  function render() {
+    var kw = ($("kw").value || "").replace(/^\s+|\s+$/g, "").toLowerCase();
+    var act = $("act").value;
+
+    var shown = all.filter(function (r) {
+      if (act && String(r.action == null ? "" : r.action) !== act) return false;
+      if (!kw) return true;
+      var reason = String(r.reason == null ? "" : r.reason).toLowerCase();
+      var signal = String(r.signal == null ? "" : r.signal).toLowerCase();
+      return reason.indexOf(kw) >= 0 || signal.indexOf(kw) >= 0;
+    });
+
+    $("n-rows").textContent = (shown.length === all.length)
+      ? String(all.length)
+      : shown.length + " / " + all.length;
+    $("last-ts").textContent = all.length ? fmtTs(all[0].ts) : "—";
+
+    var tb = $("rows");
+    if (!all.length) {
+      tb.innerHTML = '<tr><td colspan="7" class="empty">' +
+        "暂无决策（可能策略还没运行到下一根 K 线）</td></tr>";
+      return;
+    }
+    if (!shown.length) {
+      tb.innerHTML = '<tr><td colspan="7" class="empty">' +
+        "没有符合过滤条件的决策（共 " + all.length + " 条）</td></tr>";
+      return;
+    }
+
+    var buf = [], i, r, sig;
+    for (i = 0; i < shown.length; i++) {
+      r = shown[i];
+      sig = (r.signal == null || r.signal === "")
+        ? '<span class="dim">—</span>'
+        : '<span class="dim">' + esc(r.signal) + "</span>";
+      buf.push(
+        "<tr>" +
+        '<td class="num dim">' + esc(fmtTs(r.ts)) + "</td>" +
+        "<td>" + esc(r.symbol || "—") + "</td>" +
+        '<td class="num">' + esc(fmtPrice(r.price)) + "</td>" +
+        "<td>" + sig + "</td>" +
+        '<td><span class="tag ' + tone(r.action) + '">' +
+          esc(r.action == null || r.action === "" ? "—" : r.action) + "</span></td>" +
+        '<td class="reason" title="' + esc(r.reason || "") + '">' +
+          esc(r.reason == null || r.reason === "" ? "—" : r.reason) + "</td>" +
+        '<td class="num">' + esc(fmtEquity(r.equity)) + "</td>" +
+        "</tr>");
+    }
+    tb.innerHTML = buf.join("");
+  }
+
+  function load() {
+    if (busy) return;          // 慢网络下不叠请求
+    busy = true;
+    var url = q("/api/trade/decisions?limit=" + LIMIT + "&_t=" + Date.now());
+
+    fetch(url, { credentials: "same-origin", cache: "no-store" })
+      .then(function (res) {
+        // 401/404 都不是"网络坏了"，要给出能动手的说法，不能只说失败。
+        if (!res.ok) {
+          if (res.status === 401) {
+            throw new Error("未授权（缺少访问令牌，请从后台导航进入，或在地址后加 ?token=…）");
+          }
+          if (res.status === 404) {
+            throw new Error("交易库未就绪（引擎可能还没启动）");
+          }
+          throw new Error("接口返回 HTTP " + res.status);
+        }
+        return res.json();
+      })
+      .then(function (d) {
+        if (!d || !d.decisions) {
+          throw new Error((d && d.error) ? String(d.error) : "返回结构异常（没有 decisions 字段）");
+        }
+        all = d.decisions.slice().sort(function (x, y) {
+          // 按时间倒序（需求口径），不依赖接口的排序：
+          // 接口按 id 倒序，补写过历史行时 id 顺序和时间顺序会不一致。
+          return (Number(y.ts) || 0) - (Number(x.ts) || 0);
+        });
+        fillActions();
+        render();
+        err("");
+        okCount++;
+        $("poll").textContent = "已是最新 · " + fmtTs(Date.now()) + " · 第 " + okCount + " 次";
+      })
+      .catch(function (e) {
+        // 失败只出错误行，表格和数字保持不动 —— 白屏比报错更难查。
+        err((e && e.message) ? e.message : String(e));
+        $("poll").textContent = "读取失败 · " + fmtTs(Date.now());
+      })
+      .then(function () { busy = false; });
+  }
+
+  // 过滤纯前端：输入只重排已有数据，不再请求后端。
+  $("kw").addEventListener("input", render);
+  $("act").addEventListener("change", render);
+
+  load();
+  setInterval(load, POLL_MS);
+})();
+</script>
+{% endblock %}

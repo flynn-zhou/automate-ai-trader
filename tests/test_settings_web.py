@@ -16,14 +16,25 @@ import pytest
 
 
 # ------------------------------------------------------------------ settings
-def test_defaults_are_100_5_22(tmp_path):
+def test_defaults_match_the_trading_cfg(tmp_path):
+    """库空时的回落值必须等于 `TradingCfg` 的默认值。
+
+    ★ 2026-11-17：本金从 100U 改为 **50U**（用户裁决）。这里曾经硬写 100.0，
+      而 `config.paper_balance` 已经是 50.0 —— 两个来源。后果是“页面显示 50U、
+      库空时按 100U 算仓位”，而且不会报错。
+
+    所以这条测试不再钉“100/5/22”这三个数，它钉的是**两个来源不分叉**。
+    """
+    from ai_trader.config import AppCfg
     from ai_trader.settings import SettingsStore, K_CAPITAL, K_RISK, K_LEVERAGE
 
+    live = AppCfg().trading
     with SettingsStore(str(tmp_path / "s.db")) as st:
         s = st.sizing()
-    assert s[K_CAPITAL] == 100.0
-    assert s[K_RISK] == 5.0
-    assert s[K_LEVERAGE] == 22.0
+    assert s[K_CAPITAL] == live.paper_balance == 50.0, (
+        "库空回落与 TradingCfg 不一致：%r vs %r" % (s[K_CAPITAL], live.paper_balance))
+    assert s[K_RISK] == live.risk_pct
+    assert s[K_LEVERAGE] == live.max_leverage
 
 
 def test_first_run_seeds_from_env_not_hardcoded_defaults(tmp_path):

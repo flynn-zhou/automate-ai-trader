@@ -1,0 +1,671 @@
+{# K 线演化 · 回看视图（读 data/kbar.db，只读）
+   为什么是"回看"而不是"实时"：
+     kbar.db 是离线历史层（5m 到 2026-11-01、15m 到 2026-11-08），
+     而总览的实时图走币安 REST。两条链路不同源、时间轴也不同。
+     硬把演化叠在实时图上，会出现"标注只到某一天就断"的假故障。
+   所以这一块是独立的：不轮询、不假装实时、右上角永远显示数据截止到哪天。
+
+   ⚠ 前视红线：表 6/6b 是**看未来**的。快照面板把「当时能看到的」（then）
+     和「事后才知道的」（post）在版面上明确分开，post 打灰底加标注。
+     混在一起，这个页面就变成"偷看答案"的入口。 #}
+<div class="card" style="padding:0;overflow:hidden">
+  <div style="position:relative">
+    <div id="evo-chart" style="width:100%;height:640px"></div>
+  </div>
+</div>
+{# 结论筛选条。
+   为什么是 HTML 按钮而不是 ECharts 内置 legend：
+   内置 legend 只能切换 **series 的显隐**，而这里要的是"只留某一类结论的根
+   + 前后各 3 根上下文，其余淡化"—— 那是对每个数据点单独设透明度，
+   不是把整条 series 关掉。用 legend 做不出来，只能用 chip。 #}
+<div class="card k" id="evo-filter-bar" style="display:none">
+  <span style="color:#9aa1ac;margin-right:10px">按结论筛选</span>
+  <span id="evo-chips"></span>
+  <div id="evo-filter-hint" style="margin-top:8px;color:#8b95a7;font-size:12px"></div>
+</div>
+<div class="card k">
+  <span id="evo-status">读取中…</span>
+  <span id="evo-cutoff" style="margin-left:12px"></span>
+  {# 新鲜度：这一层停了没有。
+     2026-11-10 → 11-16 kbar.db 静默停摆 6.5 天，页面照常渲染、画的是旧数据，
+     没有任何提示 —— 沉默的失效比报错危险得多。落后者必须顶在脸上。 #}
+  <div id="evo-fresh" style="margin-top:6px;font-size:12px;color:#8b95a7"></div>
+</div>
+
+<div class="card" id="snap-box" style="display:none">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <span class="k">选中</span>
+      <b id="snap-ts" style="font-variant-numeric:tabular-nums"></b>
+      <b id="snap-label" style="font-size:17px;margin-left:10px"></b>
+      <span id="snap-states" style="margin-left:8px"></span>
+    </div>
+    <button id="snap-close" style="padding:5px 12px;font-size:12px">关闭</button>
+  </div>
+  <div id="snap-body" style="margin-top:12px"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var URLS = {
+    meta: {{ url_for('kbar.meta')|tojson }},
+    evo: {{ url_for('kbar.evo')|tojson }},
+    snap: {{ url_for('kbar.snapshot')|tojson }}
+  };
+
+  // 7 个结论词的配色。这里只是**显示**配色，不是判定口径 ——
+  // 判定口径全在 ai_trader/kbar/shape.py，本文件不许出现任何阈值。
+  var LCOLOR = {
+    "无·真空":   "#3a4250",
+    "无·贴线":   "#5b6678",
+    "插针":      "#e8b44a",
+    "插针收回":  "#22c55e",
+    "插针后稳住": "#38bdf8",
+    "针后远离":  "#a78bfa",
+    "恐慌盘":    "#ef4444"
+  };
+
+  var chart = null, state = null, curIv = "15m", showRx = true;
+  // 结论筛选：picked 是正在只看的那一类结论（null = 不筛选）。
+  // CONTEXT = 保留前后各几根上下文。为什么要上下文：
+  // 「插针」本身不是信息，插针**前后**的价格反应才是（观察线不是支撑线，
+  // 要看价格在它上面的反应）。只留插针那几根，等于把反应掐掉一半。
+  var picked = null;
+  var CONTEXT = 3;
+  var DIM = 0.09;          // 被淡化的点和块的不透明度
+  var zwin = null;          // 用户缩放窗口，切周期/刷新时保留
+  var snapTs = null;
+
+  function $(id) { return document.getElementById(id); }
+  function fmt(v, d) {
+    return (v == null || isNaN(v)) ? "--" : Number(v).toFixed(d == null ? 1 : d);
+  }
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  // ts → "MM-DD HH:MM"（本地时区）。只做显示，不参与任何判断。
+  function lab(ts) {
+    var d = new Date(ts);
+    return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+           pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+  function labFull(ts) {
+    var d = new Date(ts);
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+           + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function get(u, qs) {
+    return fetch(u + "?" + qs, { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) { return r.json(); });
+  }
+
+  function init() {
+    var el = $("evo-chart");
+    if (!el || !window.echarts) return false;
+    chart = echarts.init(el, null, { renderer: "canvas" });
+    chart.on("datazoom", function () {
+      var o = chart.getOption();
+      var dz = o && o.dataZoom && o.dataZoom[0];
+      if (dz && dz.start != null && dz.end != null) {
+        zwin = { start: dz.start, end: dz.end };
+      }
+    });
+    // 点蜡烛或点结论带都打开快照 —— 鼠标落在哪儿都能看，不用精确瞄准
+    chart.on("click", function (p) {
+      if (!state || p.dataIndex == null) return;
+      var b = state.bars[p.dataIndex];
+      if (!b) return;
+      openSnap(b[0]);
+    });
+    window.addEventListener("resize", function () { chart.resize(); });
+    return true;
+  }
+
+  /// 把「这一层落后多少」写在页面上。
+  ///
+  /// 三种状态必须能一眼分开：
+  ///   不落后   — 灰字，报每周期落后多少小时
+  ///   落后     — **红底**，明确说「图上画的是旧数据」，因为这时候所有结论都不可信
+  ///   没装闸   — 说明 kbar_health.json 不存在（timer 没跑过），这本身也是信息
+  /// 后端读不到快照时传 null，不能因此让整页挂掉。
+  function renderFresh(f) {
+    var el = $("evo-fresh");
+    if (!el) return;
+    if (!f || !f.layers) {
+      el.style.background = "";
+      el.style.color = "#8b95a7";
+      el.textContent = "新鲜度闸未就绪（缺 kbar_health.json）—— 无法判断这一层是否停摆";
+      return;
+    }
+    var parts = [], stale = false;
+    Object.keys(f.layers).forEach(function (k) {
+      var v = f.layers[k] || {};
+      if (v.stale) stale = true;
+      if (v.lag_hours === null || v.lag_hours === undefined) {
+        parts.push(k + " 没有任何数据");
+      } else {
+        parts.push(k + " 落后 " + v.lag_hours + " 小时（最新 " +
+                   (v.max_ts_human || "?") + "）");
+      }
+    });
+    if (stale) {
+      el.style.background = "rgba(224,92,106,.12)";
+      el.style.color = "#e05c6a";
+      el.style.padding = "6px 8px";
+      el.style.borderRadius = "6px";
+      el.textContent = "⚠ 这一层已停摆：" + parts.join(" · ") +
+                       " —— 图上画的是旧数据，基于它的任何结论都不要信";
+    } else {
+      el.style.background = "";
+      el.style.color = "#8b95a7";
+      el.style.padding = "0";
+      el.textContent = "该层在跑：" + parts.join(" · ");
+    }
+  }
+
+  function loadMeta() {
+    return get(URLS.meta, "interval=" + encodeURIComponent(curIv))
+      .then(function (d) {
+        // 新鲜度先画：连"空数据"的情况也要说清是没数据还是没算
+        renderFresh(d.freshness);
+        if (!d.ok) { $("evo-status").textContent = d.error || "读取失败"; return; }
+        if (d.empty) {
+          $("evo-status").textContent = d.hint || "该周期暂无数据";
+          return;
+        }
+        $("evo-cutoff").textContent =
+          "数据 " + labFull(d.first_ts) + " → " + labFull(d.last_ts) +
+          " · " + d.bars + " 根 · 维度 " + d.n_dims + " 个（判据读 " +
+          (d.judge_dims || []).length + " 个）· 口径 " + d.dims_hash;
+      });
+  }
+
+  function load() {
+    $("evo-status").textContent = "读取中…";
+    return get(URLS.evo, "interval=" + encodeURIComponent(curIv) +
+                        "&limit=1200&with_reactions=" + (showRx ? 1 : 0))
+      .then(function (d) {
+        if (!d.ok) { $("evo-status").textContent = d.error || "读取失败"; return; }
+        if (d.empty) {
+          $("evo-status").textContent = d.hint || "该周期暂无数据";
+          if (chart) chart.clear();
+          return;
+        }
+        state = d;
+        render(d);
+      })
+      .catch(function (e) { $("evo-status").textContent = "请求失败: " + e; });
+  }
+
+  /// 算出「哪些下标该亮」的掩码。**纯函数**，不碰 DOM、不看全局。
+  ///
+  /// 抽出来是为了可测：结论筛选是这张图的核心用法（看价格在观察线上的反应
+  /// 得能跳着看所有插针），但它的正确性没法靠"页面能加载"证明。
+  /// 用 DOM 模拟去点 chip 又要伪造 innerHTML 解析 —— 那是在测替身，不是测逻辑。
+  /// 所以把算法单独暴露成 `window.EvoPane._focusMask`，让 Node 直接喂数组。
+  ///
+  /// 语义：picked 为空 → 全亮（返回 null）。
+  ///       否则只有「picked 那些根」以及它们**前后各 ctx 根**是亮的。
+  /// 为什么要上下文：插针本身不是信息，插针前后的价格反应才是。
+  /// 只留插针那几根，等于把要看的东西掐掉一半。
+  function focusMask(labels, pickedLabel, ctx) {
+    if (!pickedLabel || !labels || !labels.length) return null;
+    var n = labels.length;
+    var on = new Array(n);
+    var z;
+    for (z = 0; z < n; z++) on[z] = false;
+    var hit = false;
+    for (var j = 0; j < n; j++) {
+      if (labels[j] !== pickedLabel) continue;
+      hit = true;
+      var lo = Math.max(0, j - ctx);
+      var hi = Math.min(n - 1, j + ctx);
+      for (var k = lo; k <= hi; k++) on[k] = true;
+    }
+    // 这个词在这个周期里一根都没有 → 当作没筛，不是"全暗"。
+    // 全暗会让用户以为图坏了（而且换周期后很容易撞上这种情况）。
+    return hit ? on : null;
+  }
+
+  /// 画结论筛选条。
+  ///
+  /// 为什么不用 ECharts 内置 legend：legend 只能整条 series 显隐，
+  /// 而这里要的是"逐个数据点设透明度"（只留选中类 + 前后各 CONTEXT 根）。
+  /// 用 chip 是为了能表达"保留上下文"这个语义。
+  ///
+  /// 为什么 chip 上带计数：7 个结论词的样本量差得很远
+  /// （15m 里「无·贴线」6,768 根、「恐慌盘」437 根）。
+  /// 不写数字，用户点进去看到零星几根，会以为是筛选坏了。
+  function renderChips(seen, count, focus) {
+    var bar = $("evo-filter-bar"), box = $("evo-chips"), hint = $("evo-filter-hint");
+    if (!bar || !box) return;
+    var keys = Object.keys(LCOLOR).filter(function (k) { return seen[k]; });
+    if (!keys.length) { bar.style.display = "none"; return; }
+    bar.style.display = "";
+
+    box.innerHTML = keys.map(function (k) {
+      var on = (picked === k);
+      return "<button class='evo-chip' data-l='" + esc(k) + "'" +
+        " title='只看这一类结论的根（含前后各 " + CONTEXT + " 根），再点一次取消'" +
+        " style='border:1px solid " + LCOLOR[k] + ";border-radius:11px;" +
+        "padding:2px 9px;margin-right:6px;font-size:12px;cursor:pointer;" +
+        "color:" + (on ? "#0b0e13" : LCOLOR[k]) + ";background:" +
+        (on ? LCOLOR[k] : "transparent") + "'>" +
+        esc(k) + " <span style='opacity:.62'>" + count[k] + "</span></button>";
+    }).join("");
+
+    Array.prototype.forEach.call(box.querySelectorAll(".evo-chip"), function (b) {
+      b.onclick = function () {
+        var k = b.getAttribute("data-l");
+        picked = (picked === k) ? null : k;
+        // 就地重绘，不重新请求：筛选是纯前端视图状态，
+        // 让后端为"我怎么看"再算一遍是浪费，而且会闪。
+        if (state) render(state);
+      };
+    });
+
+    if (!hint) return;
+    if (picked) {
+      var nOn = 0;
+      (focus || []).forEach(function (f) { if (f) nOn++; });
+      hint.innerHTML = "只看 <b style='color:" + (LCOLOR[picked] || "#e6e8eb") +
+        "'>" + esc(picked) + "</b>：" + count[picked] + " 根 + 前后各 " +
+        CONTEXT + " 根 = 共 " + nOn + " 根可见" +
+        " · <a href='#' id='evo-clear' style='color:#60a5fa'>取消筛选</a>";
+      var c = $("evo-clear");
+      if (c) {
+        c.onclick = function (e) {
+          e.preventDefault();
+          picked = null;
+          if (state) render(state);
+        };
+      }
+    } else {
+      hint.textContent = "点一个结论词，只看那些根（含前后各 " + CONTEXT +
+        " 根上下文）—— 观察线不是支撑线，要看价格在它上面的反应";
+    }
+  }
+
+  function render(d) {
+    var bars = d.bars;
+    var cats = bars.map(function (b) { return lab(b[0]); });
+
+    // ---------------- 结论筛选：先算出每个下标"该不该亮" ----------------
+    // 只在 render 里算，不在 render 里改 picked —— 渲染保持无副作用。
+    var seen = {}, count = {};
+    (d.label || []).forEach(function (l) {
+      if (!l) return;
+      seen[l] = 1;
+      count[l] = (count[l] || 0) + 1;
+    });
+    // 换周期后原来选的词可能不存在了，静默清掉，否则整图全暗（看着像坏了）
+    if (picked && !seen[picked]) picked = null;
+
+    var focus = focusMask(d.label, picked, CONTEXT);
+
+    // 未筛选时保持纯数组形态 —— ECharts 走快路径，且旧行为一模一样。
+    // 只有筛选时才换成 {value, itemStyle} 对象，代价只落在需要的那次渲染上。
+    var ohlc = bars.map(function (b, i) {
+      var v = [b[1], b[2], b[3], b[4]];
+      if (!focus || focus[i]) return v;
+      return { value: v, itemStyle: { opacity: DIM } };
+    });
+
+    // 结论带：每根一个色块。**只画 label（当时就能算出来的）**，
+    // 存活结局是事后信息，不许进这条带 —— 它只出现在快照面板的「事后」块。
+    var band = bars.map(function (_b, i) {
+      var l = d.label[i];
+      var st = { color: LCOLOR[l] || "#2a2e37" };
+      if (focus && !focus[i]) st.opacity = DIM;
+      return { value: 1, itemStyle: st };
+    });
+
+    // 观察线反应：价格碰到某条线的那一刻，在线价上打一个点。
+    // 颜色按「收在线哪一侧」：收回原侧=绿，被压到另一侧=红。
+    var rxByTs = {}, rxIdx = {};
+    for (var i = 0; i < bars.length; i++) rxIdx[bars[i][0]] = i;
+    (d.rx || []).forEach(function (r) {
+      var idx = rxIdx[r[0]];
+      if (idx == null) return;
+      var key = r[4] === "above" ? 1 : 0;
+      var pt = { value: [idx, r[2]], line: r[1], side: r[3], close: r[4] };
+      if (focus && !focus[idx]) pt.itemStyle = { opacity: DIM };
+      (rxByTs[key] = rxByTs[key] || []).push(pt);
+    });
+    function rxSeries(key, name, color) {
+      return {
+        name: name, type: "scatter", xAxisIndex: 0, yAxisIndex: 0,
+        symbolSize: 7, z: 8, animation: false,
+        itemStyle: { color: color, opacity: 0.85 },
+        data: rxByTs[key] || []
+      };
+    }
+
+    renderChips(seen, count, focus);
+
+    // 图例只放出现过的结论词，避免摆一排空图例
+    var legend = Object.keys(LCOLOR).filter(function (k) { return seen[k]; });
+
+    chart.setOption({
+      backgroundColor: "transparent", animation: false,
+      title: legend.length ? undefined : undefined,
+      tooltip: {
+        trigger: "axis", axisPointer: { type: "cross" },
+        backgroundColor: "rgba(23,26,33,.97)", borderColor: "#2a2e37",
+        textStyle: { color: "#e6e8eb", fontSize: 12 },
+        hideDelay: 300,
+        formatter: function (ps) {
+          if (!ps || !ps.length) return "";
+          var p = ps[0];
+          var i = p.dataIndex;
+          if (i == null || !bars[i]) return "";
+          var b = bars[i];
+          var c2 = (b[2] >= b[1]) ? "#22c55e" : "#ef4444";
+          var s = "<b>" + cats[i] + "</b><br/>" +
+                  "开 <span style='color:" + c2 + "'>" + fmt(b[1]) + "</span><br/>" +
+                  "高 <span style='color:" + c2 + "'>" + fmt(b[4]) + "</span><br/>" +
+                  "低 <span style='color:" + c2 + "'>" + fmt(b[3]) + "</span><br/>" +
+                  "收 <span style='color:" + c2 + "'>" + fmt(b[2]) + "</span>";
+          var l = d.label[i];
+          if (l) {
+            s += "<br/>结论 <b style='color:" + (LCOLOR[l] || "#e6e8eb") + "'>" +
+                 esc(l) + "</b>";
+          }
+          if (d.states[i]) s += "<br/>状态 " + esc(d.states[i]);
+          if (d.n_touch[i] != null) s += "<br/>碰到线 " + d.n_touch[i] + " 条";
+          s += "<br/><span style='color:#8b95a7'>点击看完整快照</span>";
+          return s;
+        }
+      },
+      legend: { data: legend.concat(showRx ? ["收回原侧", "被压到另一侧"] : []),
+                textStyle: { color: "#9aa1ac" }, top: 2,
+                itemWidth: 12, itemHeight: 8 },
+      axisPointer: { link: [{ xAxisIndex: "all" }] },
+      grid: [
+        { left: 18, right: 76, top: 30, height: 408 },
+        { left: 18, right: 76, top: 452, height: 26 }
+      ],
+      xAxis: [
+        { type: "category", data: cats, gridIndex: 0, boundaryGap: true,
+          axisLine: { lineStyle: { color: "#2a2e37" } },
+          axisLabel: { show: false },
+          axisTick: { show: false },
+          splitLine: { show: false },
+          axisPointer: { label: { backgroundColor: "#3b82f6" } } },
+        { type: "category", data: cats, gridIndex: 1, boundaryGap: true,
+          axisLine: { lineStyle: { color: "#2a2e37" } },
+          axisLabel: { color: "#8b95a7", fontSize: 10, interval: "auto" },
+          axisTick: { show: false },
+          splitLine: { show: false } }
+      ],
+      yAxis: [
+        { gridIndex: 0, scale: true, position: "right",
+          axisLine: { lineStyle: { color: "#2a2e37" } },
+          axisLabel: { color: "#9aa1ac", fontSize: 11, margin: 10,
+                       formatter: function (v) { return Number(v).toFixed(1); } },
+          splitLine: { lineStyle: { color: "rgba(42,46,55,.6)" } } },
+        { gridIndex: 1, min: 0, max: 1, show: false }
+      ],
+      dataZoom: [
+        { type: "inside", xAxisIndex: [0, 1],
+          start: zwin ? zwin.start : Math.max(0, 100 - 12000 / bars.length),
+          end: zwin ? zwin.end : 100 },
+        { type: "slider", xAxisIndex: [0, 1], height: 20, bottom: 12,
+          backgroundColor: "#141821", borderColor: "#2a2e37",
+          fillerColor: "rgba(59,130,246,.15)",
+          handleStyle: { color: "#3b82f6" }, textStyle: { color: "#9aa1ac" } }
+      ],
+      series: [
+        { name: "K线", type: "candlestick", xAxisIndex: 0, yAxisIndex: 0,
+          data: ohlc,
+          itemStyle: { color: "#22c55e", color0: "#ef4444",
+                       borderColor: "#22c55e", borderColor0: "#ef4444" } },
+        { name: "结论", type: "bar", xAxisIndex: 1, yAxisIndex: 1,
+          data: band, barWidth: "86%", silent: false, animation: false }
+      ].concat(showRx ? [rxSeries(1, "收回原侧", "#22c55e"),
+                         rxSeries(0, "被压到另一侧", "#ef4444")] : [])
+    }, true);
+
+    var have = 0;
+    d.label.forEach(function (l) { if (l) have++; });
+    $("evo-status").textContent =
+      d.interval + " · " + bars.length + " 根（有结论 " + have + " 根）" +
+      " · 观察线触点 " + (d.rx || []).length + " 个" +
+      " · 不轮询（回看模式）" +
+      " · " + new Date().toLocaleTimeString("zh-CN");
+  }
+
+  // ---------------------------------------------------------------- 快照
+  function openSnap(ts) {
+    snapTs = ts;
+    $("snap-box").style.display = "block";
+    $("snap-ts").textContent = labFull(ts);
+    $("snap-label").textContent = "读取中…";
+    $("snap-label").style.color = "#8b95a7";
+    $("snap-states").textContent = "";
+    $("snap-body").innerHTML = "";
+    get(URLS.snap, "interval=" + encodeURIComponent(curIv) + "&ts=" + ts)
+      .then(function (d) {
+        if (!d.ok) {
+          $("snap-label").textContent = d.error || "读取失败";
+          return;
+        }
+        renderSnap(d);
+      })
+      .catch(function (e) {
+        $("snap-label").textContent = "请求失败: " + e;
+      });
+  }
+
+  function chip(txt, color) {
+    return "<span style='display:inline-block;padding:1px 8px;margin:0 6px 4px 0;" +
+           "border:1px solid " + (color || "#2a2e37") + ";border-radius:10px;" +
+           "font-size:11px;color:" + (color || "#9aa1ac") + "'>" +
+           esc(txt) + "</span>";
+  }
+
+  function renderSnap(d) {
+    var then = d.then, post = d.post;
+    var sh = then.shape || {};
+    var label = sh.label || "（无结论）";
+    $("snap-label").textContent = label;
+    $("snap-label").style.color = LCOLOR[label] || "#e6e8eb";
+
+    var st = (sh.states || "").split(",").filter(function (x) { return x; });
+    $("snap-states").innerHTML = st.map(function (x) {
+      return chip(x, LCOLOR[x] || "#8b95a7");
+    }).join("");
+
+    var h = [];
+    var b = d.bar;
+
+    // ---------------- then：当时就能算出来的 ----------------
+    h.push("<div class='k' style='margin-bottom:6px'>当时能看到的</div>");
+    h.push("<div style='display:grid;grid-template-columns:repeat(auto-fit," +
+           "minmax(150px,1fr));gap:8px;margin-bottom:12px'>");
+    [["区间位置", b.zone], ["方向", b.direction], ["族/段", (b.fam != null ?
+        b.fam + "/" + b.seg + "（第 " + b.seg_idx + " 段）" : null)],
+     ["线数 / 碰线", (b.n_lines != null ? b.n_lines : "-") + " / " +
+        (b.n_touch != null ? b.n_touch : "-")],
+     ["量比", fmt(b.vol_rel, 2)], ["主动买", fmt(b.taker_buy_ratio, 3)],
+     ["事件", b.event], ["实体", fmt(b.body_pct, 2) + " 全幅"]]
+      .forEach(function (kv) {
+        h.push("<div><div class='k'>" + esc(kv[0]) + "</div><div>" +
+               esc(kv[1] == null ? "--" : kv[1]) + "</div></div>");
+      });
+    h.push("</div>");
+
+    // 判据那 8 个维度（星号从后端来，前端不写死）
+    var cat = d.dim_catalog || [];
+    var vals = (then.dims || {}).values || {};
+    var bks = (then.dims || {}).buckets || {};
+    var starred = cat.filter(function (c) { return c.starred; });
+    if (starred.length) {
+      h.push("<div class='k' style='margin-bottom:6px'>判据实际读的 " +
+             starred.length + " 个维度</div>");
+      h.push("<div style='margin-bottom:12px'>");
+      starred.forEach(function (c) {
+        var v = vals[c.name];
+        var bk = bks[c.name];
+        h.push(chip(c.name + " = " + (v == null ? "None" : v) +
+                    (bk ? "（" + bk + "）" : ""), "#6ba3f0"));
+      });
+      h.push("</div>");
+    }
+
+    // 其余维度：折叠起来，默认不糊一屏
+    var rest = cat.filter(function (c) { return !c.starred; });
+    if (rest.length) {
+      h.push("<details style='margin-bottom:12px'><summary class='k'" +
+             " style='cursor:pointer'>其余 " + rest.length +
+             " 个维度（描述层，判据没读）</summary><div style='margin-top:8px'>");
+      var byCat = {};
+      rest.forEach(function (c) { (byCat[c.cat] = byCat[c.cat] || []).push(c); });
+      Object.keys(byCat).forEach(function (k) {
+        h.push("<div style='margin-bottom:6px'><span class='k'>" + esc(k) +
+               "</span><br/>");
+        byCat[k].forEach(function (c) {
+          var v = vals[c.name];
+          var bk = bks[c.name];
+          h.push(chip(c.name + " = " + (v == null ? "None" : v) +
+                      (bk ? "（" + bk + "）" : "")));
+        });
+        h.push("</div>");
+      });
+      h.push("</div></details>");
+    }
+
+    // 碰到的线
+    if ((then.reactions || []).length) {
+      h.push("<div class='k' style='margin-bottom:6px'>本根碰到的观察线（" +
+             then.reactions.length + " 条）</div>");
+      h.push("<table><thead><tr><th>线</th><th>线价</th><th>距离%</th>" +
+             "<th>从哪侧来</th><th>收在哪侧</th><th>穿透%</th><th>收回%</th>" +
+             "</tr></thead><tbody>");
+      then.reactions.forEach(function (r) {
+        var okCol = r.close_side === "above" ? "#22c55e" : "#ef4444";
+        h.push("<tr><td>" + esc(r.line_key) + "</td><td class='num'>" +
+               fmt(r.line_price, 1) + "</td><td class='num'>" +
+               fmt(r.dist_pct, 3) + "</td><td>" + esc(r.side) +
+               "</td><td style='color:" + okCol + "'>" + esc(r.close_side) +
+               "</td><td class='num'>" + fmt(r.pen_depth_pct, 2) +
+               "</td><td class='num'>" + fmt(r.recover_pct, 1) + "</td></tr>");
+      });
+      h.push("</tbody></table>");
+    } else {
+      h.push("<div class='k' style='margin-bottom:12px'>本根没有碰到任何观察线</div>");
+    }
+
+    // 旁证 / 矛盾
+    var notes = (then.dims || {}).notes || [];
+    if (notes.length) {
+      h.push("<div class='k' style='margin:12px 0 6px'>旁证 / 矛盾提示（" +
+             notes.length + " 条）</div>");
+      notes.forEach(function (n) {
+        var col = n.kind === "矛盾" ? "#e05c6a" : "#e8b44a";
+        h.push("<div style='border-left:2px solid " + col + ";padding:2px 0 2px 8px;" +
+               "margin-bottom:6px;font-size:12px'>" +
+               "<b style='color:" + col + "'>" + esc(n.kind) + "</b> " +
+               esc(n.text) + "<span class='k'> · 用到 " + esc(n.dims) +
+               "</span></div>");
+      });
+    }
+
+    // ---------------- post：事后才知道的 ----------------
+    h.push("<div style='margin-top:16px;border-top:1px dashed #3a4250;padding-top:12px'>");
+    h.push("<div style='color:#e8b44a;font-size:12px;margin-bottom:8px'>" +
+           "⚠ 事后才知道的（回看专用 —— <b>当时这一根上是看不到的</b>，" +
+           "别把它当成当时的依据）</div>");
+
+    if ((post.preds || []).length) {
+      h.push("<table><thead><tr><th>看未来几根</th><th>当时的预言</th>" +
+             "<th>判决</th><th>偏差(点)</th></tr></thead><tbody>");
+      post.preds.forEach(function (p) {
+        var col = p.verdict === "佐证成立" ? "#22c55e"
+                : (p.verdict === "被推翻" ? "#ef4444" : "#8b95a7");
+        h.push("<tr><td class='num'>" + p.horizon + "</td><td>" +
+               esc(p.pred_text) + "</td><td style='color:" + col + "'>" +
+               esc(p.verdict) + "</td><td class='num'>" +
+               (p.diff_pts == null ? "--" : fmt(p.diff_pts, 1)) +
+               "</td></tr>");
+      });
+      h.push("</tbody></table>");
+    } else {
+      h.push("<div class='k'>这一根没有预言记录</div>");
+    }
+
+    var sv = post.survival;
+    if (sv) {
+      var sCol = sv.status === "活到最后" ? "#22c55e"
+               : (sv.status === "已破" ? "#ef4444" : "#8b95a7");
+      h.push("<div style='margin-top:8px;font-size:12px'>存活结局：" +
+             "<b style='color:" + sCol + "'>" + esc(sv.status) + "</b>" +
+             " · 该守住=" + esc(sv.must_hold) +
+             " · 看到第 " + esc(sv.n_seen) + "/" + esc(sv.max_n) + " 根" +
+             (sv.break_n != null ? " · 第 " + esc(sv.break_n) + " 根破" : "") +
+             "</div>");
+    }
+
+    var fw = post.forward;
+    if (fw) {
+      h.push("<div style='margin-top:6px;font-size:12px' class='k'>之后涨跌：" +
+             "ret1=" + (fw.ret1 == null ? "--" : (fw.ret1 * 100).toFixed(3) + "%") +
+             " · ret3=" + (fw.ret3 == null ? "--" : (fw.ret3 * 100).toFixed(3) + "%") +
+             " · ret5=" + (fw.ret5 == null ? "--" : (fw.ret5 * 100).toFixed(3) + "%") +
+             " · 守住线=" + esc(fw.held_line || "--") + "</div>");
+    }
+    h.push("</div>");
+
+    $("snap-body").innerHTML = h.join("");
+  }
+
+  // ---------------------------------------------------------------- 控件
+  Array.prototype.forEach.call(document.querySelectorAll(".evo-iv"), function (btn) {
+    btn.onclick = function () {
+      Array.prototype.forEach.call(document.querySelectorAll(".evo-iv"),
+        function (o) { o.classList.remove("on"); });
+      btn.classList.add("on");
+      curIv = btn.getAttribute("data-iv");
+      zwin = null;                       // 换周期：旧的百分比窗口没意义
+      $("snap-box").style.display = "none";
+      snapTs = null;
+      loadMeta(); load();
+    };
+  });
+  var rxBtn = $("evo-rx");
+  if (rxBtn) {
+    rxBtn.onclick = function () {
+      showRx = !showRx;
+      rxBtn.classList.toggle("on", showRx);
+      load();
+    };
+  }
+  var rf = $("evo-refresh");
+  if (rf) rf.onclick = function () { loadMeta(); load(); };
+  var cl = $("snap-close");
+  if (cl) cl.onclick = function () {
+    $("snap-box").style.display = "none";
+    snapTs = null;
+  };
+
+  // 只在切换到这个面板时初始化：隐藏容器里 echarts.init 拿到 0 宽高，
+  // 画出来是空白，还得再 resize 一次才能看 —— 干脆等它可见再建。
+  window.EvoPane = {
+    show: function () {
+      if (!chart && !init()) return;
+      chart.resize();
+      if (!state) { loadMeta(); load(); }
+    },
+    // 给自动化检查用：结论筛选的算法本体（纯函数，不碰 DOM）。
+    _focusMask: focusMask,
+    // 只读地看一眼当前筛选状态（测试用，不给页面用）
+    _debug: function () {
+      return { picked: picked, context: CONTEXT, dim: DIM,
+               hasState: !!state };
+    }
+  };
+})();
+</script>

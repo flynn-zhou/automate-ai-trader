@@ -1,0 +1,134 @@
+{% extends "dash_base.html" %}
+{% block title %}真实持仓{% endblock %}
+{% block head %}
+<style>
+  .sub{color:var(--dim);font-size:12px;line-height:1.8;margin:-4px 0 14px}
+  .net{font-variant-numeric:tabular-nums;font-weight:600}
+  .pos{color:var(--ok)}.neg{color:var(--err)}
+  .grade{display:inline-block;min-width:22px;text-align:center;border-radius:4px;
+         padding:1px 6px;font-weight:700;font-size:12px}
+  .ga{background:#1d4d38;color:#5fdcab}.gb{background:#1d3f5c;color:#7fbeff}
+  .gc{background:#4d3f1d;color:#e8c76a}.gd{background:#4d2429;color:#ff9098}
+  .seq{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+  .src{font-size:11px;color:var(--dim);border:1px solid var(--line);
+       border-radius:3px;padding:0 4px;margin-left:4px}
+  .src.adopted{border-color:#6b4d1d;color:#e8b44a}
+  .src.strategy{border-color:#1d4d38;color:#5fdcab}
+  details summary{cursor:pointer;color:var(--accent);font-size:12px}
+  details pre{white-space:pre-wrap;margin:8px 0 0;color:var(--txt);
+              font-size:12px;line-height:1.75;
+              background:#0f1117;border:1px solid var(--line);
+              border-radius:6px;padding:10px 12px}
+  tr.open td{opacity:.85}
+  .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+  .toolbar button{font-size:12px;padding:7px 14px}
+  .hint{color:var(--dim);font-size:12px}
+</style>
+{% endblock %}
+{% block body %}
+
+{% if err %}
+<div class="card"><span class="bad">{{ err }}</span></div>
+{% endif %}
+
+<div class="card">
+  <div class="grid">
+    <div><div class="k">最近 {{ limit }} 单净额</div>
+      <div class="v {{ 'pos' if summary.net and summary.net > 0 else ('neg' if summary.net and summary.net < 0 else '') }}">
+        {{ '%+.4f'|format(summary.net or 0) }} U</div></div>
+    <div><div class="k">笔数（已平 / 持仓中）</div>
+      <div class="v">{{ summary.n_closed or 0 }} / {{ summary.n_open or 0 }}</div></div>
+    <div><div class="k">胜率</div>
+      <div class="v">{% if summary.win_rate is not none %}{{ '%.1f'|format(summary.win_rate * 100) }}%{% else %}—{% endif %}</div></div>
+    <div><div class="k">毛 / 手续费 / 资金费</div>
+      <div class="v" style="font-size:14px">{{ '%+.2f'|format(summary.gross or 0) }} /
+        {{ '-%.2f'|format(summary.fee or 0) }} / {{ '%+.4f'|format(summary.funding or 0) }}</div></div>
+    <div><div class="k">平均评分</div>
+      <div class="v">{% if summary.avg_score is not none %}{{ summary.avg_score }}{% else %}—{% endif %}</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <button onclick="refreshLedger(this)">立即刷新</button>
+    <span class="hint" id="refreshMsg">数据由「启动 + 每 5 分钟对账 + 每次平仓」自动抓取</span>
+  </div>
+  <p class="sub">
+    这一页的账**不读 trades 表**，全部由交易所的逐笔成交（<code>userTrades</code>）
+    还原：一单 = 一次「从空仓到空仓」，中间的加仓和部分平仓算同一单。
+    盈亏取交易所的 <code>realizedPnl</code>，手续费取逐笔 <code>commission</code>
+    （maker 0.02% / taker 0.05% 分开记），资金费单独从 <code>income</code> 取。
+    所以它和 trades 表的数字对不上是正常的——对不上才是信息。
+  </p>
+
+  {% if not rounds %}
+    <p class="hint">还没有数据。引擎启动后第一次对账就会抓一遍；
+      也可以点上面的「立即刷新」。</p>
+  {% else %}
+  <table>
+    <thead><tr>
+      <th>评分</th><th>方向</th><th>数量</th>
+      <th>入场</th><th>出场</th><th>持仓</th>
+      <th>毛</th><th>手续费</th><th>资金费</th><th>净额</th>
+      <th>明细</th>
+    </tr></thead>
+    <tbody>
+    {% for r in rounds %}
+      <tr class="{{ 'open' if not r.exit_ts }}">
+        <td>
+          {% if r.score_total is not none %}
+            <span class="grade g{{ (r.grade or 'd')|lower }}">{{ r.grade }}</span>
+            <span class="seq">{{ r.score_total }}</span>
+          {% else %}<span class="seq">—</span>{% endif %}
+        </td>
+        <td>
+          {% if r.side == 'long' %}<span class="pos">多</span>
+          {% else %}<span class="neg">空</span>{% endif %}
+          {% if r.source == 'adopted' %}<span class="src adopted">接管</span>
+          {% elif r.source == 'strategy' %}<span class="src strategy">策略</span>
+          {% else %}<span class="src">手工</span>{% endif %}
+        </td>
+        <td class="seq">{{ '%.6f'|format(r.qty or 0) }}</td>
+        <td class="seq">
+          {{ '%.2f'|format(r.entry_price or 0) }}<br>
+          <span style="color:var(--dim)">{{ r.entry_ts|ts }}</span>
+        </td>
+        <td class="seq">
+          {% if r.exit_ts %}{{ '%.2f'|format(r.exit_price or 0) }}<br>
+            <span style="color:var(--dim)">{{ r.exit_ts|ts }}</span>
+          {% else %}<span class="warn">持仓中</span>{% endif %}
+        </td>
+        <td class="seq">{{ r.hold_sec|dur }}</td>
+        <td class="seq {{ 'pos' if (r.gross or 0) > 0 else ('neg' if (r.gross or 0) < 0 else '') }}">
+          {{ '%+.4f'|format(r.gross or 0) }}</td>
+        <td class="seq">-{{ '%.4f'|format(r.fee or 0) }}</td>
+        <td class="seq">{{ '%+.4f'|format(r.funding or 0) }}</td>
+        <td class="net {{ 'pos' if (r.net or 0) > 0 else ('neg' if (r.net or 0) < 0 else '') }}">
+          {{ '%+.4f'|format(r.net or 0) }}</td>
+        <td>
+          {% if r.analysis %}
+          <details><summary>展开</summary><pre>{{ r.analysis }}</pre></details>
+          {% else %}<span class="seq">—</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<script>
+function refreshLedger(btn){
+  var msg = document.getElementById('refreshMsg');
+  btn.disabled = true;
+  msg.textContent = '正在从交易所抓取…（首次可能要十几秒）';
+  fetch('{{ url_for("live_rounds_refresh") }}', {method:'POST', credentials:'same-origin'})
+    .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+    .then(function(res){
+      if (res.ok && res.j.ok) { location.reload(); }
+      else { msg.textContent = '刷新失败：' + (res.j.error || '未知错误'); btn.disabled = false; }
+    })
+    .catch(function(e){ msg.textContent = '刷新失败：' + e; btn.disabled = false; });
+}
+</script>
+{% endblock %}

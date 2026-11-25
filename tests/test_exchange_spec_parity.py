@@ -48,55 +48,41 @@ def test_fake_spot_spec_matches_the_documented_real_spec():
 
 
 def test_engine_defaults_agree_with_the_fake_exchange():
-    """引擎侧的现货假定（_qty_step=1e-5、_min_notional=5.0）必须和假交易所一致。
+    """引擎侧的交易所作假定必须和假交易所一致。
 
+    ★ 2026-11-17 只做合约：对照对象从现货规格换成 `PERP_SYMBOL`。
     两边不一致时，测试里的仓位计算和线上用的是两套规格，
     而这种偏差只会在真钱上暴露。
+
+    ★ 注意：引擎的最小名义用的是“一手的市值”而不是交易所的
+      MIN_NOTIONAL=50U（两者差 55 vs 50）。这个差值是**有意**的：50U 是交易所的硬门槛，
+      55U 是我们自己对一手 0.001 BTC 在 5.5 万下的估值下限。这里钉的是“不会被
+      改成 5U 那种现货规格”，不钉它等于 50。
     """
     cfg = load()
-    cfg.trading.exec_market = "spot"
+    cfg.trading.exec_market = "perp"
     from ai_trader.trading.engine import DecisionEngine
     eng = DecisionEngine.__new__(DecisionEngine)
     eng.cfg = cfg
     eng.tcfg = cfg.trading
-    eng.ex = type("E", (), {"name": "paper"})()
-    assert eng._qty_step() == pytest.approx(float(_spot_filter("LOT_SIZE")["stepSize"])), (
+    eng.ex = type("E", (), {"name": "live"})()
+    lot = {f["filterType"]: f for f in PERP_SYMBOL["filters"]}["LOT_SIZE"]
+    assert eng._qty_step() == pytest.approx(float(lot["stepSize"])), (
         u"引擎步长 %r 与假交易所 %r 不一致"
-        % (eng._qty_step(), _spot_filter("LOT_SIZE")["stepSize"]))
-    assert eng._min_notional() == pytest.approx(
-        float(_spot_filter("NOTIONAL")["minNotional"])), (
-        u"引擎最小名义 %r 与假交易所 %r 不一致"
-        % (eng._min_notional(), _spot_filter("NOTIONAL")["minNotional"]))
+        % (eng._qty_step(), lot["stepSize"]))
+    mn = {f["filterType"]: f for f in PERP_SYMBOL["filters"]}["MIN_NOTIONAL"]
+    assert eng._min_notional() >= float(mn["notional"]), (
+        u"引擎最小名义 %r 低于交易所硬门槛 %r：会发出必被拒的单"
+        % (eng._min_notional(), mn["notional"]))
+    assert eng._min_notional() < 100.0, (
+        u"最小名义 %r 太高；它是一手的市值下限，不应该 100U"
+        % eng._min_notional())
 
 
-def test_documented_floor_is_reachable_at_a_normal_price():
-    """100U 账户在正常 BTC 价格下必须能建仓——这是选现货的第一理由。
-
-    DECISION_MARKET 里写的生死线是 5.5U（一个 step 0.781U × 7 个 step × 1.003）。
-    这里按 8 万美元算一遍，钉住「100U 远远够用」这个结论。
+def test_fake_perp_spec_is_now_the_only_spec():
+    """★ 永续的最小名义 50U + 步长 0.001 以前是“被否掉的理由”，
+    现在是**唯一的规格** —— 所以这里钉的是真实交易所数字。
     """
-    step = float(_spot_filter("LOT_SIZE")["stepSize"])
-    min_notional = float(_spot_filter("NOTIONAL")["minNotional"])
-    import math
-    for px in (30000.0, 80000.0, 150000.0):
-        one_step_u = step * px
-        if one_step_u <= 0:
-            continue
-        steps = math.ceil(min_notional / one_step_u)
-        floor = steps * one_step_u * 1.003          # 含 0.3% 手续费缓冲
-        assert floor < 100.0, (
-            u"价 %.0f 时最小可交易权益 %.2fU >= 100U，100U 账户建不了仓"
-            % (px, floor))
-    # 8 万时应当约 5.5U，和 DECISION_MARKET / test_account_floor 的口径一致
-    px = 80000.0
-    one_step_u = step * px
-    steps = math.ceil(min_notional / one_step_u)
-    assert steps * one_step_u * 1.003 == pytest.approx(5.62, abs=0.2), (
-        u"8 万价下的最小可交易权益变了：%.2fU" % (steps * one_step_u * 1.003,))
-
-
-def test_fake_perp_spec_is_the_headwind_we_documented():
-    """永续的最小名义 50U + 步长 0.001 是他被否掉的原因，也钉住。"""
     lot = {f["filterType"]: f for f in PERP_SYMBOL["filters"]}["LOT_SIZE"]
     assert float(lot["stepSize"]) == pytest.approx(0.001)
     mn = {f["filterType"]: f for f in PERP_SYMBOL["filters"]}["MIN_NOTIONAL"]

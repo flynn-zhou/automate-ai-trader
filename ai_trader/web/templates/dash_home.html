@@ -6,6 +6,11 @@
   .iv{padding:6px 14px;border:1px solid var(--line);border-radius:6px;
       background:transparent;color:var(--dim);cursor:pointer;font:inherit}
   .iv.on{background:var(--accent);color:#0b0d12;border-color:var(--accent);font-weight:600}
+  /* 数据源切换与周期按钮视觉上分开：它换的是**另一条链路**，
+     不是同一张图的另一个周期。混在一起会让人以为"换周期"和"换数据源"是一回事。 */
+  .src{padding:6px 14px;border:1px solid var(--line);border-radius:6px;
+       background:transparent;color:var(--dim);cursor:pointer;font:inherit}
+  .src.on{background:var(--warn);color:#0b0d12;border-color:var(--warn);font-weight:600}
   .px{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
   .dl{font-size:13px;font-variant-numeric:tabular-nums}
 </style>
@@ -31,24 +36,87 @@
 
 <div class="card">
   <div class="row">
+    <span class="k">数据源</span>
+    <button class="src on" id="src-live">实时（币安）</button>
+    <button class="src" id="src-evo">演化回看（kbar.db）</button>
+  </div>
+  <div class="row" style="margin-top:12px">
     <span class="k">周期</span>
-    <button class="iv on" data-iv="3m">3m</button>
-    <button class="iv" data-iv="15m">15m</button>
-    <button class="iv" data-iv="1h">1h</button>
+    {# 实时：3m/5m/15m/1h（币安 REST，只读拉取）。
+       演化回看：5m/15m —— **只放 kbar.db 里真有数据的两个周期**，
+       按钮上多一个周期不等于那条链路有数据。 #}
+    <span id="iv-live">
+      <button class="iv on" data-iv="3m">3m</button>
+      <button class="iv" data-iv="5m">5m</button>
+      <button class="iv" data-iv="15m">15m</button>
+      <button class="iv" data-iv="1h">1h</button>
+    </span>
+    <span id="iv-evo" style="display:none">
+      <button class="evo-iv" data-iv="5m">5m</button>
+      <button class="evo-iv on" data-iv="15m">15m</button>
+      <button id="evo-rx" class="on" style="margin-left:10px">观察线反应</button>
+      <button id="evo-refresh" style="margin-left:6px">刷新</button>
+    </span>
     <button id="refresh" style="margin-left:14px">刷新</button>
-    <span style="margin-left:auto;text-align:right">
+    <span id="price-box" style="margin-left:auto;text-align:right">
       <div id="last-price" class="px">--</div>
       <div id="last-delta" class="dl">--</div>
     </span>
   </div>
 </div>
 
-{% include "_chart_body.html" %}
-<div class="card k"><span id="feed-status">读取中…</span></div>
+{# 两个面板各自独立：实时面板走币安、每 3 秒轮询；
+   演化面板读 kbar.db、**不轮询**（回看模式）。
+   混成一张图会把"数据只到某天"显示成"图坏了"。 #}
+<div id="pane-live">
+  {% include "_chart_body.html" %}
+  <div class="card k"><span id="feed-status">读取中…</span></div>
+</div>
+
+<div id="pane-evo" style="display:none">
+  {% include "_evo_js.html" %}
+</div>
+
+<div class="card" id="src-note" style="display:none">
+  <div class="k">
+    ⚠ 这是<b>回看</b>视图，不是实时行情：数据截止时间写在图下面。
+    5m 与 15m 的区间四线来源不同（5m 用离线重建库、15m 用已丢失的原库），
+    所以 <code>zone</code>/<code>direction</code>/<code>n_touch</code>
+    这类「空」维度<b>不能跨周期横比</b>（见 D-25）。
+    快照面板里带「事后」标注的那一块是<b>看未来</b>的信息，
+    当时看不到 —— 它是用来复盘的，不是当时的依据。
+  </div>
+</div>
 
 <div class="card">
   <div class="k" style="margin-bottom:8px">仓位参数（数据库为准，改完立即生效）</div>
   {% include "_sizing_table.html" %}
 </div>
+
 {% include "_chart_js.html" %}
+
+<script>
+(function () {
+  "use strict";
+  function $(id) { return document.getElementById(id); }
+  function show(which) {
+    var live = (which === "live");
+    $("src-live").classList.toggle("on", live);
+    $("src-evo").classList.toggle("on", !live);
+    $("pane-live").style.display = live ? "" : "none";
+    $("pane-evo").style.display = live ? "none" : "";
+    $("iv-live").style.display = live ? "" : "none";
+    $("iv-evo").style.display = live ? "none" : "";
+    $("src-note").style.display = live ? "none" : "";
+    // 实时面板的"刷新"和现价在回看模式下没有意义，藏起来免得误导
+    $("refresh").style.display = live ? "" : "none";
+    $("price-box").style.display = live ? "" : "none";
+    // 演化面板用 display:none 隐藏时 echarts 拿到 0 宽高，
+    // 所以等它可见之后再初始化/ resize —— 见 _evo_js.html 的 EvoPane.show
+    if (!live && window.EvoPane) window.EvoPane.show();
+  }
+  $("src-live").onclick = function () { show("live"); };
+  $("src-evo").onclick = function () { show("evo"); };
+})();
+</script>
 {% endblock %}

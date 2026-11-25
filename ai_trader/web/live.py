@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import urllib.error
@@ -36,8 +37,15 @@ logger = logging.getLogger(__name__)
 
 live_bp = Blueprint("live", __name__, url_prefix="/admin/api")
 
-# 只放行真实 K 线周期，避免把任意字符串透传给币安
-ALLOWED_INTERVALS = {"3m": 180_000, "15m": 900_000, "1h": 3_600_000}
+# 只放行真实 K 线周期，避免把任意字符串透传给币安。
+#
+# ⚠ 加 5m 只是让**这个只读端点**能向币安要 5m K 线。
+#   它**没有**动 `config.INTERVALS_MS` —— 那个列表决定实时聚合器要产出哪些周期，
+#   加进去就会让聚合器开始往生产 market.db 里写 5m bar（而且要过
+#   market/agg.py 那条"3s 是原子周期"的断言）。改聚合周期是另一件事，
+#   得先确认下游都吃得住，不能顺手在 Web 层捎带。
+ALLOWED_INTERVALS = {"3m": 180_000, "5m": 300_000, "15m": 900_000,
+                     "1h": 3_600_000}
 DEFAULT_INTERVAL = "3m"
 
 EMA_PERIODS = (20, 50, 144, 169, 200)
@@ -57,19 +65,93 @@ def _symbol() -> str:
         return "BTCUSDT"
 
 
-def _fetch_klines(symbol: str, interval: str, limit: int) -> list:
-    """同步拉币安 K 线。
+def _proxy_mode():
+    """`AI_HTTP_PROXY` 想表达哪种模式：('default'|'direct'|'explicit', url)。
 
-    代理策略：跟随环境变量（urllib 默认），不硬编码禁用。
-    硬编码 ProxyHandler({}) 在「必须走代理才能出网」的机器上会直接超时——
-    而写代码的人只会看到自己那台直连的服务器一切正常。
+    单独抽出来是为了**可测**：`build_opener()` 的结果没法可靠断言
+    —— 实测 Python 3.9 里 `build_opener(ProxyHandler({}))` 的 `.handlers`
+    里根本看不到 ProxyHandler（`ProxyHandler({})` 与无参调用都是 0 个），
+    所以"检查 handler 列表"这种测试是无效的，看着绿、其实什么都没验。
+    把它拆成一个返回枚举的小函数，测试才钉得住真实决策。
+    """
+    raw = (os.environ.get("AI_HTTP_PROXY") or "").strip()
+    if not raw:
+        return ("default", "")
+    if raw.lower() in ("off", "none", "direct", "0"):
+        return ("direct", "")
+    return ("explicit", raw)
+
+
+def _opener():
+    """按 `AI_HTTP_PROXY` 决定走不走代理。
+
+    ## 为什么需要这个开关
+
+    `urllib.request.build_opener()` 会自动读 Windows 注册表的代理设置
+    （`ProxyEnable=1` / `ProxyServer=127.0.0.1:4780`）。这台机器上就有：
+    代理没起来的时候，Python 拿到的错误是
+    `URLError: [Errno 2] No such file or directory` —— 一个**看起来像文件问题、
+    实际是代理 socket 连不上**的错误。2026-11-09 我就是被它误导，
+    把"代理不通"写成了"币安不可达"。
+
+    `AI_HTTP_PROXY` 三种取值：
+        未设置 / 空  → 沿用 urllib 默认（读系统代理）。保持旧行为。
+        "off"        → **强制直连**，完全不读系统代理。
+        "http://…"   → 显式用这个代理。
+
+    强制直连在"必须走代理才能出网"的机器上会超时 —— 所以它是个
+    显式开关，不做默认，也不做自动降级（自动降级会让故障变成偶发，
+    更难查）。
+    """
+    mode, url = _proxy_mode()
+    if mode == "direct":
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    if mode == "explicit":
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": url, "https": url}))
+    return urllib.request.build_opener()
+
+
+def _fetch_klines(symbol: str, interval: str, limit: int,
+                  retries: int = 2, base_sleep: float = 0.6) -> list:
+    """同步拉币安 K 线，带有限重试。
+
+    重试为什么值得加：这台机器出网要过一个本地代理，实测**时通时不通**
+    （同一进程内 pack 先成功、紧接着直接调就失败）。行情图偶发空白比
+    多花 1~2 秒糟得多，所以重试 2 次、退避 0.6s/1.2s。
+
+    为什么只重试 2 次：`PACK_TTL=2.8s` 是为了跟上 3s 轮询。重试太多会让
+    单次请求耗时超过轮询周期，请求开始堆积，反而更糟。
+
+    错误分两类，别混：
+        - 代理/网络层（URLError、超时）→ 值得重试
+        - 币安明确拒绝（HTTP 4xx/5xx 的 HTTPError 带状态码）→ 不重试，
+          重试只会让封禁更久
     """
     url = ("https://fapi.binance.com/fapi/v1/klines"
            "?symbol=%s&interval=%s&limit=%d" % (symbol, interval, limit))
-    req = urllib.request.Request(url, headers={"User-Agent": "ai-trader"})
-    opener = urllib.request.build_opener()
-    with opener.open(req, timeout=12) as r:
-        return json.loads(r.read().decode("utf-8"))
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ai-trader"})
+            with _opener().open(req, timeout=12) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 币安回了状态码 = 网络是通的，重试没意义
+            raise RuntimeError(
+                "币安拒绝请求 HTTP %s（interval=%s）" % (e.code, interval))
+        except (urllib.error.URLError, OSError) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(base_sleep * (2 ** attempt))
+                continue
+            reason = str(getattr(e, "reason", e))
+            raise RuntimeError(
+                "行情拉取失败（已重试 %d 次）：%s；代理=%s。"
+                "若代理没起来，设 AI_HTTP_PROXY=off 可强制直连"
+                % (retries, reason[:120],
+                   (os.environ.get("AI_HTTP_PROXY") or "系统默认")))
+    raise RuntimeError("行情拉取失败：%s" % last_err)
 
 
 def ema_series(closes: list, period: int) -> list:

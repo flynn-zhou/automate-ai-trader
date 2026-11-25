@@ -1,0 +1,18 @@
+[Unit]
+Description=ai-trader K线演化（15m + 5m）增量补算与新鲜度闸
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cryptobot
+Group=cryptobot
+WorkingDirectory=/home/cryptobot/ai-trader
+EnvironmentFile=-/etc/ai-trader/env
+ExecStart=/home/cryptobot/ai-trader/tools/kbar_tick.sh
+# 每 5 分钟一次，所以单次超时不能给太久，否则会叠起来。
+# 轻量路径（lines+facts 增量）正常几秒；整点那次全量重算才需要几分钟。
+TimeoutStartSec=600
+# 让出 CPU 给实盘：补算是后台活儿，不该和下单抢
+Nice=10
+CPUWeight=20

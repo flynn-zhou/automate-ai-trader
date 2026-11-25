@@ -70,6 +70,30 @@ def live_page():
                            pack_url=_pack_url(), default_interval="3m")
 
 
+@dash_bp.get("/live-rounds")
+@login_required
+def live_rounds_page():
+    """真实持仓：最近 20 单的账与评分。
+
+    数据只来自 live_rounds（由交易所 userTrades 还原），
+    不读 trades 表——两套账各自独立，对不上才有信息。
+    """
+    tdb = _cfg("TDB")
+    limit = 20
+    rounds, summary, err = [], {}, ""
+    if tdb is None:
+        err = "交易库未注入"
+    else:
+        try:
+            rounds = tdb.recent_live_rounds(limit)
+            summary = tdb.live_rounds_summary(limit)
+        except Exception as e:
+            logger.warning("读真实持仓失败: %s", str(e)[:160])
+            err = "读取失败：%s" % str(e)[:160]
+    return render_template("dash_live_rounds.html", rounds=rounds,
+                           summary=summary, err=err, limit=limit)
+
+
 @dash_bp.get("/range")
 @login_required
 def range_page():
@@ -100,17 +124,29 @@ def config_save():
                                    settings.sizing()["sizing.capital"],
                                    settings.sizing()["sizing.risk_pct"],
                                    settings.sizing()["sizing.leverage"])), 400
+    # ★ 惊喜K线阈值：表单里有就校验，没有就不动（可选字段）。
+    surprise_raw = (request.form.get("surprise_pts") or "").strip()
+    if surprise_raw:
+        ok3, why3 = settings.set_surprise(surprise_raw)
+        if not ok3:
+            return render_template("dash_config.html", error=why3,
+                                   settings=settings.sizing(),
+                                   strategy_pts=settings.strategy(),
+                                   derived=settings.preview(capital, risk, lev)), 400
     ok, why = settings.set_sizing(capital, risk, lev)
     if not ok:
         # 原样把理由显示出来，不静默取整、不静默夹紧
         return render_template("dash_config.html", error=why,
                                settings=settings.sizing(),
+                               strategy_pts=settings.strategy(),
                                derived=settings.preview(capital, risk, lev)), 400
     settings.apply_to(cfd.trading)
-    logger.info("后台改仓位参数: %.2fU / %.2f%% / %.1fx", capital, risk, lev)
+    logger.info("后台改仓位参数: %.2fU / %.2f%% / %.1fx / 惊喜K线 %s点",
+                capital, risk, lev, settings.strategy()["strategy.surprise_pts"])
     d = settings.preview(capital, risk, lev)
     return render_template("dash_config.html", saved="已保存并立即生效",
-                           settings=settings.sizing(), derived=d)
+                           settings=settings.sizing(),
+                           strategy_pts=settings.strategy(), derived=d)
 
 
 @dash_bp.get("/config")
@@ -123,4 +159,5 @@ def config_page():
     s = settings.sizing()
     d = settings.preview(s["sizing.capital"], s["sizing.risk_pct"],
                          s["sizing.leverage"])
-    return render_template("dash_config.html", settings=s, derived=d)
+    return render_template("dash_config.html", settings=s,
+                           strategy_pts=settings.strategy(), derived=d)

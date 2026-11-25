@@ -456,12 +456,31 @@ class Guard:
         # 刚停下就被判"已满 30 天"立刻放行。
         self.st.halt_kind = ""
         self.st.halt_ts = 0
+        # ★ 峰值基线必须【一起】推到当前时刻，否则复位活不过一次重启（2026-11-19）。
+        #
+        #   `peak_equity = 0.0` 只清的是**内存**。进程一重启，`_restore_peak()`
+        #   会按 `baseline_ts` 为起点从 `equity` 表重算历史最高权益 ——
+        #   基线不动，重算出来还是那个旧峰值，回撤率立刻回到 89%，
+        #   第 1 条闸（回撤 ≥60% 硬停）当场再停一次。
+        #
+        #   生产实证：11-19 复位后 `peak_equity` 从 609.5499 变成 65.5737
+        #   （当前权益）、`drawdown_pct` 89.24 → 0.0、`can_open` True；
+        #   随后一次部署重启，`peak_equity` 又变回 609.5499，
+        #   `halt_kind` 变成 `drawdown`，`can_open` 又变回 False。
+        #   表现就是"复位了，但一重启就白复位了"。
+        #
+        #   所以：把基线推到现在 = 承认"旧那段回撤已经结案，从这笔钱重新起算"。
+        #   这与第 128 轮 `baseline_ts` 的设计意图一致（资金提走又注入后，
+        #   旧峰值属于另一笔钱）——人工复位本质上就是"我确认要从这里重新起算"。
+        self.st.baseline_ts = int(time.time() * 1000)
+        self.st.peak_equity = 0.0
         # 人工复位同样要落库：不写的话重启会把硬停读回来，系统再也起不来。
+        # ★ 必须在 baseline_ts 赋值【之后】落库：`_persist_halt()` 读的是
+        #   `st.baseline_ts`，先落库再赋值等于这次复位又白写。
         self._persist_halt()
         self.st.temp_reasons.clear()
         self.st.temp_block = ""
         self.st.daily_halt_day = ""
-        self.st.peak_equity = 0.0
         self._event("guard_reset", reason)
 
     def snapshot(self) -> dict:
@@ -688,6 +707,31 @@ class Guard:
         #   回撤能吃冷却期，账实不符不能——后者意味着我们不知道真实敞口，
         #   冷却期结束之后它依然不知道。自动放行等于赌"没人动过仓位"。
         self._halt_hard(detail, kind="mismatch")
+
+    def manual_position_adopted(self, detail: str) -> None:
+        """用户手工开的仓被接管：**记事件 + 通知，但绝不硬停**（2026-11-19）。
+
+        为什么这条要单独存在，而不是复用 `position_mismatch()`：
+
+        §13.2 早就定了「手工仓只接管、不判策略出场、保留熔断止损」——
+        用户会持续在手机上下单，这是**约定好的正常工作方式**，不是故障。
+        而第 6 条闸 `position_mismatch()` 是给「我们不知道自己的敞口」用的，
+        它 kind="mismatch"、**永不自动解除**。两者在同一个场景上撞车：
+
+            用户手机开仓 → reconcile 按约定接管 → 紧接着硬停自己
+
+        结果就是「用户越按约定操作，系统越停」：每次手工开仓都要人工
+        `POST /api/guard/reset` 才能继续开新仓。实测 11-13 那次硬停
+        就是这么来的，一直挂到 11-19。
+
+        判据在引擎侧（只有执行器能查到交易所的 clientOrderId）：
+        解释错配差额的成交里没有一个 ``AI-`` 前缀 → 人工仓。
+
+        ★ 这条**不动 `halted_hard`**：如果是「人工仓叠在已有硬停之上」，
+          硬停照旧生效，这里只负责让这笔接管可见。
+        """
+        self._event("manual_position_adopted", detail, alert=True,
+                    title="已接管人工持仓（不硬停）")
 
     def executor_halt(self, detail: str, recovered: bool = False) -> None:
         """执行器熔断的状态跳变。

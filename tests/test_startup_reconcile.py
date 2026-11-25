@@ -121,7 +121,7 @@ def test_takeover_clears_reconcile_flag():
         eng.pos = None                       # 真实启动：内存空仓
         _run(eng.reconcile_live())           # 交易所却有仓 -> 接管
 
-        assert eng.pos is not None, "应当接管交易所的持仓"
+        assert eng.adopted_pos is not None, "应当接管交易所的持仓"
         assert eng.trend.need_reconcile is False, (
             "接管到持仓后对账标志仍然挂着——这笔仓一旦熔断平掉，"
             "startup_entry 会在同一根 4h 内无条件补回")

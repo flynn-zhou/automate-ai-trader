@@ -8,25 +8,348 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
+import hashlib
 import logging
+import os
 import time
 from typing import Optional
 
-from ..trade_db import TradeDB
+from ..trade_db import TradeDB, ADOPT_REASON, reconcile_orders
 from . import features as feat_mod
 from . import signals as sig_mod
+from .events import (GATE_SIZING, GATE_UNATTENDED, EntryIntent, GateResult)
+from .order_router import OrderRouter
 from .risk import RiskState, build_plan, check_risk_state, roll_day
 
 logger = logging.getLogger(__name__)
 
+# ADOPT_REASON 的【定义】在 trade_db.py —— 它同时被 stats() 用来把这类仓
+# 排除出策略战绩，两个消费方必须共用同一个字面量。
+#
+# 它标记的是「这笔仓不是策略开的」：
+#   reconcile_live() 每次发现「交易所上有仓、数据库里没有」，就把它【接管】
+#   进 self.pos。来历可能是：
+#     1) 用户在手机 App 上手工开的
+#     2) 下单超时但其实成交了、回报丢了
+#     3) 上次进程崩在 log_trade 之前
+#
+# 第 1 类没有策略的出场依据——用户为什么在那个价位开仓、打算拿到哪里、
+# 能容忍多少回撤，系统一概不知道。拿唐奇安的「跌破 75 根新低」去平掉一笔
+# 手工仓，是把两套完全不同的决策混成一套。
+#
+# 生产事故（11-12）：用户 21:09 手工买入 0.075 BTC，21:12 被接管，
+# 22:00 引擎按通道出场平掉（本金 292U 的账户，那一笔真实净额 -3.48U）。
+# 用户的原话是「我们还没有策略呢，是什么在干预我的单子」。
+#
+# 所以：接管来的仓【不判策略出场】，但【保留熔断止损】。
+# 判定入口是 _is_adopted()，判据只能读 open_reason（内存布尔活不过重启）。
+
+#: 我们自己的单 `clientOrderId` 的固定前缀（见 live.py 的 _open/_close）。
+#: 判定「这笔仓是不是我们开的」只用这一个字符串，不要在别处另写一份。
+AI_CLIENT_PREFIX = "AI-"
+
+#: 挂单（pending）策略 `clientOrderId` 的前缀。
+#: 与 `AI_CLIENT_PREFIX` 分开：看板和成交归因要能一眼区分「趋势/剥头皮的单」
+#: 和「挂单策略的单」，而且挂单还多一条撤单路径，前缀必须可识别。
+PENDING_CLIENT_PREFIX = "AI-pend-"
+
+#: 挂单策略**自己开的**仓的 `open_reason`。
+#:
+#: 它与 `trade_db.ADOPT_REASON`（`实盘对账接管`，用户手工仓）互斥，
+#: 是回答「这笔仓归谁管」的唯一判据：
+#:   · 写：`_pending_book_fill` 成交落账时写这个值；
+#:   · 读：`_pending_close` 只肯平这个值的仓。
+#: 故意做成常量而不是两处字面量 —— 2026-11-24 的误平就是因为
+#: 「该不该平」没有任何归属判据，只有「引擎手里有没有仓」。
+PENDING_FILL_REASON = "挂单成交"
+
+#: 交易所里被认作「已成交」的状态（含部分成交）。
+#: 与 `PendingOrder.status` 的原生值对齐，不做归一化 —— 归一化会把
+#: 「部分成交」压成「成交」，`_pending_book_fill` 就会按全额落账。
+_FILLED_STATES = ("FILLED", "PARTIALLY_FILLED")
+
+
+def pending_client_id(thesis_id) -> str:
+    """挂单/撤单**共用**的 clientOrderId。两处必须调同一个函数。
+
+    ★ 为什么不能再用 thesis_id 截断（2026-11-24 生产事故，已实测）：
+
+      币安要求 `clientOrderId` **< 36 字符**（是「小于」，不是「小于等于」）。
+      thesis_id 的形状是 ``形态|方向|ts|价``，例如
+
+          下跌三引线假突破限价单|up|1795481700000|61178.1000
+
+      47 个字符 / 69 字节，且含中文。原来的写法
+      ``("AI-pend-%s" % tid)[:36]`` 截出来**正好 36 字符 = 58 字节**，
+      两边都不满足，于是**每一张挂单都被交易所拒**：
+
+          HTTP 400 {"code":-4015,
+                    "msg":"Client order id length should be less than 36 chars"}
+
+      实测后果：orders 表里 `AI-pend-` 开头的记录**一条都没有** ——
+      挂单策略上线至今**从来没成功挂出过任何一张单**。而由于失败不阻断
+      状态推进（见 `_pending_place`），状态机照样把 thesis 记成 ARMED，
+      然后在历史 K 线上推出「成交 + 出场」，最后拿市价单砸在真实持仓上。
+
+    ★ 为什么用定长哈希而不是「截更短」：
+
+      · 全 ASCII、长度固定（8 + 16 = 24 字符），不随形态名长度/中文/价格位数变化；
+      · 对同一个 thesis_id 稳定 —— 幂等重放和撤单都靠这一点（撤单必须
+        能算出与挂单**逐字相同**的 id）；
+      · 日志里仍带完整 thesis_id，认人不受影响。
+
+    ★ 不做「保留可读前缀」的折中：中文形态名一进来长度就不可控，
+      而这类「看起来能读、实际会超长」的写法才是这次踩坑的原因。
+    """
+    key = hashlib.sha1(str(thesis_id).encode("utf-8")).hexdigest()[:16]
+    cid = "%s%s" % (PENDING_CLIENT_PREFIX, key)
+    # 把交易所的硬约束变成代码里的断言：以后谁改这个函数，长度错了当场红。
+    if len(cid) > 35 or not cid.isascii():
+        raise ValueError("clientOrderId 不合法（%r，%d 字符）"
+                         % (cid, len(cid)))
+    return cid
+
+#: 归类结论：用户在手机 App 上手工开的仓（§13.2：接管、不许硬停）。
+PROV_MANUAL = "manual"
+#: 归类结论：我们自己的单，成交回报丢了（真故障，必须硬停）。
+PROV_OURS = "ours"
+#: 归类结论：查不到 / 凑不出差额 / 执行器不支持（保守方向：照旧硬停）。
+PROV_UNKNOWN = "unknown"
+
+#: 判「差额能不能被这些成交解释」的容差（BTC 那种 8 位小数够用）。
+_DELTA_EPS = 1e-9
+
+
+def _fmt_ms(ms) -> str:
+    """毫秒时间戳 → ``MM-DD HH:MM``（UTC）。只是日志/通知里的人读格式。"""
+    try:
+        return time.strftime("%m-%d %H:%M", time.gmtime(int(ms) / 1000))
+    except (TypeError, ValueError):
+        return "?"
+
+
+def fills_explaining_delta(fills, delta: float):
+    """从**最近**成交往回累加，找出解释「错配差额」的那组成交。
+
+    为什么解释的是**差额**（``交易所 - 数据库``）而不是整笔持仓：
+    系统自己正常开的仓也在成交里躺着。拿整笔持仓去解释，必然把
+    我们自己的 ``AI-`` 成交一起卷进来，于是「里面有我们的单」永远成立，
+    人工仓一次也放不出去 —— 这个 bug 会表现得像「改了没生效」。
+
+    返回 ``(used, ok)``：``used`` 是被用到的成交（最近优先），
+    ``ok=False`` 表示凑不出正好等于 delta 的后缀（成交不够 7 天、
+    或者差额被一笔成交切开），调用方必须当作未知，不能猜。
+    """
+    need = float(delta)
+    if abs(need) < _DELTA_EPS:
+        return [], False
+    used = []
+    acc = 0.0
+    for f in fills:                      # 已经按时间倒序
+        side = str(f.get("side") or "").upper()
+        qty = float(f.get("qty") or 0.0)
+        if qty <= 0:
+            continue
+        acc += qty if side == "BUY" else -qty
+        used.append(f)
+        if abs(acc - need) < _DELTA_EPS:
+            return used, True
+    return used, False
+
+
+def norm_side(side) -> str:
+    """把 side 规范化成 ``"long"`` / ``"short"``（认不出时返回小写原值）。
+
+    ★ 为什么必须有（2026-11-24）：
+      这个项目里 `side` 存在三种写法 —— 内存/数据库用 ``long``/``short``
+      （`plan.side`），下单接口用 ``buy``/``sell``，交易所回报用大写
+      ``BUY``/``SELL``。而对账里有一句
+      ``_own * (1 if side == "long" else -1)``：任何不等于 ``"long"``
+      的写法都会被当成**空头** —— 一笔 ``"buy"`` 的多仓会被算成负数，
+      差额符号直接反掉，后面的接管/硬停判断全部跟着错。
+      对账是全系统唯一敢说「我到底有多少仓」的地方，符号错一次就全错。
+
+    ★ 放在模块级而不是做成方法：它是纯函数，挂单成交落账那条链上的
+      测试替身（SimpleNamespace）也能直接用，不必逐个桩去 `_bind`。
+    """
+    s = str(side or "").strip().lower()
+    if s in ("long", "buy", "b"):
+        return "long"
+    if s in ("short", "sell", "s"):
+        return "short"
+    return s
+
+
+def close_booking(pos: dict, exit_price: float, close_fee: float,
+                  qty: float, side: str):
+    """平仓记账的**唯一口径**：返回 ``(毛盈亏, 手续费合计, 净盈亏)``。
+
+    ★ 为什么必须只有一个出处（2026-11-24 用户要求「统一口径」）：
+
+      改之前三条平仓路径各写一套，同一笔仓会算出三个 pnl_net：
+
+        `_close`（策略仓）       fee = 开仓费 + 平仓费   net = 毛 - fee   ← 正确
+        `_adopted_close`（人工仓） fee = 平仓费          net = 毛 - fee   ← 漏开仓费
+        `_pending_close`（挂单仓） fee = 0.0            net = 毛         ← 两边都漏
+
+      而漏记成本的方向是**单向**的：永远让亏损看起来更小、盈利看起来更大，
+      也就是让策略显得更赚钱。这会直接毁掉纸面样本的证据价值。
+      2026-11-02 已经为这个方向吃过一次亏（线上 4 笔剥头皮仓、缺口 7.77U，
+      逐笔核对每笔少的钱恰好等于它的开仓手续费）。
+
+      所以把公式收进一个纯函数，三条路都调它 —— 以后不可能再分家。
+
+    ★ `pos["fee"]` 是**开仓**手续费，必须在开仓落账时真实写入；
+      写 0 的话这个函数算出来仍然偏乐观（`_pending_book_fill` 以前正是写 0）。
+
+    ★ 手续费一律取绝对值后相加：开/平两侧的 `commission` 符号约定不同
+      （有的返回负数表示扣款），比较净盈亏时只关心总额，方向由 gross 表达。
+    """
+    entry = float(pos.get("entry") or 0.0)
+    direction = 1 if norm_side(side or pos.get("side")) == "long" else -1
+    gross = (float(exit_price) - entry) * float(qty) * direction
+    fee_total = (abs(float(pos.get("fee") or 0.0))
+                 + abs(float(close_fee or 0.0)))
+    return gross, fee_total, gross - fee_total
+
+
+def classify_delta(fills, delta: float):
+    """把错配差额归成 manual / ours / unknown，返回 ``(结论, 用到的成交)``。
+
+    ★ 判据只有一条：解释差额的成交里有没有 ``AI-`` 前缀。
+
+      * 全是系统外的（用户手单）→ manual：§13.2 约定，接管但**不硬停**
+      * 只要有一笔是我们自己的 → ours：我们发过单却不知道成交了，必须硬停
+      * 凑不出差额 → unknown：宁可停，也不猜
+    """
+    used, ok = fills_explaining_delta(fills, delta)
+    if not ok:
+        return PROV_UNKNOWN, used
+    for f in used:
+        if str(f.get("client_id") or "").startswith(AI_CLIENT_PREFIX):
+            return PROV_OURS, used
+    return PROV_MANUAL, used
+
+
+async def pending_own_filled_qty(ex, thesis_id) -> Optional[float]:
+    """问交易所：**我这张单**成交了多少？返回已成交数量，未成交/查不到返回 None。
+
+    ★ 为什么不能用「账户里有仓」当成交证据：账户级净持仓分不清来源。
+      2026-11-24：用户手工仓 0.032 BTC 被当成了挂单策略的成交，
+      一路推成「观察线拒绝」再用市价平掉。
+
+    ★ 为什么不能用价格推断：限价买单的成交价可以低于挂单价，
+      手工仓 entry=60880 低于挂单价 61178.10，价格完全"合法"，
+      所以「买价不高于限价」这条规则会放行它。价格对不证明归属对。
+
+    ★ 查不到（None）按**不是我的**处理：宁可漏记一笔（留一条
+      `pending_fill_not_ours` 风险事件，人能看到），也不能把别人的仓
+      记成自己的 —— 后者会让 `_pending_close` 得到一个错误的"归属权"，
+      进而把用户的仓卖掉。方向必须选保守的那一边。
+    """
+    q = getattr(ex, "query_order", None)
+    if q is None:
+        # 执行器不支持查单 → 无法证明归属。挂单策略在 live 才需要它，
+        # paper/测试桩可能没有；此时按「无法证明即不接管」处理。
+        logger.warning("[挂单] %s 执行器不支持 query_order，无法确认成交归属",
+                       thesis_id)
+        return None
+    try:
+        od = await q(client_id=pending_client_id(thesis_id))
+    except Exception as e:
+        logger.error("[挂单] %s 查单失败：%s", thesis_id, e)
+        return None
+    if od is None:
+        return None
+    if str(getattr(od, "status", "") or "").upper() not in _FILLED_STATES:
+        logger.warning("[挂单] %s 状态机判定成交，但交易所这张单状态是 %r",
+                       thesis_id, getattr(od, "status", ""))
+        return None
+    got = abs(float(getattr(od, "executed_qty", 0.0) or 0.0))
+    return got if got > 0 else None
+
+
+async def pending_own_fill_fee(ex, thesis_id) -> float:
+    """问交易所：**我们这张单**开仓时实际付了多少手续费。拿不到返回 0。
+
+    ★ 为什么必须单独查一次（2026-11-24 统一口径）：
+      `PendingOrder`（`/fapi/v1/order`）**不带手续费字段**，只有
+      `executedQty` / `avgPrice`。真实 commission 只出现在
+      `/fapi/v1/userTrades`，而那个接口需要 `orderId`。
+      所以挂单成交落账这条链长期写死 `fee: 0.0` —— 整个开仓成本被漏掉，
+      净盈亏系统性偏乐观（方向和「让策略显得更赚钱」一致，最危险的那种）。
+
+    ★ maker / taker 不能用一个费率代替：用户手工挂的限价单成交是 maker
+      （永续 0.02%），我们自己的市价平仓是 taker（0.05%），差 2.5 倍。
+      同一笔持仓开、平两侧费率不同，估算必然错，所以必须查真实值。
+
+    ★ 查不到返回 0，由调用方退回「按 taker 估算」——
+      保守方向是多算成本，不是少算。
+    """
+    q = getattr(ex, "query_order", None)
+    if q is None:
+        return 0.0
+    try:
+        od = await q(client_id=pending_client_id(thesis_id))
+    except Exception as e:
+        logger.warning("[挂单] %s 查开仓手续费失败（查单）：%s", thesis_id, e)
+        return 0.0
+    if od is None:
+        return 0.0
+    oid = str(getattr(od, "order_id", "") or "")
+    fee_fn = getattr(ex, "_commission_of", None)
+    if not oid or fee_fn is None:
+        return 0.0
+    try:
+        fee = abs(float(await fee_fn(oid) or 0.0))
+    except Exception as e:
+        logger.warning("[挂单] %s 查开仓手续费失败：%s", thesis_id, e)
+        return 0.0
+    return fee
+
 
 class DecisionEngine:
     def __init__(self, cfg, feed, executor, tdb: TradeDB, guard=None,
-                 settings=None):
+                 settings=None, pending_store=None, pending_lines=None,
+                 pending_dry_run=None, pending_kbar=None,
+                 pending_source=None):
         self.cfg = cfg
         # 4 个仓位参数（本金/风险%/杠杆/保证金上限）的唯一来源是 Web 配置库。
         # 不传就当没有：宁可按"参数缺失"拒绝开仓，也不按硬编码默认值下单。
         self.settings = settings
+        # ---- 挂单策略（strategy="pending"）的三个依赖 ----
+        #: 预期（thesis）的持久化仓库。没有它就**不能**跑 pending：
+        #: 状态机每根 5m 往前推一次，两次推之间进程可能重启，
+        #: 局部变量活不过重启，而交易所那头挂着的单还活着。
+        self.pending = pending_store
+        #: 返回当前 `LineBook` 的可调用对象（ema20 等线值来自 kbar 库）。
+        #: 不注入时用空 LineBook：reversal 家族不需要线，
+        #: trend 家族的失效判定会因此恒不成立 —— 见 `_step_pending` 里的告警。
+        self.pending_lines = pending_lines
+        #: ★ S5 现实跟随出场的 K 线演化视图（`ts -> {label, side, vol_rel}`）。
+        #:
+        #: 它必须被**注入**，不能在引擎里直接读 `kbar.db`：
+        #: 回放和实盘必须走同一条取值路径，否则回测里闸会响、实盘里不会，
+        #: 而两边都不报错。
+        self.pending_kbar = pending_kbar
+        #: kbar 没接线的告警只报一次（道理同 `_pending_warn_once`）。
+        self._pending_kbar_warned = False
+        #: ★ 计划源：`(params) -> (plans, stats)`。没它就**永远不会有新计划**。
+        #:
+        #: 引擎本身只推进**已存在**的预期。没有计划源，
+        #: 它会完美地管理一个空集合 —— 日志正常、看板正常、
+        #: 永远不下单，而“没信号”和“没源头”在事后一样。
+        self.pending_source = pending_source
+        self._pending_source_warned = False
+        #: 上次采集是哪一根 15m（避免每根 5m 都扫一遍全库）。
+        self._pending_harvest_ts = 0
+        #: 「只出计划不挂单」。None = 按配置取；显式 True/False 优先（测试用）。
+        self._pending_dry = pending_dry_run
+        #: 上次推进到哪一根 5m（毫秒开盘时刻）。0 = 还没推过。
+        self._pending_5m_ts = 0
+        #: pending 未接线的告警只报一次，避免每根 3s K 线刷屏。
+        self._pending_warned = False
         self.tcfg = cfg.trading
         self.feed = feed
         self.ex = executor
@@ -34,12 +357,42 @@ class DecisionEngine:
         self.guard = guard
         self.risk = RiskState()
         self.pos: Optional[dict] = None
+        # ★ 接管来的人工仓，与系统仓**分开记账**（2026-11-24，用户要求）。
+        #
+        #   币安永续一个品种只有一个**净持仓**，交易所分不清这手是谁开的。
+        #   所以「谁的仓」这件事只能由引擎自己拆开记：
+        #       self.pos         = 系统仓（挂单成交 / 趋势 / 剥头皮开的）
+        #       self.adopted_pos = 接管来的人工仓（open_reason=ADOPT_REASON）
+        #
+        #   为什么必须拆（而不是合成一个仓位）：
+        #     用户 2026-11-24 明确要求「已存在的单子是系统单子，属于加仓行为，
+        #     当然要执行」。系统单成交 = 加仓，但**不能把人工那部分吞掉**。
+        #     合并成一个 dict 时，成交落账会拿账户净量覆盖整笔仓
+        #     （`_pending_book_fill` 旧写法正是这样），人工仓的来历、
+        #     入场价、它自己的止损同时消失 —— 那是 11-24 事故的同一族缺陷。
+        #   拆开之后每条规则只看得见自己的那份，谁也不能替对方做决定。
+        self.adopted_pos: Optional[dict] = None
         self._lock = asyncio.Lock()
         self._seq = 0
         self.decisions = 0
         self.block_stats = {}
         self._last_bar_time = 0
         self.last_decision: Optional[dict] = None
+        # ★ BUS-B：最近一次出站路由的结果（`RouteResult`）。
+        #
+        # 为什么要把它留在引擎上：路由层知道**具体是哪道闸**拦下了一笔开仓、
+        # 理由是什么，但 `_pending_place()` 只把 `bool` 交回上层 ——
+        # 于是"被安全闸拦住"这个事实只活在 `risk_events` 里，
+        # `decisions` 上看到的是「等触发价」。用户盯着决策流会以为系统在等价格，
+        # 实际上它被闸门挡着，而且可能一整晚都不会动。
+        #
+        # 这正是用户反复要求的那种诚实：「系统在做什么、为什么没做」。
+        # 拒绝必须成为一条**决策**，不是一条只有日志能看见的 side effect。
+        self._last_route = None
+        # ★ BUS-C 观察期状态：上次对照的 15m 桶、上次 guard 的判断。
+        #   只用于节流与"仓位消失后补判分歧"，不参与任何交易决策。
+        self._guard_obs_ts = 0
+        self._guard_obs_last = None
         self.last_error = ""
         # 错误发生的时刻。只存文本不存时间是个陷阱：一旦写入就永久留着，
         # 于是"三天前网络抖了一下"和"刚刚引擎挂了"在看板上长得一模一样。
@@ -60,13 +413,27 @@ class DecisionEngine:
         self._close_retry_ts = 0
         self._last_reconcile_ms = 0  # 上次实盘对账时间（周期对账用）
         self._trend_block_bar = 0    # 本根 4h 内禁止再入场（止损后防死循环）
+        # 挂单对账的重入锁。和 _ledger_busy 同一个用意：首次对账可能要
+        # 逐张查询 vanished 的单，耗时不短，两个周期叠在一起会把同一批单
+        # 重复写库（虽然 upsert 幂等，但日志和 risk 事件会刷两遍）。
+        self._orders_busy = False
 
-    def _fallback_stop(self, side: str, entry: float) -> float:
-        """持仓缺少止损价时，按趋势熔断比例重算一个，并大声告警。
+    def _fallback_stop(self, side: str, entry: float,
+                       adopted: bool = False) -> float:
+        """持仓缺少止损价时重算一个，并大声告警。
 
         宁可给一个保守的保护，也不能留 0（=永不止损）。
         entry 也是 0 时返回 0，由调用方/对账逻辑处理——
         但那种情况下连成本基准都没有，属于必须人工介入的异常。
+
+        ★ `adopted` 区分两种仓（2026-11-24）：
+          人工仓（adopted=True）没有任何策略依据，唯一站得住的兜底是
+          「爆仓距离 / 安全倍数」—— 那个值在数学上保证先于爆仓触发。
+
+          策略仓仍用 `trend_stop_pct`：那是**已回测的策略参数**（1 倍杠杆
+          时代定的），我无权在这一轮把它悄悄改成 1.618% —— 那会把一个
+          从不触发的止损变成频繁触发的止损，等于换了策略。
+          但会检查它是否落在爆仓之外并报警（那种"保护"是假的）。
         """
         if entry <= 0:
             logger.critical("持仓缺少止损价且无开仓价，无法推算保护位，需人工介入")
@@ -75,15 +442,76 @@ class DecisionEngine:
         # 100U 账户终值 689U->559U）。所以它的 stop 合法地就是 0。
         # 硬塞一个 25% 进去等于给这个策略套上另一个没验证过的规则，
         # 而且会在大屏上把一个不存在的保护位显示成"已设好"。
-        if self._is_donchian():
+        if self._is_donchian() and not adopted:
             return 0.0
-        pct = float(self.tcfg.trend_stop_pct) / 100.0
-        stop = entry * (1 - pct) if side == "long" else entry * (1 + pct)
-        logger.critical("持仓缺少止损价（脏数据），按开仓价 %.1f 与熔断 %.0f%% 重算为 %.1f",
-                        entry, self.tcfg.trend_stop_pct, stop)
-        self.db.log_risk("stop_missing",
-                         "持仓无止损价，已按 %.0f%% 重算为 %.1f" % (self.tcfg.trend_stop_pct, stop))
+        if adopted:
+            pct = self._stop_distance_pct(entry)
+            if pct <= 0:
+                pct = float(self.tcfg.trend_stop_pct)
+                logger.error("人工仓缺少止损价且算不出安全距离，退回 %.2f%%", pct)
+            why = "人工仓无止损价，按爆仓距离推导的 %.3f%%" % pct
+        else:
+            pct = float(self.tcfg.trend_stop_pct)
+            why = "持仓无止损价，按熔断 %.0f%%" % pct
+        stop = (entry * (1 - pct / 100.0) if side == "long"
+                else entry * (1 + pct / 100.0))
+        logger.critical("%s重算为 %.1f（入场 %.1f）", why, stop, entry)
+        try:
+            self.db.log_risk("stop_missing",
+                             "%s 重算为 %.1f" % (why, stop))
+        except Exception:
+            pass
+        # ★ 补一道告警：算出来的止损如果还在爆仓价之外，它就是个假保护。
+        #   策略仓这里**只报不改**（参数是回测出来的，改动需另行裁决）。
+        self._warn_if_stop_unreachable(side, entry, stop)
         return stop
+
+    def _liq_distance_pct(self) -> float:
+        """爆仓距离（价格 %）。算不出返回 0。
+
+        公式与配置页同源：`sizing.derive().liq_distance_pct`。
+        22x + 维持保证金 0.5% -> (1/22 - 0.005)*100 = 4.045%
+        """
+        params = self._sizing_params()
+        if params is None:
+            return 0.0
+        try:
+            from .sizing import SizingConfig, derive
+            c = SizingConfig(
+                capital=float(params.get("sizing.capital", 0.0) or 0.0),
+                risk_pct=float(params.get("sizing.risk_pct", 0.0) or 1.0),
+                leverage=float(params.get("sizing.leverage", 0.0) or 0.0))
+            return float(derive(c).liq_distance_pct)
+        except Exception:
+            logger.warning("算爆仓距离失败", exc_info=True)
+            return 0.0
+
+    def _warn_if_stop_unreachable(self, side: str, entry: float,
+                                  stop: float) -> bool:
+        """止损是否落在爆仓价之外（= 永远不会触发）。是则告警并返回 True。
+
+        这就是 `position_guard.py:440` 那条不变量
+        「止损必须落在爆仓价的安全一侧，否则止损永远不会先触发」——
+        它早就写好了，但引擎从来没接（`check_invariants` 零调用）。
+        这里至少先把它变成**可见的告警**，不让假保护静默存在。
+        """
+        liq_pct = self._liq_distance_pct()
+        if liq_pct <= 0 or entry <= 0 or stop <= 0:
+            return False
+        long_side = norm_side(side) == "long"
+        # 止损距离与爆仓距离都取绝对值比较，多空共用一套
+        stop_pct = abs(entry - stop) / entry * 100.0
+        if stop_pct <= liq_pct + 1e-9:
+            return False
+        msg = ("%s止损 %.4f 距入场 %.3f%%，而爆仓距离只有 %.3f%% —— "
+               "这个止损永远不会触发（价格先爆仓）。止损位是假的保护"
+               % ("多单" if long_side else "空单", stop, stop_pct, liq_pct))
+        logger.critical(msg)
+        try:
+            self.db.log_risk("stop_beyond_liquidation", msg[:300])
+        except Exception:
+            pass
+        return True
 
     # ---------------- 生命周期 ----------------
     def _restore_close_fail_count(self) -> None:
@@ -170,46 +598,95 @@ class DecisionEngine:
         # 平仓失败计数有两份副本（engine 的和 Guard 的），第 127 轮只落了
         # Guard 那份。这里让引擎启动时【采纳】Guard 的值，两份才不会再各说各话。
         self._restore_close_fail_count()
-        open_trade = self.db.open_trade()
-        if open_trade:
-            self.pos = {
-                "side": open_trade["side"],
-                "qty": open_trade["qty"],
-                "entry": open_trade["entry_price"],
-                # 止损价绝不能是 0。0 的含义是"价格跌到 0 才止损"，
-                # 等于这道保护静默消失，仓位会一直挂到跌破 SMA 才出场。
-                # 脏数据（早期 bug 遗留、人工插入）真的会出现这一列是 NULL 的情况，
-                # 事故 2 只修了 reconcile_live 的接管路径，attach() 这条被漏掉了。
-                "stop": (open_trade["stop_price"] or 0.0) or self._fallback_stop(
-                    open_trade["side"], float(open_trade["entry_price"] or 0.0)),
-                "target": open_trade["target_price"] or 0.0,
-                "entry_ts": open_trade["entry_ts"],
-                # 按时间推算已走过的 3s 根数，避免重启把超时计时清零
-                "bars": max(0, int((int(time.time() * 1000) - open_trade["entry_ts"]) / 3000)),
-                "best": open_trade["entry_price"],
-                "trade_id": open_trade["id"],
-                # 必须用开仓时记录的值，不能用默认值：
-                # 2026-11-01 事故 —— 一笔按 18 小时设计的单在重启后被当成 600 根(30分钟)强平，
-                # 其间它本来还在正常轨道上。
-                "max_hold_bars": (open_trade.get("max_hold_bars")
-                                  or (10 ** 9 if self._is_chan()
-                                      else self.tcfg.max_hold_bars)),
-                "open_reason": open_trade["open_reason"],
-                # 必须带出来源的 paper 标记。
-                # reconcile_live() 关闭遗留持仓时要按它记账，以前那里写死 paper: 0，
-                # 于是纸面仓被记成真实交易，纸面/实盘两本账当场串掉。
-                "paper": int(open_trade.get("paper") or 0),
-                # 开仓手续费必须带回来。
-                # 2026-11-02 实测缺陷：这里以前没有 fee，于是
-                #   _close 里 fee_total = p.get("fee", 0.0) + fill.fee
-                # 把开仓费算成 0，记录的 pnl_net 只减了平仓费。
-                # 线上 4 笔剥头皮仓的缺口 7.77U 正是这么来的：
-                # 逐笔核对，每笔少的钱恰好等于它的开仓手续费。
-                # 危险之处在于方向——漏记成本永远是让亏损看起来更小，
-                # 也就是让策略看起来更赚钱，这会把纸面样本的证据价值直接毁掉。
-                "fee": float(open_trade.get("fee") or 0.0),
-            }
+        # ★ 重启恢复：两个来源都要恢复（2026-11-24 拆仓）。
+        #
+        #   以前只恢复 `open_trade()`（`ORDER BY id DESC LIMIT 1`）那一行。
+        #   现在账上可能同时开着「系统仓」和「接管的人工仓」，只取最新一行
+        #   必然丢掉其中一个来源 —— 而丢哪个取决于 id 顺序，等于让重启随机
+        #   改变归属。所以这里取**全部**未平仓记录，按 open_reason 分别归位。
+        try:
+            _open_rows = self.db.open_trades(limit=5)
+        except AttributeError:            # 测试替身/旧库没有复数接口
+            _r0 = self.db.open_trade()
+            _open_rows = [_r0] if _r0 else []
+        _restored_sys = None
+        for _row in _open_rows:
+            _built = self._pos_from_row(_row)
+            if str(_row.get("open_reason") or "").strip() == ADOPT_REASON:
+                if self.adopted_pos is None:
+                    self.adopted_pos = _built
+                    logger.warning("恢复【接管的人工仓】: %s", self.adopted_pos)
+                else:
+                    logger.error("恢复时发现第二笔接管仓，只保留最新一笔：id=%s",
+                                 _row.get("id"))
+            else:
+                if _restored_sys is None:
+                    _restored_sys = _built
+                else:
+                    logger.error("恢复时发现第二笔系统仓，只保留最新一笔：id=%s",
+                                 _row.get("id"))
+        self.pos = _restored_sys
+        if self.pos:
             logger.info("恢复未平仓持仓: %s", self.pos)
+
+    def _pos_from_row(self, open_trade: dict) -> dict:
+        """把 `trades` 的一行还原成引擎内存里的持仓 dict。
+
+        ★ 提成独立函数是必须的：`attach()`（重启恢复）和
+          `_reconcile_positions()`（接管/平账）都要按同一套字段构造仓位。
+          以前这段构造逻辑只散落在 attach() 里，谁再写一份就又是一次
+          「同一件事两个来源」。
+        """
+        entry = float(open_trade.get("entry_price") or 0.0)
+        stop = float(open_trade.get("stop_price") or 0.0)
+        # 这一行是「对账接管的人工仓」吗？决定缺止损时用哪个口径重算：
+        # 人工仓没有策略依据 -> 用爆仓距离推导的安全止损；
+        # 策略仓 -> 仍用已回测的 trend_stop_pct。
+        _is_adopted_row = (str(open_trade.get("open_reason") or "").strip()
+                           == ADOPT_REASON)
+        if stop <= 0:
+            # 止损价绝不能是 0。0 的含义是"价格跌到 0 才止损"，
+            # 等于这道保护静默消失，仓位会一直挂到跌破 SMA 才出场。
+            # 脏数据（早期 bug 遗留、人工插入）真的会出现这一列是 NULL 的情况，
+            # 事故 2 只修了 reconcile_live 的接管路径，attach() 这条被漏掉了。
+            stop = self._fallback_stop(open_trade.get("side"), entry,
+                                       adopted=_is_adopted_row)
+        if stop > 0:
+            # 恢复出来的止损也要过一遍「是否还在爆仓之内」的检查：
+            # 库里可能躺着一条 22 倍杠杆下永远触发不了的止损。
+            self._warn_if_stop_unreachable(open_trade.get("side"), entry, stop)
+        return {
+            "side": open_trade["side"],
+            "qty": open_trade["qty"],
+            "entry": open_trade.get("entry_price"),
+            "stop": stop,
+            "target": open_trade.get("target_price") or 0.0,
+            "entry_ts": open_trade.get("entry_ts"),
+            # 按时间推算已走过的 3s 根数，避免重启把超时计时清零
+            "bars": max(0, int((int(time.time() * 1000)
+                                - int(open_trade.get("entry_ts") or 0)) / 3000)),
+            "best": entry,
+            "worst": entry,
+            "trade_id": open_trade.get("id"),
+            # 必须用开仓时记录的值，不能用默认值：
+            # 2026-11-01 事故 —— 一笔按 18 小时设计的单在重启后被当成 600 根(30分钟)强平，
+            # 其间它本来还在正常轨道上。
+            "max_hold_bars": int(open_trade.get("max_hold_bars") or 10 ** 9),
+            "open_reason": open_trade.get("open_reason") or "",
+            # 必须带出来源的 paper 标记。
+            # reconcile_live() 关闭遗留持仓时要按它记账，以前那里写死 paper: 0，
+            # 于是纸面仓被记成真实交易，纸面/实盘两本账当场串掉。
+            "paper": int(open_trade.get("paper") or 0),
+            # 开仓手续费必须带回来。
+            # 2026-11-02 实测缺陷：这里以前没有 fee，于是
+            #   _close 里 fee_total = p.get("fee", 0.0) + fill.fee
+            # 把开仓费算成 0，记录的 pnl_net 只减了平仓费。
+            # 线上 4 笔剥头皮仓的缺口 7.77U 正是这么来的：
+            # 逐笔核对，每笔少的钱恰好等于它的开仓手续费。
+            # 危险之处在于方向——漏记成本永远是让亏损看起来更小，
+            # 也就是让策略看起来更赚钱，这会把纸面样本的证据价值直接毁掉。
+            "fee": float(open_trade.get("fee") or 0.0),
+        }
 
     async def _cost_basis_from_trades(self, ex_qty: float) -> float:
         """用真实成交记录推算持仓成本。拿不到或不自洽时返回 0。
@@ -240,6 +717,178 @@ class DecisionEngine:
         return avg
 
     async def reconcile_live(self) -> None:
+        """实盘对账 + 顺手抓一次真账（第 130 轮）。
+
+        为什么要包一层而不是在原方法末尾加一句：原方法在"对账通过"时
+        **提前 return**（那是绝大多数情况），末尾那句永远执行不到——
+        结果就是只在账实不符时才抓真账，正好反了。
+
+        真账同步放在 finally 里：对账本身抛异常时也要抓一次。
+        _sync_live_ledger() 内部兜住了所有异常，所以它不会改变
+        对账的成败，也不会吞掉对账自己的异常。
+        """
+        try:
+            await self._reconcile_positions()
+        finally:
+            await self._sync_live_ledger()
+            # 挂单对账放在最后：它依赖真实持仓已经对齐（"这个止损单
+            # 属于哪一笔仓"要先知道仓是多少），而且它自己会再查一次
+            # 交易所状态。
+            await self._sync_working_orders()
+
+    async def _sync_working_orders(self) -> None:
+        """把本地挂单账和交易所对齐（第 131 轮）。
+
+        没有这一步的话，P0–P2 建的东西全是死的：`working_orders` 表不会被
+        填，「交易所有、本地没有」的单永远不会被补进来。而这张表唯一的价值
+        恰恰就是重启之后还能知道自己挂过什么。
+
+        三个方向都要走通：
+
+        1. **交易所有、本地没有** → 补进来。
+           漏掉它的后果不是"少一条记录"，而是引擎不知道自己还挂着一张止损单，
+           于是再挂一张 → 同一笔仓两个止损 → 先触发的平掉大部分仓，
+           后触发的那张把剩仓**反向开出去**。
+        2. **本地有、交易所没有** → 先标 LOST，再逐张 `query_order()` 查真实终态。
+           LOST 只是"我这儿认为它还挂着，交易所那儿查不到"这个中间态，
+           **不是结论**。它可能是已经成交了（那就是一笔真实成交，持仓变了、
+           账要记），也可能被手工撤了。直接当"没有"会把已成交的单当成不存在，
+           账面上少一笔真实的平仓。
+        3. **两边都有但状态不同** → 用交易所的覆盖。
+
+        失败只记日志和 risk，绝不冒泡：拿不到挂单列表时，沿用本地账
+        比"对账失败导致整个 reconcile_live 抛出去"安全得多 ——
+        后者的后果是持仓对账也一并失败（在同一个 try 里）。
+        """
+        tdb = getattr(self, "db", None)
+        ex = getattr(self, "ex", None)
+        if tdb is None or ex is None:
+            return
+        # 现货执行器没有挂单接口；纸面执行器更没有。
+        # 用 hasattr 而不是 try/except AttributeError：后者会把 open_orders
+        # 内部的真故障也当成"这个执行器不支持"吞掉。
+        # ★ 2026-11-17：判据从 `hasattr` 换成**能力标记**。
+        #
+        #   基类现在声明了 `open_orders`（否则「纸面没有挂单」只能等生产发现），
+        #   于是 `hasattr` 恒为真 —— 现货执行器被当成支持挂单，
+        #   启动对账抛 `SpotExecutor 不支持查挂单列表`，写出一条假的
+        #   `orders_fetch_failed`，而哨兵正是靠「risk_events 为空」判健康的。
+        #   `supports_pending=False` + `hasattr` 兜底：鸭子类型的测试替身
+        #   （只实现方法、不设标记）仍然照旧能跑。
+        if not (hasattr(ex, "open_orders")
+                and getattr(ex, "supports_pending", True)):
+            return
+        if getattr(self, "_orders_busy", False):
+            return
+        self._orders_busy = True
+        try:
+            try:
+                remote = await ex.open_orders()
+            except Exception as e:
+                logger.error("拉挂单列表失败，本轮沿用本地账：%s", e)
+                tdb.log_risk("orders_fetch_failed", str(e)[:200])
+                return
+
+            local = tdb.working_orders()
+            res = reconcile_orders(local, remote)
+            out = tdb.apply_order_reconciliation(res)
+
+            # `vanished` 必须逐张查清真实终态 —— 见上面第 2 点。
+            settled = await self._resolve_vanished(res.get("vanished") or [])
+
+            logger.info("[挂单] 对账：交易所 %d 张 / 本地 %d 张 → "
+                        "补 %d、变 %d、一致 %d、查不到 %d（其中查清 %d）",
+                        len(remote), len(local), out["adopted"], out["changed"],
+                        out["same"], out["lost"], settled)
+            if out["adopted"]:
+                # 补进来的单必须是显眼的：它们意味着上一次退出时本地账
+                # 和交易所就已经不一致了，那是一次没被发现的异常。
+                logger.warning("[挂单] 从交易所补回 %d 张本地不知道的挂单", out["adopted"])
+                tdb.log_risk("orders_adopted", "从交易所补回 %d 张挂单" % out["adopted"])
+        except Exception as e:
+            logger.error("挂单对账失败（不影响交易）", exc_info=True)
+            # P3 的验收写的是「失败只记 risk 和日志」—— 只写日志不够：
+            # 这条 except 会把**任何**实现缺陷吞成一行 ERROR（第 131 轮就是
+            # PendingOrder/dict 接口断裂在这里静默消失了十几分钟，
+            # 表面上"对账跑了"，实际一张单都没对上）。落一条 risk 事件，
+            # 看板和 risk_events 里才查得出来。
+            try:
+                tdb.log_risk("orders_sync_failed", str(e)[:200])
+            except Exception:
+                pass
+        finally:
+            self._orders_busy = False
+
+    async def _resolve_vanished(self, vanished) -> int:
+        """对「本地认为挂着、交易所查不到」的单逐张查真实终态。返回查清的张数。
+
+        查清之后落到本地账上的状态才有意义：
+          * FILLED          → 这张单真的成交过，持仓已经变了
+          * CANCELED        → 被撤了（可能是手工撤的）
+          * 查不到 / 报错   → 保持 LOST。**不要**改写成 CANCELED：
+            把"不知道"写成"已撤销"是这里最容易犯的错，它会让一张
+            可能已经成交的单从此消失。
+        """
+        tdb = getattr(self, "db", None)
+        ex = getattr(self, "ex", None)
+        if tdb is None or ex is None or not vanished:
+            return 0
+        if not hasattr(ex, "query_order"):
+            return 0
+        done = 0
+        for o in vanished:
+            cid = o.get("client_order_id") or ""
+            oid = o.get("exchange_order_id") or ""
+            try:
+                cur = await ex.query_order(order_id=oid, client_id=cid)
+            except Exception as e:
+                logger.warning("[挂单] 查 %s 真实状态失败：%s", cid, e)
+                continue
+            if cur is None:
+                # 查不到就保持 LOST —— 不改写、不删除。
+                continue
+            st = str(getattr(cur, "status", "") or "")
+            if not st:
+                continue
+            row = dict(o)
+            row["status"] = st
+            row["executed_qty"] = float(getattr(cur, "executed_qty", 0) or 0)
+            row["avg_price"] = float(getattr(cur, "avg_price", 0) or 0)
+            row["exchange_order_id"] = str(getattr(cur, "order_id", "") or oid)
+            row["updated_ts"] = int(time.time() * 1000)
+            row["synced_ts"] = row["updated_ts"]
+            if st == "FILLED":
+                row["note"] = (o.get("note") or "") + " | 对账查清：已成交"
+                logger.warning("[挂单] %s 本地以为挂着，实际已成交 %.6f @ %.2f",
+                               cid, row["executed_qty"], row["avg_price"])
+            else:
+                row["note"] = (o.get("note") or "") + " | 对账查清：%s" % st
+            tdb.upsert_working_orders([row])
+            done += 1
+        return done
+
+    async def _classify_position_delta(self, delta: float):
+        """查交易所成交，判这次错配是「人工仓」还是「我们丢了成交回报」。
+
+        返回 ``(结论, 用到的成交)``。三个**保守**决定：
+
+          * 执行器不支持查成交历史（纸面/现货）→ unknown → 照旧硬停
+          * 查失败（网络/签名/限频）→ unknown → 照旧硬停
+          * 7 天成交凑不出差额 → unknown → 照旧硬停
+
+        绝不因为「查不到」就放宽：放宽等于赌没人动过仓位。
+        """
+        ex = getattr(self, "ex", None)
+        if ex is None or not getattr(ex, "supports_fill_history", False):
+            return PROV_UNKNOWN, []
+        try:
+            fills = await ex.recent_fills()
+        except Exception as e:
+            logger.warning("[对账] 查成交历史失败，按未知处理（仍会硬停）：%s", e)
+            return PROV_UNKNOWN, []
+        return classify_delta(fills, delta)
+
+    async def _reconcile_positions(self) -> None:
         """实盘启动对账：数据库记的和交易所实际持仓必须一致，不一致以交易所为准。
 
         为什么必须以交易所为准：数据库只是一份记账，钱和仓在交易所手里。
@@ -255,9 +904,14 @@ class DecisionEngine:
             self.last_error = "对账失败：" + str(e)[:120]
             self.last_error_ts = int(time.time() * 1000)
             return
+        # ★ 2026-11-24 拆仓后：数据库这边的"应有多少仓"是**两个来源之和**。
+        #   交易所只有净持仓，所以对账必须比「系统仓 + 人工仓」的和，
+        #   否则一旦两个来源同时存在，每一轮对账都会判成不一致。
         db_qty = 0.0
         db_side = ""
-        if self.pos:
+        for _slot in (self.pos, self.adopted_pos):
+            if not _slot:
+                continue
             # 必须把开仓时接管的零头算进来。
             #
             # 现货账上的余额 = 持仓 + 零头（零头在 _open 里被认领进 pos["dust"]，
@@ -269,10 +923,14 @@ class DecisionEngine:
             #
             # 实测：开仓后账上 0.00126746、pos["qty"] 0.00125874、dust 0.00000872；
             # 对账一次之后 dust 键消失、pos["qty"] 变成 0.00126746。
-            db_own = float(self.pos["qty"]) + float(self.pos.get("dust") or 0.0)
-            db_qty = db_own * (1 if self.pos["side"] == "long" else -1)
-            db_side = self.pos["side"]
+            _own = float(_slot["qty"]) + float(_slot.get("dust") or 0.0)
+            db_qty += _own * (1 if self._norm_side(_slot["side"]) == "long" else -1)
+            db_side = _slot["side"] if not db_side else (
+                db_side if db_side == _slot["side"] else db_side + "/" + _slot["side"])
         ex_qty = float(actual["qty"])
+        # 分流结论的跨分支载体：else-分支里算一次，硬停块复用（见那里的注释）。
+        prov_pre = None
+        used_pre = ()
 
         if abs(ex_qty - db_qty) < 1e-9:
             logger.info("实盘对账通过：持仓 %+.6f 与数据库一致", ex_qty)
@@ -308,41 +966,154 @@ class DecisionEngine:
         logger.critical("实盘对账不一致：数据库 %+.6f(%s)，交易所 %+.6f —— 以交易所为准",
                         db_qty, db_side or "空仓", ex_qty)
         if abs(ex_qty) < 1e-9:
-            # 交易所空仓但数据库有仓：把数据库的仓标记为已平
-            if self.pos:
+            # 交易所空仓但数据库有仓：把**两个来源**都标记为已平。
+            #
+            # ★ 两个都要关（2026-11-24 拆仓）：漏掉一个的后果不是"少一条记录"，
+            #   而是重启之后那一笔会被当成"交易所有仓、我们没有" —— 于是
+            #   系统仓被重新接管成人工仓，归因再次串掉。
+            for _which in ("pos", "adopted"):
+                _slot = getattr(self, "adopted_pos" if _which == "adopted" else "pos")
+                if not _slot:
+                    continue
                 self.db.close_trade({
-                    "symbol": self.tcfg.symbol, "side": self.pos["side"],
-                    "qty": self.pos["qty"], "entry_ts": self.pos["entry_ts"],
-                    "entry_price": self.pos["entry"], "exit_ts": int(time.time() * 1000),
-                    "exit_price": float(actual.get("entry") or self.pos["entry"]),
-                    "stop_price": self.pos["stop"], "target_price": self.pos["target"],
+                    "symbol": self.tcfg.symbol, "side": _slot["side"],
+                    "qty": _slot["qty"], "entry_ts": _slot["entry_ts"],
+                    "entry_price": _slot["entry"], "exit_ts": int(time.time() * 1000),
+                    "exit_price": float(actual.get("entry") or _slot["entry"]),
+                    "stop_price": _slot["stop"], "target_price": _slot["target"],
                     "pnl_gross": 0.0, "fee": 0.0, "pnl_net": 0.0, "mfe": 0.0, "mae": 0.0,
-                    "open_reason": self.pos.get("open_reason", ""),
+                    "open_reason": _slot.get("open_reason", ""),
                     "close_reason": "实盘对账：交易所已无此仓",
                     # 按这笔仓【原本】的来历记账，不能一律记成真实交易：
                     # 从纸面切到实盘后，库里遗留的纸面仓会走到这条路径。
-                    "paper": int(self.pos.get("paper") or 0)})
-                self.pos = None
-        else:
-            # 交易所有仓（可能是手工开的或上次没记上）：接管它
-            side = "long" if ex_qty > 0 else "short"
-            entry = float(actual.get("entry") or 0.0)
-            if entry <= 0:
-                # 现货查不到开仓价（交易所只记余额）。绝不能留 0：
-                # entry=0 会让止损价也变成 0，等于"永远满足止损"，一开机就把仓位平掉。
-                #
-                # 也不能随便拿当前市价顶替。举个真实的坏情况：
-                #   40000 买入 -> 进程崩了 -> 在 28000 重启。
-                #   拿 28000 当成本，止损就成了 21000——可这仓已经浮亏 30% 了，
-                #   而这道止损还要再跌 25% 才动，等于保护失效。
-                #   而且平仓时 pnl 按 28000 算，把真实亏损记小了，边际统计全废。
-                #
-                # 现货有 /api/v3/myTrades，能拿到真实成交。先用它算加权成本。
-                entry = await self._cost_basis_from_trades(ex_qty)
-                if entry > 0:
-                    logger.warning("交易所持仓 %+.6f 无开仓价（现货特性），"
-                                   "已按真实成交记录算出成本基准 %.1f", ex_qty, entry)
+                    "paper": int(_slot.get("paper") or 0)})
+                if _which == "adopted":
+                    self.adopted_pos = None
                 else:
+                    self.pos = None
+        else:
+            # 交易所有仓、而我们记的不一致。**先判这笔差额是谁造成的，
+            # 再决定怎么记账** —— 顺序反了就会把系统自己的漏账成交
+            # 记成人工仓（11-20 自检单成交没落账，就是这么被接管的）。
+            delta = ex_qty - db_qty
+            prov, used = await self._classify_position_delta(delta)
+            # ★ 无论判不判得出来源，**账都必须先修对**。
+            #
+            #   这里有过一个想当然的写法：只有 prov==MANUAL 才接管，
+            #   判不出来就不动账。那样 db_qty 会停在 0，引擎以为自己空仓 ——
+            #   交易所有真仓、本地没仓，等于仓位既没有止损、还可能再开一笔
+            #   叠加在上面。比"记错来源"危险得多。
+            #   所以：接管照做（本地认知必须等于交易所），
+            #   而"要不要停下来等人查"是下面硬停块单独的判断。
+            prov_pre, used_pre = prov, used
+            # ★★ 先把**与交易所方向相反的本地仓**关掉（账先修对）。
+            #
+            #   漏掉这一步的后果（2026-11-24 我重构时就漏过一次，
+            #   被 tests/test_equity_outage.py 逮住）：
+            #   库里记空头 -0.001、交易所是多头 +0.001，
+            #   于是同时留下「空头 0.001」和「接管多头 0.002」两笔账 ——
+            #   合计恰好等于交易所净量，对账反而显示"一致"，
+            #   但引擎实际持有一多一空两笔互相抵消的仓：
+            #   出场规则各自算各自的，止损/止盈全部错位。
+            #   交易所只有一个净持仓，本地账也**只能有一个方向**。
+            _ex_side = "long" if ex_qty > 0 else "short"
+            for _which in ("pos", "adopted"):
+                _slot = (self.adopted_pos if _which == "adopted" else self.pos)
+                if not _slot:
+                    continue
+                if self._norm_side(_slot.get("side")) == _ex_side:
+                    continue
+                logger.critical(
+                    "[对账] 本地 %s 仓与交易所方向相反（本地 %s %.6f / 交易所 %s），"
+                    "按交易所为准关账", _which, _slot.get("side"),
+                    float(_slot.get("qty") or 0.0), _ex_side)
+                try:
+                    self.db.close_trade({
+                        "symbol": self.tcfg.symbol, "side": _slot["side"],
+                        "qty": _slot["qty"], "entry_ts": _slot.get("entry_ts"),
+                        "entry_price": _slot.get("entry"),
+                        "exit_ts": int(time.time() * 1000),
+                        "exit_price": float(actual.get("entry") or _slot.get("entry") or 0.0),
+                        "stop_price": _slot.get("stop"),
+                        "target_price": _slot.get("target"),
+                        "pnl_gross": 0.0, "fee": 0.0, "pnl_net": 0.0,
+                        "mfe": 0.0, "mae": 0.0,
+                        "open_reason": _slot.get("open_reason", ""),
+                        "close_reason": "实盘对账：方向与交易所相反，按交易所为准",
+                        "paper": int(_slot.get("paper") or 0)})
+                except Exception:
+                    logger.error("[对账] 关账失败（方向冲突，继续）", exc_info=True)
+                if _which == "adopted":
+                    self.adopted_pos = None
+                else:
+                    self.pos = None
+            # 反向的账关完之后，本地剩下的都是同向仓，重算差额。
+            db_qty = 0.0
+            for _slot in (self.pos, self.adopted_pos):
+                if not _slot:
+                    continue
+                db_qty += (float(_slot["qty"]) + float(_slot.get("dust") or 0.0)) * (
+                    1 if _slot["side"] == "long" else -1)
+            delta = ex_qty - db_qty
+            # ★ "交易所比本地账少"必须用**符号关系**判，不能用 `delta < 0`：
+            #   空头仓 delta 天然是负数（ex=-0.00127、db=0 → delta=-0.00127），
+            #   用 sign(delta) 会把这笔正常的空头接管误判成"疑似部分被平"，
+            #   直接 return 掉 —— 引擎于是以为自己空仓，而交易所真有空头。
+            #   正确判据：本地账非空、且差额方向与交易所净持仓方向相反，
+            #   才说明「账上记的比交易所多」（被部分平/被强平）。
+            if db_qty != 0 and delta * ex_qty < 0:
+                # 交易所比本地账**少**：有人（或强平）平掉了一部分，而我们的账
+                # 还记着全额。不知道平了多少、什么价平的 → 不许猜。
+                _msg = ("实盘对账：交易所比本地账少 %.6f（本地 %+.6f / 交易所 %+.6f），"
+                        "疑似部分被平，需人工核查" % (abs(delta), db_qty, ex_qty))
+                logger.critical(_msg)
+                try:
+                    self.db.log_risk("position_shrunk_externally", _msg[:300])
+                except Exception:
+                    pass
+                if self.guard is not None:
+                    try:
+                        self.guard.position_mismatch(_msg)
+                    except Exception:
+                        logger.error("部分被平的告警通道失败（继续）", exc_info=True)
+                return
+            if abs(delta) < 1e-9:
+                return
+            if True:
+                # ---- §13.2：接管为【人工仓】----
+                side = "long" if delta > 0 else "short"
+                qty_delta = abs(delta)
+                # ★ 增量的入场价必须用**成交记录**加权算，
+                #   不能用 actual["entry"] —— 那是整笔净持仓的均价，
+                #   里面混着系统仓的成本。用它会把两个来源的成本再次搅在一起。
+                entry = 0.0
+                _wsum = 0.0
+                _wqty = 0.0
+                for f in (used or ()):
+                    _q = abs(float(f.get("qty") or 0.0))
+                    _p = float(f.get("price") or 0.0)
+                    if _q > 0 and _p > 0:
+                        _wsum += _p * _q
+                        _wqty += _q
+                if _wqty > 0:
+                    entry = _wsum / _wqty
+                    logger.info("[对账] 接管增量 %+.6f 的入场价按 %d 笔成交加权 = %.2f",
+                                delta, len(used or ()), entry)
+                if entry <= 0:
+                    # 成交里没有价（理论上不会）→ 退回交易所均价再退回现价
+                    entry = float(actual.get("entry") or 0.0)
+                if entry <= 0:
+                    # ★ 现货查不到开仓价（交易所只记余额），先用真实成交记录
+                    #   算加权成本。这一步**不能省**（2026-11-24 我重构时漏过一次，
+                    #   被 tests/test_takeover_no_entry.py 逮住）：少了它，
+                    #   接管成本会退回当前价，止损跟着挪到一个假成本上，
+                    #   而且平仓时算出的盈亏全按估算值结算，边际统计全废。
+                    entry = await self._cost_basis_from_trades(ex_qty)
+                    if entry > 0:
+                        logger.warning("交易所持仓 %+.6f 无开仓价（现货特性），"
+                                       "已按真实成交记录算出成本基准 %.1f",
+                                       ex_qty, entry)
+                if entry <= 0:
                     entry = float(self.feed.last_price or 0.0)
                     if entry > 0:
                         logger.critical(
@@ -355,57 +1126,119 @@ class DecisionEngine:
                                 "成交历史不可用，以现价 %.1f 接管 %.6f" % (entry, ex_qty))
                         except Exception:
                             pass
-            if entry <= 0:
-                logger.critical("接管持仓失败：既无开仓价也无行情价，放弃接管")
-                return
-            # 唐奇安没有硬停损，接管时同样不能凭空造一个——否则这个仓位
-            # 会被一条回测里不存在的规则提前砍掉，而看板还会显示"止损已设"。
-            if self._is_donchian():
-                stop = 0.0
-            else:
-                stop = (entry * (1 - self.tcfg.trend_stop_pct / 100.0) if side == "long"
-                        else entry * (1 + self.tcfg.trend_stop_pct / 100.0))
-            if self.pos:
-                self.db.close_trade({
-                    "symbol": self.tcfg.symbol, "side": self.pos["side"],
-                    "qty": self.pos["qty"], "entry_ts": self.pos["entry_ts"],
-                    "entry_price": self.pos["entry"], "exit_ts": int(time.time() * 1000),
-                    "exit_price": entry, "stop_price": self.pos["stop"],
-                    "target_price": self.pos["target"], "pnl_gross": 0.0, "fee": 0.0,
-                    "pnl_net": 0.0, "mfe": 0.0, "mae": 0.0,
-                    "open_reason": self.pos.get("open_reason", ""),
-                    "close_reason": "实盘对账：接管交易所实际持仓", "paper": 0})
-            # 这里必须是 log_trade（写入），不是 open_trade（读取未平仓记录）。
-            # 原先误写 open_trade(...) 并传了 dict，签名不匹配直接抛 TypeError，
-            # 而 reconcile_live() 的调用方吞掉了异常，结果是：
-            #   孤儿仓位每一轮都抛错、从不被真正接管，系统始终认为自己空仓，
-            #   然后在"有持仓"的状态下还可能再买一次。
-            # 这个错误只在【交易所有币、数据库没仓】时才触发，
-            # 正常流程不会走到——所以纸面跑了半个月也没暴露。
-            self.db.log_trade({
-                "symbol": self.tcfg.symbol, "side": side, "qty": abs(ex_qty),
-                "entry_ts": int(time.time() * 1000), "entry_price": entry,
-                "stop_price": stop, "target_price": 0.0,
-                "open_reason": "实盘对账接管", "paper": 0,
-                "strategy": self.tcfg.strategy,
-                "max_hold_bars": 10 ** 9 if self._is_chan()
-                else self.tcfg.max_hold_bars})
-            # log_trade 是异步入队，拿不到自增 id。趋势策略靠 SMA 出场，
-            # 不依赖 trade_id；这里保持 None 而不是编一个假 id。
-            tid = None
-            self.pos = {"side": side, "qty": abs(ex_qty), "entry": entry, "stop": stop,
-                    "worst": entry,
-                        "target": 0.0, "entry_ts": int(time.time() * 1000), "bars": 0,
-                        "best": entry, "trade_id": tid,
+                if entry <= 0:
+                    logger.critical("接管持仓失败：既无开仓价也无行情价，放弃接管")
+                    return
+                # ★ 接管的仓位【一律给一个真实的熔断止损】（第 129 轮）。
+                #
+                # 原来这里对唐奇安给 0.0，理由是"不能凭空造一条回测里不存在的规则"。
+                # 那个理由对【策略自己开的仓】成立，对【接管来的仓】不成立：
+                # 它不是回测里的任何一笔，本来就没有策略依据，也就谈不上"偏离回测"。
+                #
+                # 而 stop=0.0 的实际效果是 `price <= 0` 恒为假 —— 这笔仓完全没有兜底，
+                # 跌掉 90% 引擎也不会动一下，看板上还把 stop 显示成 0.0。
+                #
+                # 用户明确要求：人工仓不判策略出场，但要保留熔断止损。
+                #
+                # ★★ 2026-11-24 修正：**不能直接用 `trend_stop_pct` 当价格跌幅。**
+                #
+                #   生产实测（22 倍杠杆，0.032 BTC @ 60880，权益 114U）：
+                #       逐仓爆仓价 58356（距入场 4.15%）
+                #       旧止损     45660（距入场 25.00%）← trend_stop_pct 直接当价格 %
+                #   止损比爆仓价还低 12696 点 = 0.17 倍爆仓距离。
+                #   **价格永远先到 58356 爆仓，45660 一次都不可能触发。**
+                #   这不是"止损太远"，是一句永远不会兑现的话 ——
+                #   比没有止损更糟，因为看板上它显示成"保护已设好"。
+                #
+                #   歧义来自 `trend_leverage = 1.0` 的历史设计：1 倍杠杆下
+                #   「价格跌 25%」和「保证金亏 25%」是同一个数，两种理解
+                #   恰好等价，问题从未暴露。上了 22 倍杠杆才分家。
+                #
+                #   现在改成**唯一正确口径**：止损距离 = 爆仓距离 / 安全倍数
+                #   （`sizing.derive().max_stop_distance_pct`）。这个公式本来
+                #   就写在仓库里、给挂单策略用（1.618%），且天然满足
+                #   「止损永远先于爆仓」，不需要另立一套规则。
+                _stop_pct = self._stop_distance_pct(entry)
+                if _stop_pct <= 0:
+                    # 算不出来的唯一可能是仓位参数不可用。此时宁可沿用旧口径
+                    # 也不能给 0（0 = 永不止损），但必须喊出来。
+                    _stop_pct = float(self.tcfg.trend_stop_pct)
+                    logger.error(
+                        "接管仓算不出安全止损距离（仓位参数不可用），退回 "
+                        "trend_stop_pct=%.2f%%——这一笔的保护位可能晚于爆仓", _stop_pct)
+                    try:
+                        self.db.log_risk("adopted_stop_fallback",
+                                         "无法计算安全止损距离，退回 %.2f%%" % _stop_pct)
+                    except Exception:
+                        pass
+                stop = (entry * (1 - _stop_pct / 100.0) if side == "long"
+                        else entry * (1 + _stop_pct / 100.0))
+                logger.info(
+                    "[对账] 接管仓止损按爆仓距离推导：%.3f%%（入场 %.2f -> 止损 %.2f）",
+                    _stop_pct, entry, stop)
+                # ★ 合并规则：只允许同向累加（用户分几次加仓是正常的）；
+                #   反向意味着用户先平再反手，那是「关掉旧仓 + 开新仓」两件事，
+                #   不能用一次"合并"糊过去 —— 拒绝并交给人工。
+                if self.adopted_pos and self._norm_side(
+                        self.adopted_pos.get("side")) != side:
+                    _msg = ("实盘对账：人工仓方向变了（内存 %s %s / 交易所 %s %+.6f），"
+                            "拒绝自动合并，需人工核查"
+                            % (self.adopted_pos.get("side"),
+                               self.adopted_pos.get("qty"), side, delta))
+                    logger.critical(_msg)
+                    try:
+                        self.db.log_risk("adopted_side_flip", _msg[:300])
+                    except Exception:
+                        pass
+                    if self.guard is not None:
+                        try:
+                            self.guard.position_mismatch(_msg)
+                        except Exception:
+                            logger.error("方向冲突的告警通道失败（继续）", exc_info=True)
+                    return
+                # ★ 每笔接管都写一条独立的 trade 记录（不合并成一条），
+                #   溯源时才能看到"用户 19:39 买了多少、21:10 又加了多少"。
+                self.db.log_trade({
+                    "symbol": self.tcfg.symbol, "side": side, "qty": qty_delta,
+                    "entry_ts": int(time.time() * 1000), "entry_price": entry,
+                    "stop_price": stop, "target_price": 0.0,
+                    "open_reason": ADOPT_REASON, "paper": 0,
+                    "strategy": self.tcfg.strategy,
+                    "max_hold_bars": 10 ** 9 if self._is_chan()
+                    else self.tcfg.max_hold_bars})
+                _now = int(time.time() * 1000)
+                if self.adopted_pos:
+                    _oq = float(self.adopted_pos.get("qty") or 0.0)
+                    _oe = float(self.adopted_pos.get("entry") or 0.0)
+                    _nq = _oq + qty_delta
+                    self.adopted_pos["entry"] = (
+                        (_oe * _oq + entry * qty_delta) / _nq if _nq > 0 else entry)
+                    self.adopted_pos["qty"] = _nq
+                    logger.warning("[对账] 人工仓加仓：%.6f @ %.2f → 合计 %.6f，均价 %.2f",
+                                   qty_delta, entry, _nq, self.adopted_pos["entry"])
+                else:
+                    self.adopted_pos = {
+                        "side": side, "qty": qty_delta, "entry": entry,
+                        "stop": stop, "target": 0.0, "entry_ts": _now,
+                        "bars": 0, "best": entry, "worst": entry,
+                        "trade_id": None,
                         "max_hold_bars": 10 ** 9 if self._is_chan()
                         else self.tcfg.max_hold_bars,
-                        "open_reason": "实盘对账接管",
+                        "open_reason": ADOPT_REASON,
                         # 接管的仓位是交易所上本来就有的，它的开仓手续费
                         # 我们客观上不知道（可能是人工买的、或早于本系统上线）。
                         # 记 0 是诚实的下界，不是漏写——但代价是这笔的盈亏
                         # 会系统性偏乐观（少了开仓成本）。显式写出来，
                         # 免得以后有人看到缺项以为是 bug 又去改。
+                        #
+                        # 注意：这个 0 只影响【这一笔的入场成本】。
+                        # 平仓时 fill.fee 那一侧的手续费曾经因为 ACK 回报
+                        # 整段漏成 0（见 exchange/live.py 的 _fill_truth），
+                        # 那是另一个 bug，已单独修。
                         "fee": 0.0}
+                    logger.critical("[对账] 接管人工仓：%s %.6f @ %.2f（熔断 %.2f）",
+                                    side, qty_delta, entry, stop)
+
         # guard.notify 可能本身是 None：没配 AI_FEISHU_WEBHOOK 时
         # feishu_notifier() 返回 None，Guard 把它原样存进 self.notify。
         # Guard.alert() 里检查了这一点，但这里直接调用就会 TypeError，
@@ -429,17 +1262,124 @@ class DecisionEngine:
             why = ("实盘对账不一致：数据库 %+.6f(%s)，交易所 %+.6f —— "
                    "已按交易所修正，停止开新仓等待人工核查"
                    % (db_qty, db_side or "空仓", ex_qty))
-            self.guard.position_mismatch(why)
-            if self.guard.notify is not None:
-                self.guard.notify("实盘对账不一致，已按交易所持仓修正（详见日志）")
+            # ★ 这里曾经是 guard.notify("一句话") —— 少传一个参数（第 129 轮）。
+            #
+            # 生产上的 notifier 是 feishu_notifier() 返回的 _send(title, body)，
+            # 两个位置参数都必填，于是每一次"对账不一致"都在这里抛
+            #   feishu_notifier.<locals>._send() missing 1 required positional argument: 'body'
+            #
+            # 后果不是"少发一条消息"：异常直接冒泡出 reconcile_live()，
+            # 下面是 mark_reconciled()，再下面（周期对账）只会记一条
+            # reconcile_failed 就继续——等于每 5 分钟报一次错、什么都没修好。
+            # 生产实证：risk_events 里 16 条 reconcile_failed，全是这个字符串
+            # （11-11 14 次 + 11-12 2 次）。
+            #
+            # 为什么 position_mismatch(why) 自己够了、这条是多余的：
+            # 它内部走 _halt_hard -> _event(alert=True)，_event 里已经
+            # 用【正确的两个参数】发过飞书，而且已经 try/except 包好。
+            # 重复发一遍只会让同一件事在群里出现两次。
+            #
+            # 但"删掉多余的 notify"还不够：通知这条路以后换个实现
+            # （webhook 超时、DNS 失败、模板 KeyError）仍然可能抛，
+            # 而它【绝不能反过来把对账搞崩】——对账修的是本地账本，
+            # 是全系统唯一敢说"我到底有多少仓"的地方。
+            # 所以 position_mismatch 这一整段也兜住：账必须先修对。
+            #
+            # ★ 2026-11-19：硬停之前必须**先分清这笔错配是谁造成的**。
+            #
+            #   用户 2026-11-13 在手机上手工买了 0.15 BTC（harvest 到 four
+            #   次接管：0.06 → 0.09 → 0.12 → 0.15），系统每轮接管完就
+            #   position_mismatch() 硬停自己一次，而 kind="mismatch" **永不
+            #   自动解除** —— 于是那一次硬停一直挂到 11-19，期间策略再也
+            #   没有开过仓。用户的原话：「不带 AI- 的七笔单是我人工做的，
+            #   而且我还会持续做」。
+            #
+            #   这与 §13.2 的约定直接冲突：手工仓只接管、不判策略出场、
+            #   保留熔断止损，**不是故障**。所以这里按错配差额的**成交来源**
+            #   分流：差额全由系统外的成交解释 → 人工仓 → 只记事件+通知；
+            #   只要有一笔是我们自己的（`AI-` 前缀）→ 真漏账 → 照旧硬停；
+            #   查不到/凑不出差额 → unknown → 照旧硬停（保守，不猜）。
+            # ★ 分流结果在 else-分支里已经算过一次了（拆仓后接管前必须先判来源）。
+            #   这里复用，不重复查交易所成交：查两次不只浪费配额，
+            #   两次之间成交可能变化，会出现「接管用的是 A 结论、硬停用的是
+            #   B 结论」这种自相矛盾。
+            if prov_pre is None:
+                delta = ex_qty - db_qty
+                prov, used = await self._classify_position_delta(delta)
+            else:
+                prov, used = prov_pre, used_pre
+                delta = ex_qty - db_qty
+            if prov == PROV_MANUAL:
+                detail = ("已接管人工持仓：数据库 %+.6f(%s)，交易所 %+.6f，"
+                          "差额 %+.6f 全部来自 %d 笔系统外成交（%s~%s）"
+                          % (db_qty, db_side or "空仓", ex_qty, delta,
+                             len(used),
+                             _fmt_ms(used[-1]["ts"]) if used else "?",
+                             _fmt_ms(used[0]["ts"]) if used else "?"))
+                logger.warning("[对账] %s —— 按 §13.2 约定接管，"
+                               "不判策略出场、保留熔断止损，**不硬停**", detail)
+                try:
+                    self.db.log_risk("manual_position_adopted", detail)
+                except Exception:
+                    logger.error("人工仓事件落库失败（账已修正，继续）",
+                                 exc_info=True)
+                if self.guard is not None:
+                    try:
+                        self.guard.manual_position_adopted(detail)
+                    except Exception:
+                        logger.error("人工仓接管的通知通道失败（账已修正，继续）",
+                                     exc_info=True)
+            else:
+                if prov == PROV_UNKNOWN:
+                    logger.error("[对账] 无法判定差额 %+.6f 的来源"
+                                 "（成交历史不足或查询失败），按未知处理并硬停",
+                                 delta)
+                try:
+                    self.guard.position_mismatch(why)
+                except Exception:
+                    logger.error("对账不一致的告警通道失败（账已按交易所修正，继续）",
+                                 exc_info=True)
 
         # 对账已经完成，而且我们【已经站在趋势里】——没有"补上车"这回事了。
         # 不清这个标志的话它会一直挂着（接管路径不经过 _open，而 _open 才是
         # 正常清标志的地方），于是这笔仓一旦被 25% 熔断平掉、价格却还在
         # SMA 上方，startup_entry 会立刻把仓补回去，绕过
         # "必须等下一根 4h"的规则。止损后立刻重新进场是最坏的行为。
-        if self.pos and getattr(self.trend, "need_reconcile", False):
+        # ★ 判据必须包含人工仓（2026-11-24 拆仓）：
+        #   接管来的仓现在在 `self.adopted_pos` 里，只看 `self.pos` 会让
+        #   `need_reconcile` 永远挂着 —— 而那笔仓一旦被熔断平掉、
+        #   价格还在 SMA 上方，`startup_entry` 会立刻补回来，
+        #   绕过「必须等下一根 4h」。止损后立刻重新进场是最坏的行为。
+        if (self.pos or getattr(self, "adopted_pos", None)) \
+                and getattr(self.trend, "need_reconcile", False):
             self.trend.mark_reconciled()
+
+    async def _sync_live_ledger(self) -> None:
+        """抓真账（成交 → 回合 → 打分 → 落库）。失败只记日志。
+
+        单独抽成方法是为了让 reconcile_live() 里能一句调用，
+        也让 _close() 之后能复用同一段逻辑（平仓完立刻刷新，
+        否则用户要等最多 5 分钟才看见这一单）。
+        """
+        if getattr(self, "_ledger_busy", False):
+            return          # 上一轮还没跑完（首次同步可能要拉几次 K 线）
+        tdb = getattr(self, "db", None)
+        ex = getattr(self, "ex", None)
+        if tdb is None or ex is None:
+            return
+        if not hasattr(ex, "user_trades"):
+            return          # 现货执行器没有这个接口，跳过而不是报错
+        self._ledger_busy = True
+        try:
+            from ..live_ledger import sync as ledger_sync
+            r = await ledger_sync(ex, tdb)
+            logger.info("[真账] 成交 %d 笔 → 回合 %d 个（新算 %d 个）",
+                        r.get("fills", 0), r.get("rounds", 0),
+                        r.get("analyzed", 0))
+        except Exception:
+            logger.error("真账同步失败（不影响交易）", exc_info=True)
+        finally:
+            self._ledger_busy = False
 
     def _on_bar_sync(self, bars_by_iv, last_bar) -> None:
         """feed 的回调在事件循环里同步调用；这里只做调度，不阻塞采集。"""
@@ -583,6 +1523,36 @@ class DecisionEngine:
                     logger.error("周期对账失败，本轮沿用现有持仓认知：%s", e)
                     self.db.log_risk("reconcile_failed", str(e)[:200])
 
+        # ★★ BUS-C 观察期：让 `position_guard.decide()` 第一次在生产环境跑起来，
+        #    **只算不做**（分歧写 decision，绝不产生任何动作）。
+        #
+        #    为什么必须放在所有策略分流**之前**：趋势/挂单/剥头皮三条链各自
+        #    直接 return，钩子放在任何一个分支里都只覆盖一个策略。
+        #    而观察期要回答的问题是「守卫的 P0→P5 若接管出场，会和现有逻辑
+        #    分歧多少次」—— 只覆盖一条链，答案就是错的。
+        #
+        #    `position_guard.py` 是完整的持仓管理系统（P0 保命 → P1 止损 →
+        #    P2 结构 → P3 分批止盈 → P4 加仓 → P5 持有）+ `check_invariants`，
+        #    测试齐全，但**生产零调用**（grep check_invariants/GuardPosition
+        #    在引擎里 0 命中）。BUS-D 要把它接线成唯一的出场出口，
+        #    前提是先知道它和现状差多少。
+        #
+        # ★ F7（2026-11-24 审查）：观察者与人工仓必须用**同一个爆仓价来源**。
+        #   以前观察期用配置推算、人工仓用交易所真实 —— 同一个账户净仓
+        #   只有一个真实爆仓价，两套数字算出来的"缓冲几倍"不可比，
+        #   观察期的分歧统计就失去意义。这里先暖一次缓存（内部 5 分钟节流），
+        #   两个调用方随后都读 `_liq_cache`。
+        if self.pos and self.guard is not None:
+            try:
+                await self._live_liq_price()
+            except Exception as e:
+                logger.warning("[守卫] 预热真实爆仓价失败（本轮用推算值）：%s", e)
+        try:
+            self._guard_observe(bars_by_iv, price, now_ms)
+        except Exception as e:
+            # 观察者坏了绝不能影响交易。它是纯读的，最坏结果只是少一条对照记录。
+            logger.warning("[守卫观察] 本轮跳过（不影响交易）：%s", e)
+
         # 趋势策略走独立分支：它的开平仓条件、仓位算法、止损逻辑都和剥头皮不同，
         # 混在一条链上会让两边互相污染（而且剥头皮那套可达性门会直接拒掉趋势单）。
         #
@@ -596,8 +1566,72 @@ class DecisionEngine:
         #   实测：漏掉最好 1 笔进场 = 总收益少 46%，漏 5 笔 = 6.84 年白干。
         #   日亏损上限同样够不着：单笔最大亏损约 11%，两笔之间隔好几天。
         # 已有测试锁定此行为：tests/test_trend_risk_gate.py
+        # ★★ 人工仓（接管来的）的出场管理：**任何策略下、每个 tick 都必须跑**。
+        #
+        #   2026-11-24 拆仓后人工仓放在 `self.adopted_pos`，而
+        #   `_step_trend` / `_manage` / 剥头皮链全都只读 `self.pos`。
+        #   如果只在挂单链里管人工仓，那么把 strategy 换成趋势/剥头皮时，
+        #   人工仓就变成**没有任何人管出场**的裸仓 —— 比重构前更危险：
+        #   重构前它至少会被策略规则管（虽然用错了规则），
+        #   而现在连错的规则都轮不到它，熔断止损也不会执行。
+        #   tests/test_equity_outage.py 逮住的就是这个（该测试期望
+        #   「价格跌破后必须卖」而一笔卖单都没有）。
+        #
+        #   ★★ 2026-11-24 全链路审查（F2）：这里原来写着
+        #      `and not self._is_pending()`，理由是"挂单链自己会调用它，
+        #      避免同一根 K 判两次"。实际后果是 —— 生产跑的正是
+        #      `strategy=pending`，于是唯一的调用点在 `_step_pending` 里，
+        #      而那里**先过了 5m 节流才轮到它**（`ts <= self._pending_5m_ts` 就 return）。
+        #
+        #      也就是说：22 倍杠杆、止损 1.618% 的仓位，
+        #      **止损与爆仓保护每 5 分钟才判一次**，不是 3 秒。
+        #      BUS-D 之前这里只判"结构是否失效"，慢 5 分钟是判断迟滞；
+        #      BUS-D 之后这里扛着 P0 保命，慢 5 分钟就是真实的敞口。
+        #
+        #      修法不是"两个地方都跑"（那才是同一根 K 判两次），
+        #      而是**只留一个调用点，放在这里**：3 秒粒度、与策略无关、
+        #      `_step_pending` 不再调用它。
+        if self._is_adopted():
+            try:
+                _b15 = self._to_pending_bars((bars_by_iv or {}).get(900000))
+                await self._step_adopted_exit(bars_by_iv, _b15, price, now_ms,
+                                             log_quiet=True)
+            except Exception as e:
+                logger.error("[接管] 人工仓出场判断失败：%s", e, exc_info=True)
+                try:
+                    self.db.log_risk("adopted_exit_error", str(e)[:200])
+                except Exception:
+                    pass
+
         if self._is_chan():
             await self._step_trend(bars_by_iv, price, equity, now_ms)
+            return
+
+        # ★★ 挂单策略（strategy="pending"）必须**在**剥头皮链之前分流。
+        #
+        # 为什么这是一个安全问题的修复而不是加功能：
+        #   在 2026-11-17 之前，`strategy` 的白名单里已经有 "pending"，
+        #   但 `_step` 里没有任何 `_is_pending()` 分支 —— 于是配了 pending
+        #   的环境会**直接落进下面那段剥头皮逻辑**：3s 动量 + 可达性门，
+        #   那是一个已被回测证伪的负期望策略。
+        #   不报错、不告警，日志里能看到策略是 pending，实际跑的是 scalp。
+        #   这正是这个项目反复吃亏的「同一件事两个来源」的变体：
+        #   配置说 A，执行链不知道 A 的存在。
+        if self._is_pending():
+            await self._step_pending(bars_by_iv, price, equity, now_ms)
+            return
+
+        # ★ 只有人工仓、没有系统仓：**不许入场**（2026-11-24 拆仓）。
+        #   剥头皮/旧链同理：`self.pos` 为空不代表真的空仓，
+        #   人工仓的出路由 `_step_adopted_exit` 管，这里只挡开仓，
+        #   免得在用户的未验证仓位上再叠一笔系统仓。
+        if getattr(self, "adopted_pos", None) and not self.pos:
+            self._log_decision(
+                bars_by_iv, price, equity, now_ms, None, "hold",
+                "接管的人工仓在管（%s %.6f @ %.1f），不新开系统仓"
+                % (self.adopted_pos.get("side"),
+                   float(self.adopted_pos.get("qty") or 0.0),
+                   float(self.adopted_pos.get("entry") or 0.0)))
             return
 
         # 1) 有仓位 -> 只管仓位
@@ -830,7 +1864,21 @@ class DecisionEngine:
                                      "本地 %.1f / 交易所 %.1f，已忽略熔断" % (price, truth))
                     price = truth
             stop_hit = price <= p["stop"]
-            ex = self.trend.want_exit(price)
+            # ★ 接管来的仓【不判策略出场】（第 129 轮）。
+            #
+            # 判据见模块顶部 ADOPT_REASON 的注释：唐奇安的出场是
+            # 「1h 收盘跌破 M 根新低」，那是【策略自己的进场依据】的镜像。
+            # 一笔用户手工开的仓没有这个依据，用镜像规则去平它是无中生有。
+            #
+            # 实测（11-12）：用户 22:54 手工买入 0.05 BTC，22:57:51 被接管，
+            # 紧接着在同一秒被平掉——因为 21:00 那根 1h 早就收在 75 根新低下方，
+            # want_exit() 一看到 "below_lower 且 ready" 就成立。
+            # 也就是说：接管之后【第一个 tick】就出场，用户根本没有时间反应。
+            #
+            # 保留的是熔断止损（上面那一段）：那是「本金快要没了」的兜底，
+            # 不是策略判断。用户明确要求留它。
+            adopted = self._is_adopted()
+            ex = None if adopted else self.trend.want_exit(price)
             if stop_hit:
                 # 熔断出局后，同一根 4h 内不再进场：否则交叉信号仍成立，
                 # 会变成"止损->立即再进->再止损"的死循环。
@@ -862,7 +1910,14 @@ class DecisionEngine:
             st = self._chan_view(self.trend.state(price))
             # 唐奇安没有熔断止损（stop=0），这里若照抄"距熔断 X%"会算出
             # 一个 100% 的假数字。两种处境分开写，日志才说得清系统在做什么。
-            if self._is_donchian():
+            if adopted:
+                # 接管仓：绝不能照抄"出场线（下轨）距 X%"——那条线我们不判。
+                # 看板/日志说"距下轨 3%"会让人以为引擎随时会平，
+                # 而实际它不会动，除非跌到熔断止损。
+                tail = (u"人工仓·不判策略出场｜距熔断 %.1f%%"
+                        % ((price - p["stop"]) / price * 100) if p["stop"] > 0
+                        else u"人工仓·不判策略出场｜无熔断止损")
+            elif self._is_donchian():
                 tail = "出场线（下轨）%.1f，距 %.2f%%" % (
                     st.get("lower") or 0.0,
                     (price - (st.get("lower") or price)) / (st.get("lower") or price) * 100)
@@ -876,6 +1931,24 @@ class DecisionEngine:
                    else ("SMA%d" % st["lookback"]),
                    st["sma"] or 0, self._hold_phrase(st), tail),
                 gates=[], risk_info=self._pos_risk(price, equity))
+            return
+
+        # ★★ 只有人工仓、没有系统仓：**不许入场**（2026-11-24 拆仓）。
+        #
+        #   拆分之后 `self.pos` 只放系统仓，于是「人工仓在账上」这件事
+        #   在入场判断眼里等于空仓 —— 引擎会照着趋势信号再开一笔，
+        #   叠在用户的手工仓上。用户说的是「有人工单时不挂新单」，
+        #   而且从风险角度这也是错的：那笔人工仓没有策略依据，
+        #   在它上面加系统仓等于用一个未验证的仓位当基础放大敞口。
+        #   出场管理已经由 `_step` 里的 `_step_adopted_exit` 负责，这里只挡开仓。
+        if getattr(self, "adopted_pos", None):
+            _ap = self.adopted_pos
+            self._log_decision(
+                bars_by_iv, price, equity, now_ms, "trend_hold", "hold",
+                "接管的人工仓在管（%s %.3f @ %.1f），不新开系统仓"
+                % (_ap.get("side"), float(_ap.get("qty") or 0.0),
+                   float(_ap.get("entry") or 0.0)),
+                gates=[], risk_info=None)
             return
 
         # 数据源 DOWN 时禁止开仓（REQUIREMENTS 的铁律：看不见行情就不许开枪）。
@@ -1133,10 +2206,19 @@ class DecisionEngine:
             snap["hard_stop"] = False
         if self.pos:
             p = self.pos
+            # adopted=True 是给看板看的：这笔仓不是策略开的，引擎【不会】按
+            # 通道出场平掉它，只保留熔断止损。不标出来，用户看到的
+            # "持仓 0.075 @ 72475 / 出场线 72691" 会让人以为马上要被平。
             snap["pos"] = {"side": p["side"], "qty": p["qty"], "entry": p["entry"],
-                           "stop": p["stop"], "entry_ts": p["entry_ts"]}
+                           "stop": p["stop"], "entry_ts": p["entry_ts"],
+                           "adopted": self._is_adopted()}
             snap["pos_pnl_pct"] = (price - p["entry"]) / p["entry"] * 100.0
             snap["hold_h"] = (int(time.time() * 1000) - p["entry_ts"]) / 3600000.0
+            # 接管仓有真实熔断止损，这里就必须显示 True —— 上面那两行
+            # 是"策略计划没有硬停损"的口径，不能覆盖到持仓身上。
+            if self._is_adopted() and p["stop"] > 0:
+                snap["hard_stop"] = True
+                snap["stop_pct"] = self.tcfg.trend_stop_pct
         return snap
 
     def _build_trend_snapshot(self, price: float, equity: float) -> dict:
@@ -1147,7 +2229,9 @@ class DecisionEngine:
         snap = {"mode": "trend", "ready": st["ready"], "bars": st["bars"],
                 "lookback": st["lookback"], "sma": sma, "price": price,
                 "above": st["above"], "next_bar_h": self.trend.next_bar_eta_h(),
-                "hold": bool(self.pos)}
+                # ★ 人工仓也算"有仓"：否则看板在用户手上有仓时显示"空仓"。
+                "hold": bool(self.pos or getattr(self, "adopted_pos", None)),
+                "adopted": getattr(self, "adopted_pos", None)}
         # 最近一根 4h K 是从哪来的、量是多少。
         # 收盘价两种口径一致，所以 SMA 区分不出用的是官方还是本地；
         # 只有成交量能区分（官方 8558 vs 本地 117）。不报出来，
@@ -1247,7 +2331,8 @@ class DecisionEngine:
         if self.pos:
             p = self.pos
             snap["pos"] = {"side": p["side"], "qty": p["qty"], "entry": p["entry"],
-                           "stop": p["stop"], "entry_ts": p["entry_ts"]}
+                           "stop": p["stop"], "entry_ts": p["entry_ts"],
+                           "adopted": self._is_adopted()}
             snap["pos_pnl_pct"] = (price - p["entry"]) / p["entry"] * 100.0
             snap["hold_h"] = (int(time.time() * 1000) - p["entry_ts"]) / 3600000.0
         return snap
@@ -1264,23 +2349,21 @@ class DecisionEngine:
             return 0.0
 
     def _is_spot(self) -> bool:
-        """是否现货执行。**单一口径**：以实际挂上的执行器为准（它才是真正下单的东西）。
+        """★ 永远返回 False。无论配置、无论执行器名字。
 
-        之前杠杆/步长/最小名义用 self.ex.name 判断，而手续费缓冲用配置项判断，
-        两者若不一致（配置写 spot、执行器却是永续），仓位计算就会自相矛盾。
-        统一到一个入口，避免这种"一半现货一半永续"的错位。
+        2026-11-17 用户裁决：「我们是合约账户做交易，我不想看到现货相关的
+        东西影响到我们了！」
+
+        为什么不是删掉这个方法、而是让它恒 False：
+        它的 7 个调用点（杠杆 / 步长 / 手续费缓冲 / 最小名义 / 钱包提示 / dust 清理）
+        每一处都带着一串现货专用常量。直接删方法要同时改 7 处，
+        任何一处漏改就是静默按现货记账（这个项目最吃亏的失败方式）。
+        恒 False 让所有分支同时失效，且每个分支变量都被注销。
+
+        ★ 它不是“看不见就不存在”：`tests/test_perp_only.py` 钉住
+          这个方法恒 False，且配置层面拒绝 `exec_market=spot`。
         """
-        name = getattr(self.ex, "name", "")
-        if name == "spot":
-            return True
-        if name == "live":
-            return False
-        # paper 执行器没有真实市场，它的规格必须服从配置——
-        # 否则会出现"配置是现货、纸面却按永续的 0.001 步长和 50U 最小名义撮合"，
-        # 于是纸面权益曲线和回放数字全都算在了错的品种上。
-        # 实测代价：权益 71.77U 时永续一手要 77.80U，直接被判"买不起"，
-        # 而现货一手只要 0.78U——同一笔钱在两种规格下结论完全相反。
-        return self.tcfg.exec_market == "spot"
+        return False
 
     def _chan_warmup(self) -> int:
         """策略变热需要多少根 K。
@@ -1292,6 +2375,53 @@ class DecisionEngine:
         if self._is_donchian():
             return int(getattr(self.tcfg, "donchian_entry", 150) or 150) + 2
         return int(self.tcfg.sma_lookback) + 1
+
+    @staticmethod
+    def _norm_side(side) -> str:
+        """兼容旧调用点的别名，实现见模块级 `norm_side()`。"""
+        return norm_side(side)
+
+    def _is_adopted(self) -> bool:
+        """当前是否存在「对账接管」来的人工仓（不是策略自己开的）。
+
+        为什么不能只看内存里的一个布尔：进程重启后持仓是从
+        trades 表恢复的，那个布尔不会跟着走。
+        唯一能活过重启的载体就是 open_reason —— 所以判断也必须读它。
+
+        ★ 2026-11-24 拆仓后：人工仓存放在 `self.adopted_pos`，
+          系统仓在 `self.pos`。所以主判据变成「adopted_pos 非空」。
+
+        ★ 但**保留**对 `self.pos` 的兜底判断（两者取或）：
+          任何还没改到的新代码路径、测试替身、或者从旧版本升级时遗留的
+          状态，都可能把一笔接管仓放进 `self.pos`。这道闸必须**宁可多触发**——
+          它拦的是「拿策略规则去平用户手工仓」，漏一次就是真钱。
+          读不到 open_reason 时返回 False，维持「按策略仓处理」的老行为，
+          那一条方向相反（宁可多管一笔策略仓，也不要让策略仓无人看管）。
+        """
+        # ★ 用 getattr 而不是 `self.adopted_pos`：测试替身（SimpleNamespace）
+        #   和"跨版本恢复的旧状态对象"都可能没有这个属性，而这道闸是**安全闸**，
+        #   它自己抛 AttributeError 等于把归属判断整段跳过 —— 那就是 11-24 事故。
+        #   getattr 默认 None = "没有人工仓"，随后仍会走 self.pos 的兜底判断。
+        if getattr(self, "adopted_pos", None):
+            return True
+        p = self.pos
+        if not p:
+            return False
+        return str(p.get("open_reason") or "").strip() == ADOPT_REASON
+
+    def _adopted_slot(self) -> Optional[dict]:
+        """取「人工仓」那一份，并告诉调用方它放在哪个槽里。
+
+        返回 ``(pos_dict, "adopted"|"pos"|"")``。`"pos"` 只出现在旧状态兜底
+        （接管仓被放进了 `self.pos`）时，清空时要清对槽，不能清错。
+        """
+        _a = getattr(self, "adopted_pos", None)
+        if _a:
+            return _a, "adopted"
+        p = self.pos
+        if p and str(p.get("open_reason") or "").strip() == ADOPT_REASON:
+            return p, "pos"
+        return None, ""
 
     def _is_donchian(self) -> bool:
         """当前是否跑唐奇安策略。
@@ -1310,16 +2440,1875 @@ class DecisionEngine:
         """
         return str(getattr(self.tcfg, "strategy", "") or "").lower() in ("trend", "donchian")
 
+    def _is_pending(self) -> bool:
+        """是否走「提前挂单」策略。单一口径：只认配置值。"""
+        return str(getattr(self.tcfg, "strategy", "") or "").lower() == "pending"
+
+    def _pending_is_dry(self) -> bool:
+        """本轮是否「只出计划不挂单」。
+
+        默认值来自配置（`trading.pending_dry_run`），构造参数可以覆盖它
+        —— 测试和临时演练都用得上，但**线上唯一权威是配置**。
+        """
+        if self._pending_dry is not None:
+            return bool(self._pending_dry)
+        return bool(getattr(self.tcfg, "pending_dry_run", True))
+
+    def _pending_harvest(self, b15, b5=None) -> None:
+        """从计划源采集**当前这一根 K** 上新生的计划。
+
+        ★★ 为什么必须按时间过滤
+
+          `detect_all()` 扫的是**全历史**，返回的也是全部历史计划
+          （真实数据：180 天 **11 条**）。如果不过滤就全插进去，
+          引擎会在开盘那一刻按**几个月前的价位**挂出 11 张单。
+          而且每一张看起来都合法：价位自洽、止损合规、方向正确。
+          这种错误不会报错，只会表现为“一开机就满仓”。
+
+        ★★ 2026-11-20 修：**时钟必须跟着形态的周期**
+
+          三引线声明在 **5m** 收盘上（`claim_on_entry=True`，
+          `effective_claim_ts` 是那根 5m 的起始时刻，例如 10:05），
+          而采集原来只拿**最后一根 15m** 的 ts 去比。5m 的时刻和 15m
+          的时刻（10:00 / 10:15）基本不可能相等 → 三引线的计划
+          **一条都采不到**，永远是 0 条预期。
+
+          这不是「偶尔漏一条」：它让 5m 周期的形态**整体失效**，
+          而表现只是「没有计划」，看起来像行情没配合。
+
+          现在的判据按形态自己的时钟走：
+            · `claim_on_entry=True`  → 和「最后一根 5m」比
+            · 否则（15m 口径）        → 和「最后一根 15m」比
+          `thesis_id` 是 `方向-形态-bar_ts` 的确定值、store 按主键覆盖，
+          所以重复采集是幂等的（不会插出两条）。
+
+        不报错的三种情形（都要留痕，不许静默）
+
+          1. 没接计划源 → 告警一次，然后不产生计划（而不是崩）。
+          2. 计划源抛错 → 记风控，本根 K 不采集（不能因为源坏了就
+             让已有持仓的推进也停下来）。
+          3. 一根 K 里重复调用 → 直接返回（全库扫一遍不便宜）。
+        """
+        if self.pending_source is None:
+            if not self._pending_source_warned:
+                self._pending_source_warned = True
+                detail = (
+                    "挂单策略没接计划源（pending_source=None）：永远不会有新计划，"
+                    "也就永远不会下单。实盘必须注入 PlanSource.plans。")
+                logger.error("[挂单] %s", detail)
+                try:
+                    self.db.log_risk("pending_source_not_wired", detail[:300])
+                except Exception:
+                    pass
+            return
+
+        cur15 = 0
+        for b in reversed(list(b15 or ())):
+            cur15 = int(getattr(b, "ts", 0) or 0)
+            if cur15:
+                break
+        cur5 = 0
+        for b in reversed(list(b5 or ())):
+            cur5 = int(getattr(b, "ts", 0) or 0)
+            if cur5:
+                break
+        # 节流：按 5m 时钟（采集节奏 = 状态机推进节奏）
+        cur = cur5 or cur15
+        if not cur or cur == self._pending_harvest_ts:
+            return
+        self._pending_harvest_ts = cur
+
+        try:
+            plans, stats = self.pending_source(self._pending_params())
+        except Exception as e:
+            logger.error("[挂单] 计划源出错，本根不采集：%s", e, exc_info=True)
+            try:
+                self.db.log_risk("pending_source_error", str(e)[:200])
+            except Exception:
+                pass
+            return
+
+        from . import pending_thesis_store as _PTS
+        from . import thesis as _T
+        added = 0
+        for pl in (plans or ()):
+            # ★ 只收「决策时刻 = 当前这根」的计划，时钟跟着形态自己的周期
+            _claim_ts = int(getattr(pl, "effective_claim_ts", 0) or 0)
+            _want = cur5 if bool(getattr(pl, "claim_on_entry", False)) else cur15
+            if not _want or _claim_ts != _want:
+                continue
+            try:
+                pl.validate()
+            except Exception as e:
+                logger.warning("[挂单] 计划自洽性不过，丢弃 %s：%s", getattr(pl, "kind", ""), e)
+                continue
+            tid = self._pending_plan_key(pl)
+            th = _T.Thesis(
+                thesis_id=tid, kind=pl.kind, direction=pl.direction,
+                order_price=float(pl.order_price),
+                stop_price=float(pl.stop_price),
+                target_price=float(pl.target_price),
+                order_type=pl.order_type, family=pl.family,
+                surprise_pts=float(getattr(pl, "surprise_pts", 0.0) or 0.0))
+            try:
+                if self.pending.add_if_new(_PTS.row_of(
+                        th, state=_T.EXPECTED, next_index=0,
+                        bar_ts=int(pl.bar_ts))):
+                    added += 1
+            except Exception as e:
+                logger.error("[挂单] 新计划落库失败 %s：%s",
+                             tid, e, exc_info=True)
+        if added:
+            logger.warning("[挂单] 采集到 %d 条新计划（bar_ts=%s）", added, cur15)
+
+    async def _step_selfcheck(self, b15, b5=None) -> None:
+        """消费一次链路自检请求（请求文件读走即删，所以只会触发一次）。
+
+        语义与边界全部在 `trading/selfcheck.py` 的模块 docstring 里；
+        这里只做「有没有请求」这一件事，**不判断该不该下单** ——
+        判定在 `selfcheck.refusal()`，仓位在 `_pending_size()`，
+        安全闸在 `_pending_place()`，一处都不在这里重复。
+        """
+        from . import selfcheck as _SC
+
+        if os.path.exists(_SC.request_path(self.cfg)):
+            res = await _SC.fire_once(self, b15, self.cfg, b5=b5)
+        elif os.path.exists(_SC.cancel_path(self.cfg)):
+            res = await _SC.cancel_once(self, self.cfg)
+        else:
+            return
+        if res.get("fired"):
+            self._log_pending_note("[自检] %s" % (res.get("detail")
+                                                  or ",".join(res.get("cancelled") or ())))
+        elif res.get("reason"):
+            logger.info("[自检] 未执行：%s", res.get("reason"))
+
+    def _log_pending_note(self, text: str) -> None:
+        """自检留痕。风控表由 selfcheck 自己写，这里只保证日志里看得见。"""
+        logger.warning("%s", text)
+
+    @staticmethod
+    def _pending_plan_key(plan) -> str:
+        """计划的稳定身份。与 `PlanSource.plan_key()` 同一份口径"""
+        from .plan_source import PlanSource
+        return PlanSource.plan_key(plan)
+
+    def _pending_kbar_view(self):
+        """取 S5 等着的 K 线演化视图；没接线就告警。
+
+        返回 None 不是“错误”，是“这三道闸本轮不工作”。
+        但它必须在日志和风控表里留下一条 —— 否则“闸没数据”和“闸没触发”
+        在事后看起来完全一样。
+        """
+        kv = self.pending_kbar
+        if kv is None:
+            if not self._pending_kbar_warned:
+                self._pending_kbar_warned = True
+                detail = (
+                    "S5 出场闸没接 K 线演化视图（pending_kbar=None）：保本棘轮、恐慌盘顺向、缩量停滞"
+                    "本轮全部不工作。实盘必须注入 load_kbar_view()。")
+                logger.error("[挂单] %s", detail)
+                try:
+                    self.db.log_risk("pending_kbar_not_wired", detail[:300])
+                except Exception:
+                    pass
+        return kv
+
+    def _pending_warn_once(self, detail: str) -> None:
+        """pending 没接线/idle 的告警只报一次。
+
+        每根 3s K 线报一次的后果不是"更安全"，而是把真正的告警淹掉。
+        """
+        if self._pending_warned:
+            return
+        self._pending_warned = True
+        logger.error("[挂单] %s", detail)
+        try:
+            self.db.log_risk("pending_not_wired", detail[:300])
+        except Exception:
+            pass
+
+    async def _step_adopted_exit(self, bars_by_iv, b15, price, now_ms,
+                                 log_quiet=False) -> None:
+        """接管仓（人工仓）的**出场管理**：只管出场，不挂新单。
+
+        ★ 为什么要这个函数（2026-11-24 事故 + 用户要求「系统帮我管理手工单
+          的出场我是满意的，只是要正确」）：
+
+          事故前，`strategy=pending` 的下接管仓**没有任何正当管理路径**：
+          分派在 `_step` 里 `if self._is_pending(): _step_pending(); return`，
+          所以 `_step_trend` 那段熔断判断（`price <= p["stop"]`，还带交易所价
+          复核）**永远不会跑**；而挂单链又只推进 thesis。
+          接管时写进 `self.pos["stop"]` 的那个 25% 熔断止损（`entry*0.75`）
+          于是只存在于数据库里，没有一行代码去执行它。
+
+        ★★ BUS-D（2026-11-24）：判据从「三条自写规则」改为**守卫的 P0+P1**。
+
+        用户的裁决（原话）：
+          「这样的话，你人工仓还一定要基于结构失效的判断吗？」
+
+        **不需要，而那两条判据现在都删了**：
+
+          · 原来的「结构失效」用 `thesis.invalidation_verdict(family=FAMILY_TREND)`。
+            `FAMILY_TREND` 是**我编造的前提** —— 人工仓没有入场时的结构，
+            凭什么用一个趋势家族的结构去判它失效。
+          · 原来的「观察线穿透后收回」同属 P2 结构类，一并删除。
+            （它需要"入场时盯的是哪条线"，人工仓同样没有。）
+
+        留下的是两条**与策略无关的数学事实**：
+
+          P0 保命 —— 离爆仓还有几个止损宽度。用**交易所返回的真实爆仓价**
+                   （BUS-D 补的 `liquidationPrice`），不再用配置推算。
+          P1 止损 —— 止损价 = 爆仓距离 / 安全倍数（上一轮已修好）。
+                   价格越过它才走；「越过」这件事仍用交易所权威价复核一次，
+                   防本地行情陈旧导致假触发（这条防御是有效的，保留）。
+
+        用户说的「每一根 K 线都有话说」在这里也成立，但**只用一处**：
+        `KlineRead` 每根都算，只喂给 P1 的一次性恐慌插针延迟
+        （`panic_flush`），永远不作为「所以该出场了」的理由。
+
+        ★ 不设止盈：人工仓没有 R 依据，硬编 4R 等于凭空造规则；而且用户
+          明确说「我是准备拿久一点」，固定目标位会把它自动卖掉。
+
+        ★ 2026-11-24 全链路审查改动（F1/F3/F4/F5/F6/F10）：
+          · 参数表收缩为 `(bars_by_iv, b15, price, now_ms, log_quiet)`。
+            原来的 `b5` / `book` / `ts` 在删掉 P2 之后**已无人使用**，
+            两处调用方却仍在每 tick 计算 `pending_lines()` —— 白算。
+          · 部分平仓不再由 `_adopted_close` 一律清槽（见该函数）。
+          · 出场/减仓都会写一条 `action="close"/"reduce"` 的决策行，
+            并因此触发看板推送 —— 用户最初的困惑就是"为什么在这个价位出场"，
+            而这条路径以前**一条决策都没留**。
+          · 维护 `best/worst` 供 MFE/MAE 记账（以前恒写 0）。
+          · `stop <= 0` 不再当成"止损在 0 元"（见下面 F4 处）。
+        """
+        # ★ 只处理**人工仓**那一份（2026-11-24 拆仓）。
+        #   用 `_adopted_slot()` 而不是直接读 self.pos：旧状态可能把接管仓
+        #   放在 self.pos 里，这个辅助函数两种都能找到，并且告诉我们
+        #   清槽时该清哪一个。
+        pos, _slot = self._adopted_slot()
+        if not pos:
+            return
+        qty = abs(float(pos.get("qty") or 0.0))
+        if qty <= 0:
+            return
+        side = str(pos.get("side") or "long").lower()
+        up = side == "long"
+        entry = float(pos.get("entry") or 0.0)
+        stop = float(pos.get("stop") or 0.0)
+        anchor = self._adopted_anchor_ts(pos)
+
+        # ---- F5：维护持仓期间的最高/最低价（MFE/MAE 的唯一来源）----
+        #   `_manage` 里对系统仓做过同一件事（`p["best"]/["worst"]`），
+        #   但人工仓从不经过 `_manage`，所以这两列在 trades 表里恒为 0。
+        #   而"这笔出场是不是太早"恰恰只能靠 MFE 判断 —— 正是用户最初的问题。
+        #   统计字段一律防御式：拿不到就用现价，绝不让它把出场判断搞崩。
+        try:
+            _b3 = self.feed.agg.current(3000)
+            _hi = float(getattr(_b3, "high", price))
+            _lo = float(getattr(_b3, "low", price))
+        except Exception:
+            _hi = _lo = float(price)
+        _dir = 1 if up else -1
+        try:
+            if _dir > 0:
+                pos["best"] = max(float(pos.get("best") or entry), _hi)
+                pos["worst"] = min(float(pos.get("worst") or entry), _lo)
+            else:
+                pos["best"] = min(float(pos.get("best") or entry), _lo)
+                pos["worst"] = max(float(pos.get("worst") or entry), _hi)
+        except Exception:
+            pass
+
+        # ---- F4：`stop <= 0` 不是"止损在 0 元" ----
+        #   唐奇安策略**合法地不设硬止损**（`_fallback_stop` 第 445 行），
+        #   它的 stop 就是 0。而守卫把 stop=0 读成"入场价下方一整个入场价"
+        #   的距离：d_stop = entry，结构性缓冲 = 爆仓距离/入场价 ≈ 0.04 倍，
+        #   于是判「减仓 98%」—— 那不是守卫激进，是我们在用错的语言问它。
+        #   人工仓不该出现这种状态（接管时就算好了止损），所以这里**补一个**
+        #   而不是跳过：补的是"爆仓距离/安全倍数"，数学上保证先于爆仓触发。
+        if stop <= 0 and entry > 0:
+            _pct = self._stop_distance_pct(entry)
+            if _pct > 0:
+                stop = (entry * (1 - _pct / 100.0) if up
+                        else entry * (1 + _pct / 100.0))
+                pos["stop"] = stop
+                logger.error("[接管] 人工仓没有止损价 → 按爆仓距离推导 %.3f%% "
+                             "补一个 %.2f（入场 %.2f）", _pct, stop, entry)
+                self.db.log_risk("adopted_stop_missing_repaired",
+                                 "按 %.3f%% 补止损 %.2f（入场 %.2f）"
+                                 % (_pct, stop, entry))
+            else:
+                self._log_decision(
+                    bars_by_iv, price, 0.0, now_ms, None, "watch",
+                    "接管仓没有止损价且算不出安全距离 —— 需人工介入"
+                    "（不调用守卫，避免把 stop=0 读成「止损在 0 元」）")
+                return
+
+        from . import kline_intent as _ki
+        from .exit_executor import HOLD as _EX_HOLD
+        from .exit_executor import describe as _ex_describe
+        from .exit_executor import plan_exit as _plan_exit
+        from .position_guard import decide as _pg_decide
+
+        # ---- 只取「接管之后」的已收盘 15m K 线 ----
+        #   「正确」的可实现定义：早于接管时刻的 K 线一律不参与判断。
+        #   事故那次用的就是 11-20 的 K 线去判 11-24 的仓。
+        bars = self._adopted_bars(b15, anchor)
+        if not bars:
+            self._log_decision(
+                bars_by_iv, price, 0.0, now_ms, None, "watch",
+                "接管仓：还没有接管之后的已收盘 15m，本轮不判出场")
+            return
+
+        # ---- 组装守卫的持仓视图 ----
+        gp = await self._guard_position_for_adopted(pos, price)
+        if gp is None:
+            # 连爆仓价都拿不到：只能用熔断止损兜底，绝不用猜的缓冲去判 P0。
+            if stop > 0 and ((price <= stop) if up else (price >= stop)):
+                truth = await self._confirm_stop_price(price)
+                if truth and ((up and truth > stop) or ((not up) and truth < stop)):
+                    logger.warning("[接管] 本地价触发止损但交易所价未触发，忽略")
+                    self.db.log_risk("stale_price",
+                                     "接管仓：本地 %.1f / 交易所 %.1f，已忽略"
+                                     % (price, truth))
+                else:
+                    await self._adopted_close(
+                        qty, side, entry, "熔断止损（stop=%.2f 无爆仓价）" % stop)
+                    return
+            self._log_decision(
+                bars_by_iv, price, 0.0, now_ms, None, "watch",
+                "接管仓在管：拿不到爆仓价，本轮只做止损兜底（stop=%.2f）" % stop)
+            return
+
+        # ---- K 线读数：只用于 P1 的一次性恐慌插针延迟 ----
+        #   ★ 用 `_bar_ts` / `_bar_ohlcv` 取值，不要写死 `b.open` 或 `b.o`：
+        #     真实 `feed.Bar` 是 open/high/low/close，
+        #     `pending_plan._Bar` 是 o/h/l/c，写死任一种都会在另一种上炸。
+        seq = [((self._bar_ts(b),) + self._bar_ohlcv(b)) for b in bars[-60:]]
+        try:
+            kline = _ki.read_kline(seq) if seq else None
+        except Exception as e:
+            logger.error("[接管] K 线读数失败（不影响止损）：%s", e)
+            kline = None
+
+        cfg = self._guard_config_for_observe()
+        decision = _pg_decide(gp, float(price), cfg, kline=kline)
+
+        # ---- 出场执行层：这里守住手数门槛（用户裁决 ②）----
+        plan = _plan_exit(decision, qty, self._qty_step(), price)
+
+        if plan.is_noop:
+            if not log_quiet:
+                # ★ F6：把爆仓价**来源**写进决策。以前 `_liq_src` 只赋值、
+                #   从不输出，docstring 却写着"记进日志" —— 一行装成
+                #   可观测的假字段。"离爆仓还有 2.5 倍"这句话到底基于
+                #   交易所真实值还是配置推算，必须能从库里读出来。
+                self._log_decision(
+                    bars_by_iv, price, 0.0, now_ms, None, "watch",
+                    "接管仓在管：未出场（数量 %.6f / 入场 %.2f / 止损 %.2f "
+                    "距离 %.2f%%；守卫 %s：%s；判据用 %d 根接管后 15m；"
+                    "爆仓价来源 %s）"
+                    % (qty, entry, gp.stop_price,
+                       (abs(price - gp.stop_price) / price * 100.0)
+                       if price > 0 else 0.0,
+                       decision.action, _ex_describe(plan), len(bars),
+                       getattr(self, "_liq_src", "未知")))
+            return
+
+        # ---- 止损/减仓都要先过「本地价是否陈旧」这一关 ----
+        if plan.action in ("EXIT_STOP", "REDUCE"):
+            truth = await self._confirm_stop_price(price)
+            if truth:
+                _adverse = (truth <= gp.stop_price) if up else (truth >= gp.stop_price)
+                _triggered_by_stop = gp.remaining_to_stop(float(price)) <= 0
+                if _triggered_by_stop and not _adverse:
+                    logger.warning(
+                        "[接管] 本地价 %.1f 触发止损，但交易所价 %.1f 未触发，"
+                        "判定为行情陈旧，不执行", price, truth)
+                    self.db.log_risk(
+                        "stale_price",
+                        "接管仓：本地 %.1f / 交易所 %.1f，已忽略出场"
+                        % (price, truth))
+                    return
+
+        if plan.is_full_exit:
+            logger.info("[接管] 守卫判 %s → 全部离场：%s",
+                        decision.action, decision.reason)
+            await self._adopted_close(qty, side, entry,
+                                      "守卫 %s：%s" % (decision.action,
+                                                      decision.reason))
+            # ★ F3：出场必须自己留一条决策行（`_adopted_close` 目前不写，
+            #   它只写 trades + risk_events）。用户最初的困惑就是
+            #   「我没明白系统为什么要在这个价位出场」—— 而这条路径
+            #   以前在决策流里**一条记录都没有**，看板也没有推送。
+            #   写在这里而不是 `_adopted_close` 里：这个函数才有
+            #   `bars_by_iv` 与 equity，且只有"真的平掉了"才会走到这儿
+            #   （`_adopted_close` 失败会抛，不会静默记账）。
+            self._log_decision(
+                bars_by_iv, price, float(getattr(self, "_last_equity", 0.0) or 0.0),
+                now_ms, "adopted_exit", "close",
+                "接管仓全部离场（守卫 %s）：%s｜qty %.6f 入场 %.2f 止损 %.2f"
+                "｜爆仓价来源 %s"
+                % (decision.action, decision.reason, qty, entry, gp.stop_price,
+                   getattr(self, "_liq_src", "未知")),
+                gates=[{"gate": "守卫P判断", "ok": True,
+                        "detail": "%s：%s" % (decision.action, decision.reason)}],
+                features={"guard": decision.as_dict(), "liq_src": getattr(
+                    self, "_liq_src", "未知"), "qty": qty,
+                    "stop": gp.stop_price, "liq": gp.liq_price},
+                risk_info={"qty": qty, "entry": entry,
+                           "stop": gp.stop_price, "liq": gp.liq_price,
+                           "buffer": gp.structural_buffer()})
+            return
+
+        if plan.action == "REDUCE":
+            logger.info("[接管] 守卫判 REDUCE → 减仓 %.6f：%s",
+                        plan.qty, decision.reason)
+            await self._adopted_close(plan.qty, side, entry,
+                                      "守卫 REDUCE：%s" % decision.reason)
+            self._log_decision(
+                bars_by_iv, price, float(getattr(self, "_last_equity", 0.0) or 0.0),
+                now_ms, "adopted_reduce", "reduce",
+                "接管仓减仓 %.6f / 共 %.6f（守卫 REDUCE）：%s｜剩余 %.6f"
+                "｜爆仓价来源 %s"
+                % (plan.qty, qty, decision.reason, qty - plan.qty,
+                   getattr(self, "_liq_src", "未知")),
+                gates=[{"gate": "守卫P判断", "ok": True,
+                        "detail": "%s：%s" % (decision.action, decision.reason)}],
+                features={"guard": decision.as_dict(), "liq_src": getattr(
+                    self, "_liq_src", "未知"), "sold": plan.qty,
+                    "remain": qty - plan.qty},
+                risk_info={"sold": plan.qty, "remain": qty - plan.qty})
+            return
+
+        if plan.action == "MOVE_STOP":
+            old = float(pos.get("stop") or 0.0)
+            if abs(old - plan.new_stop) > 1e-9:
+                pos["stop"] = plan.new_stop
+                logger.info("[接管] 守卫移动止损 %.2f -> %.2f：%s",
+                            old, plan.new_stop, decision.reason)
+                self.db.log_risk(
+                    "adopted_stop_moved",
+                    "%.2f -> %.2f（%s）" % (old, plan.new_stop,
+                                           decision.reason))
+                self._persist_adopted_stop(pos)
+                self._log_decision(
+                    bars_by_iv, price, 0.0, now_ms, None, "watch",
+                    "接管仓止损移动：%.2f -> %.2f（守卫 %s）"
+                    % (old, plan.new_stop, decision.reason))
+                return
+
+        # 理论到不了这里；到了说明执行层放行了一个它不认识的动作用途
+        logger.error("[接管] 执行层返回了未知动作 %r，本轮不动作", plan.action)
+        return
+
+    @staticmethod
+    def _adopted_anchor_ts(pos) -> int:
+        """接管仓的**判断锚点**（毫秒）。
+
+        ★ 这是「正确」的核心：早于这个时刻的 K 线一律不许参与出场判断。
+          事故就是用 11-20 的 K 线判 11-24 的仓。
+
+        取 `entry_ts`（这笔仓存在的最早时刻）。取不到就退到「现在」，
+        **绝不退到 0**——退到 0 等于允许重放整个缓冲，也就是事故本身。
+        """
+        try:
+            v = int(pos.get("entry_ts") or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v > 0:
+            return v
+        return int(time.time() * 1000)
+
+    @staticmethod
+    def _bar_ts(b) -> int:
+        """取一根 bar 的时间戳，**兼容两种真实存在过的形状**。
+
+        ★★ 2026-11-24 BUS-D 发现并修掉的**既存缺陷**（不是本次引入的）：
+
+          `feed.Bar`（`market/agg.py` 的 dataclass）字段是
+          `(interval_ms, open_time, open, high, low, close, volume)` ——
+          **没有 `ts`**。而 `_adopted_bars` 原来用 `getattr(b, "ts", 0)` 过滤，
+          于是真实行情上每根都取到 0，`0 >= anchor` 恒为 False，
+          **过滤结果永远是空列表**。
+
+          后果：`_step_adopted_exit` 每次都走到
+          「还没有接管之后的已收盘 15m，本轮不判出场」就 return。
+          也就是说接管仓的两条结构判据（观察线、结构失效）
+          **在生产上从未执行过一次** —— 它们不是"有争议的规则"，
+          是看着活的死代码。
+
+          实测证据（用真实 `Bar` 跑 `_adopted_bars(400根, anchor=第300根)`）：
+              带 .ts 的假对象 -> 保留 100 根（期望值）
+              真实 feed.Bar   -> 保留   0 根   ← 恒空
+
+          这正是这个项目栽过 8 次的同一个错：同一事实两个来源。
+          假对象有 `.ts`、真对象只有 `.open_time`，
+          而测试夹具造的是假对象，所以测试一路绿。
+
+        ★ 为什么不干脆只认 `open_time`：`pending_plan._Bar` 是
+          `(ts, o, h, l, c)` 形状，同时代码里还有元组形态的序列。
+          三种形态都是合法输入，所以这里按**字段名**逐个试，
+          不靠位置对齐（位置对齐全错位且不报错，历史上更致命）。
+        """
+        for attr in ("open_time", "ts"):
+            v = getattr(b, attr, None)
+            if v:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    continue
+        # 元组/列表形态：`_to_pending_bars` 约定第 0 位是时间
+        try:
+            return int(b[0])
+        except (TypeError, IndexError, ValueError, KeyError):
+            return 0
+
+    @staticmethod
+    def _bar_ohlcv(b):
+        """取一根 bar 的 `(open, high, low, close, volume)`，兼容两种命名。
+
+        ★ 和 `_bar_ts` 是同一个理由：这个仓库里同时生活着两种 bar
+          · `feed.Bar`（真实行情）—— `open/high/low/close/volume`
+          · `pending_plan._Bar`      —— `o/h/l/c`（没有 volume）
+          写死任一种都会在另一种上抛 AttributeError 或被静默取到 0。
+        """
+        def _pick(*names):
+            for n in names:
+                v = getattr(b, n, None)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        continue
+            return 0.0
+
+        return (_pick("open", "o"), _pick("high", "h"), _pick("low", "l"),
+                _pick("close", "c"), _pick("volume", "v"))
+
+    @staticmethod
+    def _adopted_bars(b15, anchor) -> list:
+        """只保留 `时间 >= anchor` 的 15m bar（按时间升序）。"""
+        out = []
+        try:
+            a = int(anchor or 0)
+        except (TypeError, ValueError):
+            a = 0
+        for b in (b15 or ()):
+            try:
+                if DecisionEngine._bar_ts(b) >= a:
+                    out.append(b)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    async def _adopted_close(self, qty, side, entry, reason: str) -> None:
+        """平掉接管来的人工仓。**与 `_pending_close` 分开是故意的。**
+
+        ★ 为什么不能复用 `_pending_close`：
+          那个函数的归属判据是 `open_reason == "挂单成交"`，接管仓是
+          `ADOPT_REASON` —— 它必须拒绝。这里走的是**另一条授权路径**：
+          接管仓的出场由「接管仓在管」这条规则授权，不是由某条 thesis 授权。
+          把两者混成一个函数，就等于把 11-24 那个洞重新打开。
+
+        ★ 平仓同样走 `market_order(reduce_only=True)`，不用 place_order
+          （执行器不支持 MARKET，见 `_pending_close` 的注释）。
+
+        ★★ 2026-11-24 全链路审查（F1）：**部分平仓与全部平仓必须分开收尾。**
+
+          改之前这个函数无条件执行 `self.adopted_pos = None`。BUS-D 之前
+          它只会被"全量平仓"调用，所以看不出问题；BUS-D 之后守卫的
+          `REDUCE` 会带一个**部分数量**进来，于是：
+
+              卖 93.4%        （交易所真的只卖这么多）
+              记一笔已平      （trades 里这笔 exit_ts 非空）
+              清空整槽        （剩余 6.6% 从内存消失）
+              `_step` 随即认为"没有人工仓" → 交给策略链
+
+          三重后果，全是真金白银：
+            1. 剩余仓**无人管出场**（没有止损、没有爆仓保护）；
+            2. `trades` 表里这笔已经"平完了"，**剩余仓在库里不存在** ——
+               重启后引擎按空仓跑，等 5 分钟对账再重新接管，
+               `entry_ts` 变了，"只用接管之后的 K 线"这个锚点历史一起丢；
+            3. `close_booking` 把**整笔开仓费**摊在这一条部分腿上，
+               pnl 偏负，而剩余仓没有成本。
+
+          现在：卖出量 < 持仓量时走部分平仓 —— 内存减仓、费用按比例分摊、
+          `close_trade` 记已卖部分、再补一条剩余的 open 行让重启接得上。
+          卖完不足一个步长则升格为全平（不留下卖不掉的粉尘）。
+
+        ★★ 记账一律用 `fill.qty`（交易所回来的**实际成交量**），不用计划量。
+
+          这是 `_close`（策略仓）早就写对、而这里一度写错的地方：
+          `market_order` 返回的 `FillResult.qty` 是真实成交量，计划量只是意图。
+          拿计划量减内存持仓，部分成交时会把"没卖掉的那部分"从内存里抹掉 ——
+          同一个后果又回来了一次（剩余仓无人管、库里不存在）。
+          两条平仓路径必须用同一个口径，否则又是一处"同一事实两个来源"。
+        """
+        pos, _slot = self._adopted_slot()
+        if not pos or abs(float(pos.get("qty") or 0.0)) <= 0:
+            return
+        pos_qty = abs(float(pos.get("qty") or 0.0))
+        want = abs(float(qty or 0.0))
+        step = float(self._qty_step() or 0.0)
+        remain = pos_qty - want
+        # 剩余不足一个步长 = 卖不掉（交易所会拒单），按全平处理
+        if remain <= 1e-12 or (step > 0 and remain < step - 1e-12):
+            want = pos_qty
+        close_side = "SELL" if str(side).lower() == "long" else "BUY"
+        try:
+            fill = await self.ex.market_order(
+                close_side, want, reason=("接管仓%s %s"
+                                          % ("减仓" if remain > 0 else "出场",
+                                             reason)),
+                reduce_only=True)
+        except Exception as e:
+            logger.error("[接管] 平仓失败（人工仓，%s）：%s", reason, e)
+            self.db.log_risk("adopted_close_failed", "%s: %s" % (reason, str(e)[:200]))
+            raise
+        if not getattr(fill, "ok", False):
+            err = str(getattr(fill, "reason", "") or "未知原因")
+            logger.error("[接管] 平仓失败（人工仓，%s）：%s", reason, err)
+            self.db.log_risk("adopted_close_failed", "%s: %s" % (reason, err[:200]))
+            raise RuntimeError(err)
+
+        # ★ 实际成交量优先；执行器没给（或给 0）才退回计划量。
+        sold = float(getattr(fill, "qty", 0.0) or 0.0)
+        if sold <= 0:
+            sold = want
+        if sold > pos_qty:                     # 防御：不许卖出超过持仓
+            sold = pos_qty
+        if abs(sold - want) > 1e-9:
+            logger.warning(
+                "[接管] 实际成交 %.8f 与计划 %.8f 不一致（差 %.8f），"
+                "按实际成交量记账", sold, want, want - sold)
+        remain = pos_qty - sold
+        # 卖完之后剩的不足一个步长 = 卖不掉的粉尘，按全平收尾
+        if remain > 0 and step > 0 and remain < step - 1e-12:
+            logger.info("[接管] 剩 %.8f 不足一个步长（%.6f），按全平收尾",
+                        remain, step)
+            remain = 0.0
+        partial = remain > 1e-12
+
+        exit_price = float(getattr(fill, "price", 0.0) or 0.0)
+        if exit_price <= 0:
+            try:
+                exit_price = float(await self.ex.mark_price())
+            except Exception:
+                exit_price = float(pos.get("entry") or 0.0)
+
+        # ★★ 统一口径（2026-11-24）：走 `close_booking()`，三条平仓路径
+        #   同一个公式。这里以前只减平仓费、漏了开仓费（`pos["fee"]`），
+        #   净盈亏仍然偏乐观；`_pending_close` 更是两边都不记。
+        #
+        # ★ F1：部分平仓时开仓费必须**按比例**摊 —— 整笔开仓费属于整笔仓，
+        #   把它全压在这一条部分腿上会让这笔看起来更亏，而剩下的仓
+        #   一分成本都不剩。所以先算出本腿该承担的那一份。
+        _open_fee = abs(float(pos.get("fee") or 0.0))
+        _fee_share = (_open_fee if not partial or pos_qty <= 0
+                      else _open_fee * (sold / pos_qty))
+        pnl, fee_total, pnl_net = close_booking(
+            dict(pos, fee=_fee_share), exit_price,
+            getattr(fill, "fee", 0.0), sold, side)
+
+        # ★ F5：MFE/MAE 用持仓期间真实的最高/最低价。
+        #   以前这里恒写 0.0 —— 而"这笔出场是不是太早了"只能靠 MFE 回答，
+        #   正是用户最初那个问题（61550 没卖、61250 被平）。
+        _dir = 1 if str(side).lower() == "long" else -1
+        _best = float(pos.get("best") or entry)
+        _worst = float(pos.get("worst") or entry)
+        _mfe = round((_best - entry) * _dir, 6)
+        _mae = round((_worst - entry) * _dir, 6)
+
+        try:
+            self.db.close_trade({
+                "symbol": self.tcfg.symbol, "side": side,
+                "qty": sold, "entry_ts": pos.get("entry_ts"),
+                "entry_price": entry, "exit_ts": int(time.time() * 1000),
+                "exit_price": exit_price,
+                "stop_price": pos.get("stop"), "target_price": pos.get("target"),
+                "pnl_gross": pnl, "fee": fee_total, "pnl_net": pnl_net,
+                "mfe": _mfe, "mae": _mae,
+                "open_reason": pos.get("open_reason", ""),
+                "close_reason": "接管仓%s（%s）"
+                                % ("减仓" if partial else "出场", reason),
+                "paper": int(pos.get("paper") or 0)})
+        except Exception as e:
+            logger.error("[接管] 平仓已成交但关账失败：%s", e, exc_info=True)
+            self.db.log_risk("adopted_close_book_failed", str(e)[:200])
+
+        if partial:
+            # ---- 部分平仓：只减仓，不清槽 ----
+            #   内存里的数量与成本同步改写，`best/worst` 保留（它们描述的
+            #   是同一段持仓期间），`entry_ts` 保留（判断锚点不变）。
+            pos["qty"] = abs(float(pos.get("qty") or 0.0)) - sold
+            pos["fee"] = max(0.0, _open_fee - _fee_share)
+            # 剩下那部分仓在库里必须有一条 open 行，否则重启后引擎认为
+            # 这笔已经平完 —— 那就是"账实不符"的最短路径。
+            try:
+                self.db.log_trade({
+                    "symbol": self.tcfg.symbol, "side": side,
+                    "qty": pos["qty"], "entry_ts": pos.get("entry_ts"),
+                    "entry_price": entry,
+                    "stop_price": pos.get("stop"),
+                    "target_price": pos.get("target"),
+                    "fee": pos["fee"],
+                    "open_reason": pos.get("open_reason", ""),
+                    "paper": int(pos.get("paper") or 0),
+                    "strategy": getattr(self.tcfg, "strategy", "")})
+            except Exception as e:
+                logger.error("[接管] 减仓后补记剩余仓失败（内存仍是正确数量）：%s", e)
+                self.db.log_risk("adopted_remain_unbooked", str(e)[:200])
+            # 交易所的爆仓价会随持仓量变化，让下一跳重取真实值
+            self._liq_cache = None
+            try:
+                self.db.log_risk(
+                    "adopted_reduced",
+                    "%s %.6f @ %.2f（剩余 %.6f，%s）"
+                    % (close_side, sold, exit_price, pos["qty"], reason[:120]))
+            except Exception:
+                pass
+            logger.warning(
+                "[接管] 人工仓 %s 减 %.6f @ %.2f，剩余 %.6f（%s，本腿毛 %+.2f / 净 %+.2f）",
+                close_side, sold, exit_price, pos["qty"], reason, pnl, pnl_net)
+            return
+
+        # ★ 只清**人工仓**那一个槽。以前这里是 `self.pos = None`，
+        #   拆仓之后那样写会把系统仓一起清掉（反过来更糟：不清人工仓，
+        #   下一根 bar 又会判一次出场 → 反复市价平仓）。
+        if _slot == "adopted":
+            self.adopted_pos = None
+        else:
+            self.pos = None
+        self._liq_cache = None
+        try:
+            self.db.log_risk("adopted_closed",
+                             "%s %.6f @ %.2f（%s）" % (close_side, sold,
+                                                      exit_price, reason[:160]))
+        except Exception:
+            pass
+        logger.warning("[接管] 人工仓 %s 平 %.6f @ %.2f（%s，毛 %+.2f / 净 %+.2f）",
+                       close_side, sold, exit_price, reason, pnl, pnl_net)
+
+    @staticmethod
+    def _pending_start_index(b15, bar_ts) -> int:
+        """新 thesis 的 15m **起点下标**：它自己那根计划 K。
+
+        ★★ 这是 2026-11-24 生产事故的直接成因，必须在这里说清楚。
+
+          新 thesis 落库时 `next_index=0`（`_pending_harvest`），而
+          `thesis.step()` 拿 `progress["next_index"]` 当 `start_at`。
+          于是「从第 0 根开始」= **从行情缓冲最老那一根开始** ——
+          `feed.py` 的 `history` 是 `deque(maxlen=400)`，400 根 15m ≈ 4 天。
+
+          而生产又没传 `claim`，`thesis.run` 对 claim=None 的语义是
+          「一开始就成立，直接挂单」。两件事一叠加：
+
+              bars[0]（4 天前）立刻 ARMED → 顺着历史往后走 →
+              某根历史 K 上判成 FILLED → 再某根上判成「观察线拒绝」
+              → 产出 close 动作 → 拿**市价**平掉**当下**的真实持仓。
+
+          实测那一天：起点 = 11-20 05:00（`armed_ref_close=61962.2`
+          正是那根收盘），出场 = 11-20 20:00（决策价 61389.5 正是那根收盘），
+          `next_index=61` 恰好是 0..60 共 61 根；而真实成交是
+          11-24 09:00:14 的市价 61289.40 —— 拿 4 天前的结论平今天的仓。
+
+        ★ 为什么复用 `pending_plan._b15_index_for_plan` 的算法而不是另写一套：
+          回测路径（`run_plan`）一直是对的，生产的错在于**自己拼 step 参数、
+          绕过了那个唯一入口**。同一个事实（计划在哪一根）只能有一个来源。
+
+        ★ 用 `bisect_left`（第一根 ts >= bar_ts）而不是 `right-1`：
+          计划就是在 `bar_ts` 那根**收盘后**才成立的，起点必须是它自己，
+          从它开始判失效/成交才不会把「计划之前」的行情算进来。
+
+        ★ 两种「算不出正确起点」的边界，都必须**拒绝重放**而不是退回 0：
+
+          · `bar_ts` 比缓冲里所有 K 都新（计划那根还没到）→ 返回 `len(b15)`，
+            这一轮什么也不做；下一根新 K 到达后自然从 `len` 处接上。
+          · `bar_ts` 比缓冲最老一根还旧（进程停机超过缓冲长度 400×15m≈4 天）
+            → 也返回 `len(b15)`，并留 ERROR + 风险事件。
+            这里**绝不能返回 0**：返回 0 就是"把一条几万根之后才成立的计划
+            扔进历史里跑"，也就是 11-24 那次事故本身。
+            宁可让这条 thesis 停在原地等人看见，也不能让它凭历史行情
+            产出一张市价单砸在真实持仓上。
+        """
+        try:
+            want = int(bar_ts or 0)
+        except (TypeError, ValueError):
+            return 0
+        if want <= 0 or not b15:
+            return 0
+        arr = [int(getattr(b, "ts", 0) or 0) for b in b15]
+        i = bisect.bisect_left(arr, want)
+        if i >= len(arr):
+            return len(arr)          # 计划那根还没到，或恰好是下一根 → 不动
+        if arr[0] > want:
+            logger.error(
+                "[挂单] 计划的 bar_ts=%d 早于行情缓冲最早一根 %d"
+                "（缓冲 %d 根）→ 拒绝从历史重放，本轮跳过该 thesis",
+                want, arr[0], len(arr))
+            return len(arr)
+        return max(0, i)
+
+    async def _step_pending(self, bars_by_iv, price, equity, now_ms) -> None:
+        """把每条 live 预期往前推一根 5m，然后执行状态机产出的动作。
+
+        ★ 三个不变量（少一个都会静默错账）：
+
+        1. **只在新的 5m 收盘推进一次**。`_step` 由 3s 桶触发，一根 5m 里
+           会进来约 100 次。不判重就等于把同一根 K 推进 100 次：成交判定
+           会被重复执行，游标会被推过头。
+        2. **先执行动作、再前移游标**。反过来的话「游标前移了但单没挂上」
+           会漏掉一次挂单，而且下一根不会补 —— 因为那根已经算「处理过」。
+        3. **动作按 (thesis, bar_ts, kind) 幂等**。进程重启后同一根 K 会被
+           重新算出来一次（游标可能刚好没落盘），止损不能平第二次。
+        """
+        if self.pending is None:
+            self._pending_warn_once(
+                "strategy=pending 但没有注入预期仓库（PendingThesisStore）。"
+                "本轮不交易 —— 绝不能落进剥头皮链：那是一个已证伪的负策略，"
+                "而且日志里策略名还写着 pending。")
+            return
+
+        raw5 = list((bars_by_iv or {}).get(300000) or ())
+        if not raw5:
+            return
+        ts = int(getattr(raw5[-1], "open_time", 0) or 0)
+        if ts <= self._pending_5m_ts:
+            return                      # 还没有新的 5m 收盘
+        self._pending_5m_ts = ts
+
+        # ★★ 接管来的仓：挂单链**不挂新单**，但**要正确管它的出场**
+        #    （2026-11-24 生产事故 + 用户 2026-11-24 明确要求）。
+        #
+        #   事故原貌：用户 11-23 手工买的 0.032 BTC 被接管，11-24 09:00
+        #   挂单链拿**4 天前**的 K 线推出「观察线拒绝」，用市价平在 61289.4。
+        #   用户的原话是「系统帮我管理手工单的出场我是满意的，只是要正确」——
+        #   所以正确起见不是「不管」，而是「用当前行情管」。
+        #
+        #   接管仓的出场判据见 `_step_adopted_exit`（**BUS-D 之后只有两条**）：
+        #     1) P0 保命：用**交易所真实爆仓价**算"离爆仓还有几个止损宽度"
+        #     2) P1 止损：价格越过止损价才走（带一次交易所权威价复核）
+        #
+        #   ★ 2026-11-24 审查（F11）：这里原来还列着「观察线穿透后收回」
+        #     与「结构失效」两条 —— 它们已被 BUS-D **删除**。
+        #     文档比代码多讲两条判据，比缺文档更危险：读的人会以为
+        #     那两条还在跑，排查时永远找不到对得上的代码。
+        #
+        #   ★ 不设固定止盈：人工仓没有 R 依据（没按风险预算定过仓），
+        #     硬编一个 4R 目标等于凭空造规则，而且用户明确说「准备拿久一点」。
+        #
+        # ★★ 2026-11-24 第二次纠正（用户）：「有手工仓时不挂新单，不代表系统
+        #   不决策。决策行为要落库留痕，以便回溯，只是因为手工的存在，所以不
+        #   真实下单而已。系统决策跟下不下单没一点关系，系统不停，决策不止。」
+        #
+        #   所以这里**不是**「接管仓就整段跳过」，而是——
+        #     · 决策照常做：采集计划、推进每一条 live thesis（含 ARMED 的成交判定）
+        #     · 只把 `place_order` 那一个动作压住，并把它写成一条决策
+        #     · ARMED 的 thesis 可能已经在交易所有真实挂单，它的成交属于
+        #       **加仓**，必须照样落账（用户：「属于加仓行为，当然要执行」）
+        #   用一个布尔带下去，不改变主流程结构 —— 少一个分叉就少一处
+        #   「同一件事两个来源」。
+        b5 = self._to_pending_bars(raw5)
+        b15 = self._to_pending_bars((bars_by_iv or {}).get(900000))
+        try:
+            book = self.pending_lines() if self.pending_lines else None
+        except Exception as e:
+            logger.error("[挂单] 取线值失败，本轮按「无线」处理：%s", e)
+            book = None
+        if book is None:
+            from . import thesis as _T
+            book = _T.LineBook()
+
+        # 接管仓的出场管理**不在这里**（2026-11-24 审查 F2 修正）。
+        #
+        # ★ 原来这里有一句 `await self._step_adopted_exit(...)`，但它写在
+        #   `ts <= self._pending_5m_ts: return` 这条 5m 节流**之后** ——
+        #   于是人工仓的止损/爆仓保护实际上每 5 分钟才判一次。
+        #   现在唯一的调用点在 `_step` 里（3 秒粒度、与策略无关），
+        #   这里只保留"有没有人工仓"这个事实用于压制新挂单。
+        _adopted = self._is_adopted()
+
+        # ★ 先采集新计划，再取 live 列表：
+        #   采集出来的新计划应该在**同一根 K** 被推进一步，
+        #   而它们恰恰就是刚生效的那一根。
+        self._pending_harvest(b15, b5)
+
+        # ★ 链路自检单：只有请求文件存在时才触发一次（见 trading/selfcheck.py）。
+        #   必须放在这里而不是启动时：它要「当前这根 15m」的游标和现价，
+        #   启动那一刻两者都还没有；游标给错会让状态机从历史第一根重放成交。
+        try:
+            await self._step_selfcheck(b15, b5)
+        except Exception as e:
+            logger.error("[自检] 执行失败：%s", e, exc_info=True)
+            try:
+                self.db.log_risk("selfcheck_error", str(e)[:220])
+            except Exception:
+                pass
+
+        # ★★ S5 出场判据的输入。
+        #   拿不到就**必须喊**：否则三道闸全部退化为「永不触发」，
+        #   而看板上显示的是一笔一笔正常持仓 —— 没人会怀疑闸没数据。
+        kbar_view = self._pending_kbar_view()
+
+        rows = self.pending.live(limit=200)
+        if not rows:
+            # 空仓不等于出错：可能这段时间就是没有计划。
+            # 但要让看板能回答「为什么没动静」，所以写一条决策日志。
+            self._log_decision(bars_by_iv, price, equity, now_ms, None, "watch",
+                               "挂单策略：当前没有 live 预期（计划源为空）")
+            return
+
+        from . import pending_thesis_store as _PTS
+        from . import thesis as _T
+
+        _briefs = []          # 每根 bar 的逐条处境，循环外汇总成一条决策
+        # ★ BUS-B：本根是否有预期被闸门拦下、以及具体被哪道闸拦的。
+        #   `_blocked_any` 决定汇总决策的 action 名字 ——
+        #   "被拦下"和"在等触发"必须是两种不同的动作，
+        #   否则决策流上二者长得一样，用户又要靠猜。
+        _blocked_any = False
+        _gates_all = []
+        for row in rows:
+            tid = str(row.get("thesis_id") or "")
+            try:
+                th = _PTS.thesis_of(row)
+                prog = _PTS.progress_of(row)
+
+                # ★★★ 幽灵成交自愈（2026-11-24）。
+                #
+                #   生产库里有一条 `state=FILLED` 但 `filled_ts=0`、
+                #   `filled_price=0.0`、成交动作一条都没有的 thesis，
+                #   而交易所那张 `AI-pend-*` 单从未存在过（orders 表 0 行），
+                #   账本和交易所都是空仓。它是**旧代码从 K 线推断出来的假成交**。
+                #
+                #   不修的话它会永远停在 FILLED：每根 5m 都推一个 close 动作，
+                #   `_pending_close` 看到空仓就返回、不 mark_applied ——
+                #   于是每 5 分钟重试一次、永远重试，日志和决策表被噪声淹没，
+                #   真正该关注的信号被埋掉。
+                #
+                #   判据只用 `filled_ts`：真成交一定带成交时刻
+                #   （`_pending_book_fill` 落账时写），推断出来的假成交没有。
+                #   这不会误伤真仓 —— 真仓若要清理，那是 reconcile 的活。
+                if (str(row.get("state") or "") == "FILLED"
+                        and not float(row.get("filled_ts") or 0)
+                        and not self.pos
+                        and not getattr(self, "adopted_pos", None)):
+                    logger.warning(
+                        "[挂单] %s 状态是 FILLED 但没有任何成交记录、"
+                        "账本与交易所都空仓 → 判定为旧的幽灵成交，按 CANCELLED 终结",
+                        tid)
+                    try:
+                        self.db.log_risk(
+                            "pending_phantom_filled",
+                            "%s: filled_ts=0, filled_price=%r, 无仓无成交"
+                            % (tid, row.get("filled_price")))
+                    except Exception:
+                        pass
+                    _row = dict(row)
+                    _row["state"] = "CANCELLED"
+                    _row["note"] = ("判定为幽灵成交：无成交记录、"
+                                    "账本与交易所均空仓（2026-11-24 修复）")
+                    self.pending.upsert_thesis(_row)
+                    _briefs.append("幽灵成交已按 CANCELLED 终结")
+                    continue
+
+                # ★★ 首次推进：起点必须是这条 thesis 自己的那根计划 K。
+                #
+                #   `row["bar_ts"]` 在第一次 upsert 之前仍然是计划的那根
+                #   （`_pending_harvest` 写的是 `pl.bar_ts`），推进过一次之后
+                #   会被覆盖成当前 5m 的 ts —— 我们只用它在 next_index==0 时，
+                #   所以这个「只在首步有效」的取值恰好是对的。
+                #
+                #   不能改成「让 bar_ts 永不更新」：action_id 是
+                #   `thesis_id:bar_ts:kind`，bar_ts 一旦固定，不同步骤产出的
+                #   同类动作 id 会撞，第二次会被幂等逻辑当成重放而丢掉。
+                if not int(prog.get("next_index") or 0):
+                    prog = dict(prog)
+                    prog["next_index"] = self._pending_start_index(
+                        b15, int(row.get("bar_ts") or 0))
+                res, newp = _T.step(th, b15, book, progress=prog,
+                                    entry_bars=b5, kbar=kbar_view)
+            except Exception as e:
+                logger.error("[挂单] 推进 %s 失败：%s", tid, e, exc_info=True)
+                self.db.log_risk("pending_step_error", "%s: %s" % (tid, str(e)[:200]))
+                continue
+
+            placed = []
+            failed_place = False
+            suppressed = False
+            # ★ BUS-B：这条预期的挂单被**哪道闸**拦住、理由是什么。
+            #   空串 = 没被拦（要么挂了、要么压根没到挂单那一步）。
+            blocked = ""
+            for act in res.actions:
+                # ★ 有接管来的人工仓时：**只压住 place_order 这一个动作**，
+                #   其它动作（成交落账、出场）照常执行 —— 用户 2026-11-24：
+                #   「系统决策跟下不下单没一点关系」，而已挂在交易所的系统单
+                #   成交属于加仓，必须执行。
+                if _adopted and str(getattr(act, "kind", "") or "") == "place_order":
+                    suppressed = True
+                    logger.warning(
+                        "[挂单] %s 决策为【应挂单】但存在接管的人工仓 → 本根不下单"
+                        "（决策已落库，人工仓平掉后若条件仍成立会自动重挂）", tid)
+                    # ★ 这里**不写**决策行：`_log_decision` 按 bar_time 去重，
+                    #   在循环里写会把本根的汇总行顶掉（只留下第一条被压制的计划）。
+                    #   压制详情统一由循环外的汇总写入，且每条计划单独列明
+                    #   挂单价/止损/数量 —— 那才是回溯时要看的东西。
+                    #
+                    # ★★ 必须 `break` 而不是 `continue`：同一批 actions 里
+                    #   排在 place_order 后面的成交/出场动作**全部以「这张单存在」
+                    #   为前提**。单没挂出去还去执行它们，等于拿一个不存在的仓位
+                    #   下单 —— 11-24 那 15 条幽灵动作正是这么来的
+                    #   （状态机从 K 线推出 FILLED，再推出 close，交易所那头没单）。
+                    #   宁可这一轮什么都不做，下一根重新推导。
+                    logger.warning(
+                        "[挂单] %s 丢弃本批剩余的 %d 个动作（它们都以该挂单存在为前提）",
+                        tid, len(res.actions) - len(placed) - 1)
+                    break
+                done = await self._apply_pending_action(act, th, ts)
+                if done:
+                    placed.append(act.kind)
+                elif str(getattr(act, "kind", "") or "") == "place_order":
+                    failed_place = True
+                    # ★ BUS-B：把路由层的拒绝原因取出来（哪道闸 + 为什么）。
+                    #   以前这里只知道"没挂成"，于是决策行只能写"等触发"，
+                    #   而真正的原因（安全闸/仓位不可行/交易所拒单）只进了
+                    #   risk_events —— 决策流上看不见，用户就被误导了。
+                    _r = getattr(self, "_last_route", None)
+                    if _r is not None and not _r.placed:
+                        blocked = str(getattr(_r, "rejection", "") or "")
+                    if not blocked:
+                        blocked = "挂单未成功（路由层未给出原因，查 risk_events）"
+                    # ★★ 挂单没成 → 本批**后续动作一律不做**。
+                    #
+                    #   同一批 actions 里 place_order 后面的成交/出场动作，
+                    #   全部都以「这张单存在」为前提。单没挂出去还去执行它们，
+                    #   等于拿一个不存在的仓位下单 —— 这正是事故的形态：
+                    #   交易所没单，状态机却推出 FILLED 再推出 close。
+                    #   宁可这一轮什么都不做（状态退回 EXPECTED、下一根重来）。
+                    logger.warning(
+                        "[挂单] %s 挂单未成功 → 丢弃本批剩余的 %d 个动作",
+                        tid, len(res.actions) - len(placed) - 1)
+                    break
+
+            # ★★ 挂单没成功 → 状态**退回 EXPECTED**，绝不落成 ARMED。
+            #
+            #   状态机判成交只看 K 线（`_fill_condition` 比对挂单价），
+            #   它不会去问交易所「我那张单还在吗」。所以只要状态是 ARMED，
+            #   后面就会照着价格走出 FILLED → 出场动作 —— 而交易所那头
+            #   从来没有这张单（2026-11-24：15 条 thesis 全是这种幽灵动作）。
+            #
+            #   退回 EXPECTED 而不是 CANCELLED：这类失败（安全闸、仓位不可行、
+            #   交易所拒单）大多是**可恢复**的，下一根重新 claim + 重挂
+            #   才是原本的设计意图（「挂单，容忍5/6/7……直到成交或撤单」）。
+            #   坏消息不静默：仍然打 WARNING + risk 事件（在 _pending_place 里）。
+            _p_state = newp["state"]
+            _p_armed = newp.get("armed_at_bar")
+            _p_ref = newp.get("armed_ref_close")
+            if failed_place:
+                _p_state = _T.EXPECTED
+                _p_armed = None
+                _p_ref = None
+                logger.warning(
+                    "[挂单] %s 本根未成功挂出 → 状态退回 EXPECTED（不判成交、不平仓）",
+                    tid)
+            elif suppressed:
+                # 被人工仓压住：同理，**不能落成 ARMED**。状态机判成交只看 K 线，
+                # 一旦 ARMED 就会顺着价格推出 FILLED → 出场动作，
+                # 而交易所那头根本没有这张单（11-24 那 15 条幽灵动作）。
+                _p_state = _T.EXPECTED
+                _p_armed = None
+                _p_ref = None
+
+            # ★ 动作落地之后才前移游标（不变量 2）
+            try:
+                self.pending.upsert_thesis(_PTS.row_of(
+                    th, state=_p_state, next_index=newp["next_index"],
+                    armed_at_bar=_p_armed,
+                    armed_ref_close=_p_ref,
+                    bar_ts=ts, ambiguous=bool(res.ambiguous),
+                    note=",".join(placed) or ("place_failed" if failed_place else "")))
+            except Exception as e:
+                logger.error("[挂单] 落库 %s 失败：%s", tid, e, exc_info=True)
+                self.db.log_risk("pending_store_error", "%s: %s" % (tid, str(e)[:200]))
+
+            if placed:
+                self._log_decision(
+                    bars_by_iv, price, equity, now_ms, th.kind, "pending",
+                    "挂单策略 %s %s：%s → %s（%s）"
+                    % (th.direction, tid, res.state, newp["state"],
+                       "只记计划（dry-run）" if self._pending_is_dry() else ",".join(placed)))
+
+            # ★★ 成交那一刻必须落账。
+            #
+            #   2026-11-20 实测：自检单 10:05:06 成交，什么都没写库；
+            #   10:09:30 周期对账发现「数据库 +0.000000(空仓)，交易所 +0.005000」，
+            #   按 §13.2 判成**人工仓接管** → 止损被换成 25% 兜底、止盈清零、
+            #   且「接管仓不判策略出场」。于是挂单策略的每一笔真实成交，
+            #   5 分钟后都会变成一笔不受策略保护的裸仓。
+            if str(newp["state"]) == _T.FILLED and str(prog.get("state")) != _T.FILLED:
+                await self._pending_book_fill(th)
+
+            # ★ 逐条留痕，但**不在这里落库** —— 攒到循环外写一条汇总，
+            #   因为 `_log_decision` 本身按 3s 桶去重（同一根 bar 只保留第一条），
+            #   在循环里写会被静默丢掉，只剩最后一条/第一条，等于没有。
+            _desc = self._pending_thesis_brief(th, _p_state, price, suppressed,
+                                               blocked=blocked)
+            if _desc:
+                _briefs.append(_desc)
+            if blocked:
+                _blocked_any = True
+                _gates_all.append({"gate": self._blocked_gate(blocked), "ok": False,
+                                   "detail": blocked})
+
+        # ★★ A1：**每根 5m 收盘，只要还有 live 预期，就写一条决策**。
+        #
+        #   用户 2026-11-24：「系统决策跟下不下单没一点关系，系统不停，决策不止，
+        #   你所有的决策不用管有一个存储，用于在 web 端不断的显示出系统决策行为吗？」
+        #   事故前这条链只在两种情况下写 decisions：
+        #     · 没有任何 live 行（计划源为空）
+        #     · 本根**真的挂出去了**（`placed` 非空）
+        #   于是「在等触发价」「挂单还挂在交易所」「被人工仓压住没下」这三种
+        #   最需要回溯的状态，一条记录都没有 —— 生产库 11-24 全天只有 1 行决策，
+        #   而那 1 行还是事故本身。这就是「决策不止」名存实亡的根因。
+        if _briefs:
+            # ★ BUS-B：动作名必须区分「被闸门拦下」和「正常在等」。
+            #   action 是决策流的筛选项和颜色依据（看板按 pending* 着色），
+            #   如果拦截也写成 pending，用户过滤时根本看不出"整晚没动"是因为被挡着。
+            if _blocked_any:
+                _act = "pending_blocked"
+            elif _adopted:
+                _act = "pending_suppressed"
+            else:
+                _act = "pending"
+            self._log_decision(
+                bars_by_iv, price, equity, now_ms,
+                ("pending_adopted" if _adopted else "pending"),
+                _act,
+                "挂单策略：%d 条预期在管｜%s" % (len(_briefs), "；".join(_briefs)),
+                # ★ 拦截信息进 gates 列：和另外两条开仓路径（scalp/trend）
+                #   的决策形状对齐 —— 那边被闸门拦下时都会带 gates，
+                #   挂单这边以前是空的，看板上就少了一整列因果。
+                gates=_gates_all or None,
+                # ★ force：本根可能已经被 `_step_adopted_exit` 写过一行"在管"，
+                #   但那是**另一件事**（人工仓出不出场）。这条是「系统决策了什么」，
+                #   少了它，用户要的「决策不止」在库面上就断了。
+                force=True)
+
+    @staticmethod
+    def _blocked_gate(rejection: str) -> str:
+        """从路由层的拒绝文本里抽出闸门名。
+
+        路由层给的形状是 ``"闸门名：理由"``（见 `order_router.route`），
+        而 `decisions.gates` 要的是 ``{"gate":..., "ok":..., "detail":...}``。
+        这里拆开，保证两个读者（日志 / 决策表）看到的是同一份事实。
+        """
+        s = str(rejection or "")
+        head, sep, tail = s.partition("：")
+        if sep and head and len(head) <= 40:
+            return head
+        return "出站拦截"
+
+    def _pending_thesis_brief(self, th, state, price, suppressed=False,
+                              blocked="") -> str:
+        """把一条预期的当前处境压成一句话（给决策表用）。
+
+        ★ 只描述**事实**，不做判断：这条 thesis 现在在哪一步、在等什么、
+          离触发还有多远。回溯时缺的正是这些，而不是又一句「跳过」。
+
+        ★ BUS-B `blocked`：这一条为什么**没能挂出去**。
+          以前挂单失败时决策行写的是「等触发（挂单 X / 止损 Y）」——
+          那句话在失败场景下是**假的**：单根本没挂出去，价格永远等不到它。
+          现在把闸门名和理由原样带出来，决策流上看到的就是真因。
+        """
+        try:
+            tid = str(getattr(th, "thesis_id", "") or "")
+            short = tid.split("|")[0][:12] if tid else "?"
+            where = float(getattr(th, "order_price", 0.0) or 0.0)
+            stop = float(getattr(th, "stop_price", 0.0) or 0.0)
+            dist = ""
+            if where > 0 and price > 0:
+                dist = "，距挂单价 %.2f%%" % (abs(price - where) / where * 100.0)
+            st = str(state or "")
+            if suppressed:
+                # ★ A2：被压制的那条计划必须**逐条**记清「本应挂什么价、多少量、
+                #   止损在哪、为什么没下」。只记一个计数等于没记 —— 回溯时
+                #   看不出系统当时到底想做什么。
+                _qty = float(getattr(th, "qty", 0.0) or 0.0)
+                _tgt = float(getattr(th, "target_price", 0.0) or 0.0)
+                return ("%s 应挂%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）%s"
+                        "——因存在接管的人工仓，只决策不下单"
+                        % (short, str(getattr(th, "direction", "") or ""),
+                           _qty, where, stop, _tgt, dist))
+            if blocked:
+                # 决策为「应挂单」但被闸门拦下：写清**本应挂什么** + **被谁拦的**。
+                _qty = float(getattr(th, "qty", 0.0) or 0.0)
+                _tgt = float(getattr(th, "target_price", 0.0) or 0.0)
+                return ("%s 应挂%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）%s"
+                        "——被【%s】拦下，未下单"
+                        % (short, str(getattr(th, "direction", "") or ""),
+                           _qty, where, stop, _tgt, dist, blocked))
+            if st == "EXPECTED":
+                return "%s 等触发（挂单 %.2f / 止损 %.2f）%s" % (short, where, stop, dist)
+            if st == "ARMED":
+                return "%s 挂单在交易所（%.2f）%s" % (short, where, dist)
+            if st in ("FILLED", "PARTIALLY_FILLED"):
+                _b = float((self.pos or {}).get("best") or 0.0)
+                _w = float((self.pos or {}).get("worst") or 0.0)
+                return "%s 已成交（最优 %.2f / 最差 %.2f，止损 %.2f）" % (
+                    short, _b, _w, stop)
+            return "%s %s%s" % (short, st or "?", dist)
+        except Exception:
+            return ""
+
+    async def _pending_book_fill(self, th) -> None:
+        """挂单成交 → 写一条开仓 trade，并把仓位设进 `self.pos`。
+
+        仓位事实取自交易所（`ex.position()`），不拿计划量顶替：
+        部分成交、滑点后的实际手数与计划不是一个数，而止损/平仓都要用实际量。
+
+        ★★ 但「交易所有仓」≠「这笔仓是我的」（2026-11-24 生产事故）。
+
+          `ex.position()` 返回的是**账户级**净持仓，它分不清这笔仓是谁开的。
+          用户手工买的仓在对账接管之前（最多 5 分钟窗口）也会出现在这里，
+          于是「我的限价单成交了」和「用户手工买入了」在代码里长得一模一样 ——
+          一旦按自己成交落账，这笔人工仓就被「洗」成了策略仓，
+          之后 `_pending_close` 的归属校验也拦不住（因为判据正是我们写进去的）。
+
+          ★ 判据只能问交易所：`query_order(client_id=...)`。
+            我这张单在不在、成交了没有、成交了多少 —— 只有交易所答得上来。
+
+          ★ 为什么不用「价格不变量」（我第一版写错了，留在这里当反例）：
+            限价买单的成交价**可以低于**挂单价（更优成交），而事故那笔
+            手工仓 entry=60880 恰好**低于**挂单价 61178.10 ——
+            「买价不高于限价」这条规则会**放行**它。价格长得对，
+            不证明仓位归属对。所以这个思路根本救不了，必须查单。
+        """
+        from . import thesis as _T
+
+        qty = 0.0
+        entry = float(th.order_price)
+        try:
+            actual = await self.ex.position()
+            qty = abs(float(actual.get("qty") or 0.0))
+            entry = float(actual.get("entry") or 0.0) or entry
+        except Exception as e:
+            logger.error("[挂单] %s 成交后查持仓失败：%s", th.thesis_id, e)
+
+        if qty <= 0:
+            # 查不到就**记一笔风险**而不是编一个量：编量会让后面的止损
+            # 保护一个不存在的仓，比不记账更危险。
+            logger.error("[挂单] %s 已成交但查不到持仓量，无法落账", th.thesis_id)
+            self.db.log_risk("pending_fill_unbooked", str(th.thesis_id)[:200])
+            return
+
+        # ★ 归属证据：我那张单真的成交了吗？
+        _filled_qty = await pending_own_filled_qty(self.ex, th.thesis_id)
+        if _filled_qty is None:
+            logger.error(
+                "[挂单] %s 判定成交，但交易所查不到这张单的成交"
+                "（client_id=%s）—— 那笔仓不是我们开的，不落账、不接管",
+                th.thesis_id, pending_client_id(th.thesis_id))
+            try:
+                self.db.log_risk(
+                    "pending_fill_not_ours",
+                    "%s: entry=%.2f qty=%.6f"
+                    % (th.thesis_id, entry, qty))
+            except Exception:
+                pass
+            return
+
+        side = "long" if str(th.direction).lower() == _T.UP else "short"
+        now_ms = int(time.time() * 1000)
+        stop = float(th.stop_price)
+        target = float(th.target_price)
+        # ★★ 入账数量必须是【我这张单成交了多少】，不是账户净持仓（2026-11-24）。
+        #
+        #   旧写法 `qty = abs(actual["qty"])` 是账户级净量：
+        #     用户手工仓 0.032 + 我这单成交 0.010 → 净 0.042
+        #     → 写一条 qty=0.042、open_reason='挂单成交' 的交易
+        #     → 用户那 0.032 被"洗"成策略仓，它自己的入场价和止损一起消失。
+        #   这正是 11-24 事故的同一族缺陷：一个来源覆盖了另一个来源。
+        #   用户 2026-11-24 明确要求「已存在的单子是系统单子，属于加仓行为，
+        #   当然要执行」—— 加仓要执行，但只能记自己那一份。
+        book_qty = float(_filled_qty)
+        if book_qty <= 0:
+            logger.error("[挂单] %s 查单成交量为 %r，不落账", th.thesis_id, book_qty)
+            return
+        if book_qty > qty + 1e-9:
+            # 理论上不可能：我们这单的量不可能超过账户净量。
+            # 出现就是数据不自洽，宁可停手也不写一个超量。
+            logger.error("[挂单] %s 查单成交量 %.6f 超过账户净量 %.6f，拒绝落账",
+                         th.thesis_id, book_qty, qty)
+            self.db.log_risk("pending_fill_qty_inconsistent",
+                             "%s: own=%.6f net=%.6f"
+                             % (th.thesis_id, book_qty, qty))
+            return
+        # 我这一份的成交价：账户均价里混着人工仓的成本，能查到就用自己的均价
+        entry = float(getattr(th, "order_price", 0.0) or 0.0) or entry
+        # ★★ 开仓手续费必须记真实值（2026-11-24 统一口径）。
+        #   以前这里写死 `fee: 0.0`，于是 `close_booking()` 算净盈亏时
+        #   开仓费永远是 0 —— 就算平仓路径改对了，这一侧的窟窿还在。
+        #   查不到真实 commission 就按 taker 估算（保守方向：多算成本）。
+        open_fee = await pending_own_fill_fee(self.ex, th.thesis_id)
+        if open_fee <= 0:
+            try:
+                _is_spot = bool(getattr(self.tcfg, "is_spot", False))
+                _rate = self.tcfg.taker_fee_for(_is_spot)
+            except Exception:
+                _rate = 0.0005
+            open_fee = abs(book_qty * entry * _rate)
+            logger.warning(
+                "[挂单] %s 查不到开仓真实手续费，按 taker %.4f%% 估算为 %.6fU",
+                th.thesis_id, _rate * 100.0, open_fee)
+        else:
+            logger.info("[挂单] %s 开仓手续费（交易所真实值）%.6fU",
+                        th.thesis_id, open_fee)
+        try:
+            self.db.log_trade({
+                "symbol": self.tcfg.symbol, "side": side, "qty": book_qty,
+                "entry_ts": now_ms, "entry_price": entry,
+                "stop_price": stop, "target_price": target,
+                "fee": open_fee, "open_reason": PENDING_FILL_REASON, "paper": 0,
+                "strategy": self.tcfg.strategy,
+                "max_hold_bars": self.tcfg.max_hold_bars})
+        except Exception as e:
+            logger.error("[挂单] %s 成交落账失败：%s", th.thesis_id, e, exc_info=True)
+            self.db.log_risk("pending_fill_book_error",
+                             "%s: %s" % (th.thesis_id, str(e)[:200]))
+            return
+
+        # ★ 加仓：**系统仓**同向就累加，绝不碰 `adopted_pos`（人工仓）。
+        #
+        #   以前这里是 `self.pos = {...}` 无条件覆盖 —— 有手工仓在时不只
+        #   吞掉人工仓，还会把它的止损换成本 thesis 的止损。
+        #   用户 2026-11-24：「假如已存在的单子是系统单子，属于加仓行为，
+        #   当然要执行」—— 执行，而且必须记成系统仓，不是覆盖整笔仓。
+        if self.pos and norm_side(self.pos.get("side")) == side:
+            _oq = float(self.pos.get("qty") or 0.0)
+            _oe = float(self.pos.get("entry") or 0.0)
+            _nq = _oq + book_qty
+            self.pos["entry"] = ((_oe * _oq + entry * book_qty) / _nq) if _nq > 0 else entry
+            self.pos["qty"] = _nq
+            # 止损/止盈取**更近的那一条**（更保守的一侧）：
+            # 加仓后暴露变大，保护必须跟着收紧的方向走，不能放宽。
+            for _k in ("stop", "target"):
+                _old = float(self.pos.get(_k) or 0.0)
+                _new = float((stop if _k == "stop" else target) or 0.0)
+                if _old > 0 and _new > 0:
+                    if side == "long":
+                        self.pos[_k] = min(_old, _new) if _k == "stop" else max(_old, _new)
+                    else:
+                        self.pos[_k] = max(_old, _new) if _k == "stop" else min(_old, _new)
+                elif _new > 0:
+                    self.pos[_k] = _new
+            logger.warning("[挂单] %s 系统仓加仓：+%.6f @ %.2f → 合计 %.6f，均价 %.2f",
+                           th.thesis_id, book_qty, entry, _nq, self.pos["entry"])
+        elif self.pos:
+            # 反向成交 = 先平后反手，不属于"加仓"，拒绝自动处理交人工。
+            logger.error("[挂单] %s 成交方向 %s 与现有系统仓 %s 相反，拒绝覆盖",
+                         th.thesis_id, side, self.pos.get("side"))
+            self.db.log_risk("pending_fill_opposite_side",
+                             "%s: new=%s/%s old=%s/%s"
+                             % (th.thesis_id, side, book_qty,
+                                self.pos.get("side"), self.pos.get("qty")))
+            try:
+                self.guard.position_mismatch(
+                    "挂单成交方向与现有系统仓相反：%s，需人工核查" % th.thesis_id)
+            except Exception:
+                pass
+            return
+        else:
+            self.pos = {"side": side, "qty": book_qty, "entry": entry,
+                        "stop": stop, "target": target, "entry_ts": now_ms,
+                        "bars": 0, "best": entry, "worst": entry, "trade_id": None,
+                        "max_hold_bars": self.tcfg.max_hold_bars,
+                        "open_reason": PENDING_FILL_REASON, "paper": 0,
+                        "fee": open_fee}
+        logger.warning("[挂单] %s 成交落账：%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）",
+                       th.thesis_id, side, book_qty, entry, stop, target)
+
+    @staticmethod
+    def _to_pending_bars(seq) -> list:
+        """把行情池的 `Bar` 转成状态机要的 `(ts/o/h/l/c)` 形状。
+
+        ★★ 这一步**不能省**，而且不能交给 `pending_plan._norm`。
+
+          `feed` 的 `Bar` 是 NamedTuple，字段顺序是
+              (interval_ms, open_time, open, high, low, close, volume)
+          而 `pending_plan._norm` 对“没有 .ts/.o 属性”的对象按
+              (ts, o, h, l, c) 取下标。
+
+          两边一对上就是灾难：time 变成 interval_ms(3000)、open 变成
+          open_time(1.7e12)、close 变成 high。不报错、不抛异常，只是所有价位
+          判定全部错位。上一次这类型的错在这个项目里叫做“同一事实两个来源”，
+          已经出事过 8 次。所以这里**按字段名显式取**，不靠位置对齐。
+        """
+        from .pending_plan import _Bar
+        out = []
+        for b in (seq or ()):
+            if hasattr(b, "open_time") and hasattr(b, "close"):
+                out.append(_Bar(b.open_time, b.open, b.high, b.low, b.close))
+            elif hasattr(b, "ts") and hasattr(b, "c"):
+                out.append(b)
+            else:
+                out.append(_Bar(b[0], b[1], b[2], b[3], b[4]))
+        return out
+
+    async def _apply_pending_action(self, act, thesis_obj, bar_ts: int) -> bool:
+        """把一条动作真正落地。返回 True = 已执行（或已按 dry-run 记账）。
+
+        ★ 幂等：`put_action` 返回 False 表示这批动作以前算出来过
+          （进程重启后重算同一根 K），此时直接跳过执行。
+        """
+        tid = str(getattr(act, "thesis_id", "") or "")
+        kind = str(getattr(act, "kind", "") or "")
+        if not kind:
+            return False
+        try:
+            fresh = self.pending.put_action(
+                thesis_id=tid, kind=kind, state_after=str(getattr(act, "state_after", "") or ""),
+                bar_ts=bar_ts, price=float(getattr(act, "price", 0.0) or 0.0),
+                payload=getattr(act, "to_dict", lambda: {})())
+        except Exception as e:
+            logger.error("[挂单] 记动作失败 %s %s：%s", tid, kind, e)
+            return False
+        if not fresh:
+            return False                # 幂等：这条动作已经处理过
+
+        dry = self._pending_is_dry()
+        if dry:
+            logger.info("[挂单][dry-run] %s %s %s @ %.1f（只记计划，不挂单）",
+                        tid, kind, getattr(act, "side", ""), float(getattr(act, "price", 0.0) or 0.0))
+            self.pending.mark_applied(tid, kind, bar_ts)
+            return True
+
+        try:
+            if kind == "place_order":
+                # ★ 下单没成 → 这条动作**不能**记成已执行。
+                #
+                #   以前无论成败都往下走到 `mark_applied`，于是交易所那头
+                #   什么都没有、库里写着「已挂单」。状态机接着按 K 线判成交，
+                #   一路推出幽灵平仓单（2026-11-24：15 条 thesis 全部如此）。
+                #   留一个「未 applied」的动作，上层才能把状态退回 EXPECTED。
+                if not await self._pending_place(act, thesis_obj):
+                    return False
+            elif kind == "cancel":
+                await self._pending_cancel(act)
+            elif kind == "close":
+                await self._pending_close(act, thesis_obj)
+            else:
+                logger.warning("[挂单] 未知动作 %r（%s），已记录但未执行", kind, tid)
+                return False
+            self.pending.mark_applied(tid, kind, bar_ts)
+            return True
+        except Exception as e:
+            logger.error("[挂单] 执行动作失败 %s %s：%s", tid, kind, e, exc_info=True)
+            self.db.log_risk("pending_action_error",
+                             "%s %s: %s" % (tid, kind, str(e)[:200]))
+            return False
+
+    # ---------------- 挂单策略：仓位与执行 ----------------
+
+    def _pending_size(self, entry: float, stop: float,
+                      order_type: str = "") -> Tuple[float, str]:
+        """按**项目已定的仓位口径**算一笔挂单的手数。返回 ``(qty, 拒绝理由)``。
+
+        ★★ 唯一口径是 `sizing.plan_position()` —— 我不是"参考"它，是把
+          判定权完全交给它。这里只额外做**交易所规格**那一层（步长取整、
+          最小名义复查），因为那是币安的一手/最小额，不是风控口径。
+
+        ★ 为什么必须这么改（2026-11-17 修正的一个真缺陷）：
+          上一版我写了
+
+              notional = min(risk_usd / stop_frac, margin_cap x leverage)
+
+          也就是**把保证金上限当成"夹一下"**。但项目规则（sizing.py 模块
+          docstring §3.1）明确写的是「仓位由风险定仓，保证金比例只是
+          **上限校验**，不参与定仓」，并给了理由：夹完之后的止损距离会落到
+          双边手续费+滑点的噪音里。两条实现给出相反答案 —— 实测同一批
+          11 条真实计划：
+
+              plan_position()    → 0/11 可开（保证金 27.0~76.6U 超上限 20U）
+              _pending_size()    → 11/11 可开，但**实际风险只有 0.45~1.31U**
+                                   而配置说 2U
+
+          也就是说：看着像在下 5% 风险的仓，实际一半都不到，而且不报错。
+          这就是这个项目反复吃亏的「同一件事两个来源」。现在只留一个来源。
+
+        ★ 50U 本金下的真实约束（写在这里免得下次又去猜）：
+
+              能开仓 ⟺ 止损% ≥ 单笔风险% ÷ (保证金上限% × 杠杆)
+
+          本金在不等式两边约掉了 —— 所以「本金加大」并不能让窄止损变得可开，
+          除非同时动这三个量里的某一个。
+        """
+        entry = float(entry or 0.0)
+        stop = float(stop or 0.0)
+        if entry <= 0 or stop <= 0:
+            return 0.0, "计划缺少入场价或止损价（entry=%r stop=%r）" % (entry, stop)
+        stop_frac = abs(entry - stop) / entry
+        if stop_frac <= 0:
+            return 0.0, "止损距离为 0：这笔单没有任何保护"
+
+        # ★★ 成本必须进风险预算。
+        #
+        #   只用 `R ÷ 止损距离` 定仓时，止损被打时亏的是
+        #   「风险 + 手续费 + 滑点」，不是 R。实测 11 条真实计划：
+        #   用形态止损定仓时实际亏 2.61~3.74 倍 R（手续费占风险 31%~87%）。
+        #
+        #   口径：`round_trip_costs()`就是成本的唯一来源，
+        #   与 `plan_prices()` 同一个函数 —— 不允许各算一份。
+        from .pending_plan import PendingParams, round_trip_costs
+        try:
+            _cw, cost_pts = round_trip_costs(
+                entry, (order_type or "LIMIT").upper(), PendingParams())
+        except Exception:
+            logger.warning("[挂单] 成本口径不可用，拒绝开仓", exc_info=True)
+            return 0.0, "成本口径不可用，拒绝开仓"
+        cost_frac = cost_pts / entry if entry else 0.0
+        # 风险预算 = 止损距离 + 成本。两者合起来才是「最坏亏 R」。
+        risk_frac = stop_frac + cost_frac
+
+        # ★ 取数必须走 `_sizing_params()`，不要直接 `self.settings.sizing()`。
+        #
+        # 两者不是一回事：`settings.sizing()` 只有 3 个键（本金/风险/杠杆），
+        # 而 `_sizing_params()` 还带 `sizing.margin_cap_pct`（100%）—— 它是守卫
+        # 实际用的那份。直接拿 settings.sizing() 去建 SizingConfig，
+        # 保证金上限会静默落回 dataclass 默认的 40%，于是
+        # 同一笔计划“守卫说能开、挂单说不能”。
+        params = self._sizing_params()
+        if params is None:
+            return 0.0, "仓位参数不可用（读不到 Web 配置），拒绝开仓"
+
+        try:
+            from .sizing import SizingConfig, plan_position
+            cfg = SizingConfig(
+                capital=float(params["sizing.capital"]),
+                risk_pct=float(params["sizing.risk_pct"]),
+                leverage=float(params["sizing.leverage"]),
+                # 保证金上限：与守卫同一份（默认 100% = 不额外截断）。
+                # 注意这不是“放宽”—— 它只在**风险定仓**路径上生效，
+                # 真正限制仓位的仍然是 R/止损%。
+                margin_cap_pct=float(params.get("sizing.margin_cap_pct", 100.0)))
+            # ★ 传入的是**含成本**的风险距离 —— 这才是真正会亏的那个量。
+            #   计划层已把止损往里让出成本（d_max - cost），
+            #   所以 risk_frac ≈ d_max，正好贴着爆仓安全上限，不会超。
+            pp = plan_position(cfg, risk_frac * 100.0)
+        except Exception as e:
+            return 0.0, "仓位参数不可用：%s" % str(e)[:120]
+
+        # ★ 判定权在 plan_position：它说不行就是不行，这里不许"夹一下再说"。
+        if not pp.ok:
+            return 0.0, "风控拒绝：%s" % "；".join(pp.reasons)
+
+        # ---- 以下才是这一层独有的：交易所规格 ----
+        notional = float(pp.notional)
+        if notional <= 0:
+            return 0.0, "风控算出名义为 0（本金过小或止损距离异常）"
+        step = float(self._qty_step() or 0.0)
+        if step <= 0:
+            return 0.0, "步长为 0，无法取整"
+        lots = int(notional / entry / step)
+        qty = round(lots * step, 10)
+        if qty <= 0:
+            return 0.0, ("取整后为 0（名义 %.2fU / 价 %.1f / 步长 %r）"
+                         % (notional, entry, step))
+        real_notional = qty * entry
+        if real_notional < self._min_notional():
+            return 0.0, ("取整后名义 %.2fU 低于最小下单 %.2fU"
+                         % (real_notional, self._min_notional()))
+        # 取整只会变小，所以保证金不会反而超限；这里只是把数字带出去记账。
+        margin = real_notional / max(float(cfg.leverage), 1e-9)
+        if margin > pp.margin + 1e-9:      # pragma: no cover - 防御性
+            return 0.0, "取整后保证金 %.2fU 反而超过 %.2fU（取整方向错了）" % (
+                margin, pp.margin)
+        return qty, ""
+
+    async def _pending_place(self, act, thesis_obj) -> bool:
+        """挂一张单。仓位来自 `_pending_size`，不在这里算任何数。
+
+        Returns:
+            True  = 这张单**真的挂出去了**（交易所接受了）。
+            False = 没挂出去（安全闸拦下 / 仓位不可行 / 交易所拒绝）。
+
+        ★ 为什么必须返回这个布尔（2026-11-24 生产事故）：
+
+          以前这个函数是 `-> None`，所有失败分支都只是「打个日志 + return」。
+          于是上层 `_apply_pending_action` 无从区分「挂上了」和「没挂上」，
+          照样 `mark_applied` + 把 thesis 写成 ARMED。而状态机的下一步
+          是按**K 线**判成交的（`_fill_condition` 只看价格有没有走到挂单价），
+          它不会去问交易所「我那张单还在吗」。
+
+          实测：-4015 让每一张单都挂不出去，但 18 条 thesis 里 15 条都被
+          推成了 FILLED 又平掉 —— 全是没有成交基础的幽灵动作。
+
+          失败必须是**可观测的返回值**，不能只活在一行日志里。
+        """
+        tid = str(getattr(act, "thesis_id", "") or "")
+        price = float(getattr(act, "price", 0.0) or 0.0) or float(thesis_obj.order_price)
+        stop = float(thesis_obj.stop_price)
+
+        # ★★ 2026-11-24 BUS-A：拦截与下单搬进**出站路由层**。
+        #
+        #   改之前是三段 if 平铺在这个函数里：
+        #       guard.can_open()  →  _pending_size()  →  ex.place_order()
+        #   同样的逻辑在另外三条开仓路径上各写了一遍，而且已经漂移过：
+        #   2026-11-17 挂单路径**漏了** guard.can_open()，于是数据源 DOWN、
+        #   日亏损上限、连亏冷却、熔断、持仓不一致这些保护在最新那条策略上
+        #   全部静默失效，且不报错。
+        #
+        #   现在三关变成三个**具名闸门**，顺序在 `_pending_router()` 里一眼可数。
+        #   行为零变化：每个闸内部的日志、risk 事件、返回语义全部逐字保留，
+        #   连"闸门抛异常要冒到上层记 pending_action_error 并让动作不算已执行"
+        #   这条也保留（路由层不吞异常，见 order_router 模块注释）。
+        intent = EntryIntent(
+            strategy=str(self.tcfg.strategy or "pending"),
+            side=norm_side(getattr(act, "side", "")),
+            entry=price, stop=stop,
+            target=float(getattr(thesis_obj, "target_price", 0.0) or 0.0),
+            order_type=str(getattr(act, "order_type", "") or "LIMIT").upper(),
+            client_id=pending_client_id(tid),
+            reason=str(getattr(act, "reason", "") or ""),
+            thesis_id=tid,
+            bar_ts=int(getattr(act, "bar_ts", 0) or 0),
+        )
+        # ctx 只承载"闸门之间要传递的数据"（手数），不放任何交易状态。
+        ctx = {"qty": 0.0, "size_why": ""}
+        # ★ F9（2026-11-24 审查）：**先清空再路由**。
+        #   以前只在路由返回后才赋值，而路由层刻意不吞异常
+        #   （见 order_router 模块注释）。于是路由抛异常时 `_last_route`
+        #   仍是**上一条 thesis** 的拒绝原因，上层 3245 行读到它，
+        #   就把别人的闸门名字写进了这一条的决策行 —— 一条张冠李戴的
+        #   "证据"比没有证据更糟，排查时会一路追错方向。
+        #   清空之后，上层走的是那句诚实的兜底文案。
+        self._last_route = None
+        res = await self._pending_router().route(intent, ctx)
+        # ★ BUS-B：把路由结果留在引擎上，让上层能把**是哪道闸拦的**写进决策。
+        #   这是"拒绝也必然产出一条决策"的传话通道：路由层不碰数据库
+        #   （它只做编排），落库仍然只有引擎一个写入口。
+        self._last_route = res
+        return res.placed
+
+    # ---------------- 挂单路径的闸门与下单动作 ----------------
+    def _pending_router(self) -> OrderRouter:
+        """挂单开仓的拦截链。**顺序即优先级，改顺序等于改风控。**
+
+        1. 无人值守闸 —— 数据源/日亏损/连亏/熔断/持仓不一致
+        2. 仓位闸     —— `sizing.plan_position()` 唯一口径 + 交易所规格
+        3. 下单       —— 只有前两关都放行才会执行
+
+        每次调用现建一个（闸门是绑定方法，构造成本可忽略；
+        缓存反而会让"配置改了但链还是旧的"这种问题重新出现）。
+        """
+        return OrderRouter(
+            gates=[self._gate_pending_unattended, self._gate_pending_size],
+            placer=self._place_pending_order)
+
+    async def _gate_pending_unattended(self, intent, ctx) -> Optional[GateResult]:
+        """无人值守闸：只在**开仓**时拦，撤单/平仓绝不能过这道闸。
+
+        熔断期间反而是最需要能平仓的时候。
+        """
+        if self.guard is None:
+            return None
+        g_ok, g_why = self.guard.can_open()
+        if g_ok:
+            return GateResult(gate=GATE_UNATTENDED, ok=True)
+        logger.warning("[挂单] %s 被安全闸拦下，不挂单：%s", intent.thesis_id, g_why)
+        self.db.log_risk("pending_blocked_by_guard",
+                         "%s: %s" % (intent.thesis_id, g_why))
+        return GateResult(gate=GATE_UNATTENDED, ok=False, detail=str(g_why or ""))
+
+    async def _gate_pending_size(self, intent, ctx) -> Optional[GateResult]:
+        """仓位闸：手数由 `_pending_size()` 唯一决定，这里只搬运结论。"""
+        qty, why = self._pending_size(
+            intent.entry, intent.stop,
+            str(intent.order_type or "").upper())
+        if qty <= 0:
+            logger.warning("[挂单] %s 计划不可行，本次不挂单：%s",
+                           intent.thesis_id, why)
+            self.db.log_risk("pending_unaffordable",
+                             "%s: %s" % (intent.thesis_id, str(why)[:220]))
+            return GateResult(gate=GATE_SIZING, ok=False, detail=str(why or ""))
+        ctx["qty"] = qty
+        ctx["size_why"] = why
+        return GateResult(gate=GATE_SIZING, ok=True,
+                          detail="%.6f 张" % qty)
+
+    async def _place_pending_order(self, intent, ctx):
+        """真正的下单动作。**只有全部闸门放行才会被调用。**"""
+        tid = intent.thesis_id
+        qty = float(ctx.get("qty") or 0.0)
+        side = str(intent.side or "").upper()
+        otype = str(intent.order_type or "LIMIT").upper()
+        # 下单接口认 buy/sell，不认 long/short —— 这里转一次，别把口径带下去。
+        api_side = "BUY" if side == "LONG" else "SELL"
+        order, err = await self.ex.place_order(
+            api_side, qty, order_type=otype, price=intent.entry,
+            client_id=intent.client_id)
+        if err:
+            logger.error("[挂单] %s 下单失败：%s", tid, err)
+            self.db.log_risk("pending_place_failed", "%s: %s" % (tid, err[:220]))
+            return False, None, str(err)
+        logger.info("[挂单] %s %s %.6f @ %.1f（止损 %.1f，%s） -> %s",
+                    tid, api_side, qty, intent.entry, intent.stop, otype,
+                    getattr(order, "status", ""))
+        self.db.log_risk("pending_placed",
+                         "%s %s %.6f @ %.1f" % (tid, api_side, qty, intent.entry))
+        return True, order, ""
+
+    async def _pending_cancel(self, act) -> None:
+        """撤挂单。“已经不在了”按成功处理（目的状态已达成）。
+
+        ★ client_id 必须和 `_pending_place` 逐字一致（同一个 ``AI-pend-``
+          前缀）。两处各写一份就会撤不掉自己的单，而报错只有
+          "撤单失败" —— 项目里这类"同一事实两个来源"已经出过很多次，
+          所以这里和下单处调**同一个函数** `pending_client_id()`。
+        """
+        tid = str(getattr(act, "thesis_id", "") or "")
+        cid = pending_client_id(tid)
+        fn = getattr(self.ex, "cancel_order", None)
+        if fn is None:
+            logger.warning("[挂单] %s 需要撤单，但执行器不支持撤单", tid)
+            return
+        ok = await fn(client_id=cid)
+        if ok:
+            logger.info("[挂单] %s 已撤单（%s）", tid, getattr(act, "reason", ""))
+        else:
+            logger.error("[挂单] %s 撤单失败（%s）", tid, getattr(act, "reason", ""))
+            self.db.log_risk("pending_cancel_failed", tid)
+
+    async def _pending_close(self, act, thesis_obj) -> None:
+        """平掉持仓。手数用**仓位事实**（self.pos），不用计划里的 qty。
+
+        ★ 为什么不能用计划 qty：计划的 qty 是「打算开多少」，而平仓要平「
+          实际持有多少」。两者不一致的场景很常见（部分成交、手工干预、
+          强平）。用计划量会平不干净或超卖 —— 而超卖在合约上等于反向开仓。
+        """
+        tid = str(getattr(act, "thesis_id", "") or "")
+        pos = self.pos or {}
+        qty = abs(float(pos.get("qty") or 0.0))
+        if qty <= 0:
+            logger.warning("[挂单] %s 需要平仓，但引擎认为空仓－仍然记账", tid)
+            return
+
+        # ★★ 只能平**自己开的**仓（2026-11-24 生产事故的第二道闸）。
+        #
+        #   判据用 `open_reason`：挂单成交写的是 `"挂单成交"`，而对账接管
+        #   写的是 `ADOPT_REASON`（`实盘对账接管`）。手单/接管仓永远不等于
+        #   `"挂单成交"`，所以这条能挡住「拿策略动作平人工仓」。
+        #
+        #   ★ 为什么不在这里看 `_is_adopted()`：那道闸在 `_step_pending`
+        #     入口（更早、覆盖面更大）。这里是**纵深防御**：即使将来有人
+        #     在别处（自检、补单、脚本）直接调 `_pending_close`，
+        #     也不会把不属于这条 thesis 的仓卖掉。
+        #
+        #   实测事故：11-24 09:00 的 close 动作平掉的是
+        #   `open_reason='实盘对账接管'`、qty 0.032、entry 60880 的人工仓，
+        #   而那条 thesis 计划的量是 0.010 且**一张单都没挂出去**。
+        _oreason = str(pos.get("open_reason") or "")
+        if _oreason != PENDING_FILL_REASON:
+            logger.error(
+                "[挂单] %s 拒绝平仓：当前持仓不是挂单策略开的"
+                "（open_reason=%r，数量 %.6f）—— 不碰它",
+                tid, _oreason, qty)
+            try:
+                self.db.log_risk(
+                    "pending_close_not_owned",
+                    "%s: open_reason=%r qty=%.6f" % (tid, _oreason, qty))
+            except Exception:
+                pass
+            return
+
+        side = "SELL" if str(pos.get("side") or "long") == "long" else "BUY"
+
+        # ★★ 平仓必须用 `market_order`，不能走 `place_order(order_type="MARKET")`。
+        #
+        #   2026-11-20 实测（链路自检单）：`place_order` 只接受
+        #   LIMIT/STOP_MARKET/STOP/TAKE_PROFIT_MARKET，传 MARKET 会被执行器直接拒：
+        #       [挂单] ... 平仓失败：不支持挂单类型 'MARKET'
+        #   也就是说**挂单策略从来平不掉仓**。一天里唯一的证伪机会就是真成交一笔。
+        #   平仓的专用入口一直是 `market_order(reduce_only=True)`（_open/_close 都走它，
+        #   而且它会对 reduce_only 放行熔断）。
+        fill = await self.ex.market_order(
+            side, qty, reason=("挂单平仓 %s" % tid), reduce_only=True)
+        if not getattr(fill, "ok", False):
+            err = str(getattr(fill, "reason", "") or "未知原因")
+            logger.error("[挂单] %s 平仓失败：%s", tid, err)
+            self.db.log_risk("pending_close_failed", "%s: %s" % (tid, err[:220]))
+            raise RuntimeError(err)
+
+        exit_price = float(getattr(fill, "price", 0.0) or 0.0)
+        if exit_price <= 0:
+            try:
+                exit_price = float(await self.ex.mark_price())
+            except Exception:
+                exit_price = float(pos.get("entry") or 0.0)
+
+        # ★ 平仓必须同步关账。不关的后果不是"少一行统计"：
+        #   下一轮对账会看到「交易所有平、库里还开着」，而解释差额的成交
+        #   带 `AI-` 前缀 → 判 ours → **硬停**。平仓路径自己制造硬停。
+        entry = float(pos.get("entry") or 0.0)
+        # ★★ 统一口径（2026-11-24）：毛/费/净一律走 `close_booking()`。
+        #   这里以前写的是 `"fee": 0.0, "pnl_net": pnl` —— 开仓费和平仓费
+        #   两边都不记，pnl_net 等于毛盈亏，系统性地偏乐观。
+        pnl, fee_total, pnl_net = close_booking(
+            pos, exit_price, getattr(fill, "fee", 0.0), qty,
+            pos.get("side"))
+        try:
+            self.db.close_trade({
+                "symbol": self.tcfg.symbol, "side": pos.get("side"),
+                "qty": qty, "entry_ts": pos.get("entry_ts"),
+                "entry_price": entry, "exit_ts": int(time.time() * 1000),
+                "exit_price": exit_price,
+                "stop_price": pos.get("stop"), "target_price": pos.get("target"),
+                "pnl_gross": pnl, "fee": fee_total, "pnl_net": pnl_net,
+                "mfe": 0.0, "mae": 0.0,
+                "open_reason": pos.get("open_reason", ""),
+                "close_reason": "挂单策略出场（%s）" % str(getattr(act, "reason", "")),
+                "paper": int(pos.get("paper") or 0)})
+        except Exception as e:
+            logger.error("[挂单] %s 平仓已成交但关账失败：%s", tid, e, exc_info=True)
+            self.db.log_risk("pending_close_book_failed", "%s: %s" % (tid, str(e)[:200]))
+        self.pos = None
+        logger.info("[挂单] %s %s 平 %.6f @ %.2f（%s，毛 %+.2f / 费 %.4f / 净 %+.2f）",
+                    tid, side, qty, exit_price, getattr(act, "reason", ""),
+                    pnl, fee_total, pnl_net)
+
     def _plan_leverage(self) -> float:
-        """现货没有杠杆（也不该有：资金费随名义线性增长，加杠杆等于加倍付费）。"""
-        if self._is_spot():
-            return 1.0
-        return min(float(self.tcfg.trend_leverage), float(self.tcfg.max_leverage))
+        """计划杠杆。永续口径（现货那条 `return 1.0` 已删）。
+
+        ★★ 2026-11-17 修：**挂单路径固定用配置的 `max_leverage`**。
+
+        原来这里是 `min(trend_leverage, max_leverage)`，而
+        `trend_leverage` 默认 **1.0** —— 于是 `main.py` 拿着
+        1.0 去交易所设杠杆，而 `sizing` 那边按 22 倍算保证金。
+        同一个仓位在两处有两个杠杆 —— 又一个「同一件事两个来源」。
+
+        永续挂单的仓位是“风险定仓”算出来的，它的保证金、
+        爆仓距离、最远止损都由这个杠杆推出来，不能取小。
+
+        保留原引擎对 trend/scalp 的口径（它们是满仓思路，
+        与风险定仓不同）—— 所以按策略分流，不是一刀切改。
+        """
+        if self._is_pending():
+            lev = float(self.tcfg.max_leverage)
+        else:
+            lev = min(float(self.tcfg.trend_leverage),
+                      float(self.tcfg.max_leverage))
+        if lev <= 0:
+            raise ValueError("杠杆必须 > 0（当前 %r），拒绝带着 0 杠杆下单"
+                             % (lev,))
+        return lev
 
     def _qty_step(self) -> float:
-        """现货步长 0.00001 BTC，永续 0.001——用错会把仓位算成 0 或差 100 倍。"""
-        if self._is_spot():
-            return 0.00001
+        """数量步长。★ 只有一个来源：`cfg.trading.qty_step`。
+
+        以前这里有一个 `if _is_spot(): return 0.00001`。现货步长和永续差
+        **100 倍**，用错不会报错，只会把仓位算成 0（永续按现货步长）
+        或者差 100 倍（现货按永续步长）。分支删了，不存在“选错”这件事。
+        """
         return self.tcfg.qty_step
 
     def _fee_buffer(self) -> float:
@@ -1337,7 +4326,8 @@ class DecisionEngine:
         下单就会以「保证金不足」被拒——而且是在趋势信号刚出现的时刻。
         留 0.1%（覆盖 0.05% taker 与滑点）把这个洞堵上。
         """
-        return 0.003 if self._is_spot() else 0.001
+        # ★ 永续 0.1%（覆盖 0.05% taker 与滑点）。现货那个 0.3% 已删。
+        return 0.001
 
     def _affordability_note(self, price: float, equity: float) -> str:
         """资金不够建仓时返回说明文字，够则返回空串。
@@ -1347,23 +4337,22 @@ class DecisionEngine:
         混在同一句日志里，运维会一直等一个永远不会来的成交。
         """
         if equity <= 0:
-            return ("余额为 0，无法交易｜现货模式下请确认 USDT 在【现货钱包】，"
-                    "不是合约钱包")
+            return "余额为 0，无法交易｜请确认 USDT 在【合约钱包】"
         step = self._qty_step()
         lev = self._plan_leverage()
         need_notional = max(self._min_notional(), 1.0)
         # 一手 = 一个步长；连一手都不够就没法建仓
         one_lot = step * price / lev
         if equity < one_lot or equity * lev < need_notional:
-            wallet = "现货钱包" if self._is_spot() else "合约钱包"
             return ("资金不足：权益 %.2fU，建一手至少需要 %.2fU 名义（一手 %.6f BTC ≈ %.2fU）"
-                    "｜请确认 USDT 在%s" % (equity, need_notional, step, step * price, wallet))
+                    "｜请确认 USDT 在合约钱包" % (equity, need_notional, step, step * price))
         return ""
 
     def _min_notional(self) -> float:
-        """现货最小名义 5U，永续 50U。这个差异对 100U 账户是能不能建仓的区别。"""
-        if self._is_spot():
-            return 5.0
+        """最小名义（永续 55U 带 10% 余量）。现货那个 5U 已删。
+
+        ★ 这个值对小账户是“能不能建仓”的硬门槛，不是建议值。
+        """
         return self.tcfg.trend_min_notional
 
     def _sizing_params(self):
@@ -1414,6 +4403,25 @@ class DecisionEngine:
             return None
         return snap
 
+    def _pending_params(self):
+        """生成挂单计划用的 `PendingParams`。
+
+        ★★ 生产生成计划**必须**走这一个函数。
+
+        它把 `max_stop_pct` 从 `sizing.derive()` 填进去，于是止损就是
+        公式算出的最远距离。不走它——比如直接 `PendingParams()`——
+        `max_stop_pct` 默认 0，止损会**静默落回振幅规则**，
+        于是仓位被放大 10 倍以上、保证金装不下。
+
+        这正是本项目反复吃亏的「同一件事两个来源」，所以这里把它变成
+        **一个函数**，而不是让调用方自己拼参数。
+        """
+        from .pending_plan import PendingParams
+        params = self._sizing_params()
+        if params is None:
+            return PendingParams()
+        return PendingParams(max_stop_pct=self._max_stop_distance_pct(params))
+
     def _max_stop_distance_pct(self, params: dict) -> float:
         """止损距离上限 = 爆仓距离 / 安全倍数。
 
@@ -1435,6 +4443,32 @@ class DecisionEngine:
         except Exception:
             logger.warning("[ENGINE] 算止损距离上限失败，本项跳过校验", exc_info=True)
             return 0.0
+
+    def _stop_distance_pct(self, ref_price: float = 0.0) -> float:
+        """**任何一个仓位的止损距离（价格 %）** 的唯一来源。
+
+        ★ 为什么要有这个函数（2026-11-24 生产缺陷）：
+
+          同一个概念在这个项目里有三个数：
+            `trend_stop_pct = 25.0`        ← 1 倍杠杆时代的价格跌幅，给趋势仓用
+            `sizing.derive().max_stop...`  ← 1.618%，爆仓距离 / 安全倍数，给挂单用
+            保证金亏损 25%                  ← 用户在 22 倍杠杆下的直觉（≈1.14% 价格）
+
+          25% 价格跌幅在 22 倍杠杆下**永远晚于爆仓**（爆仓只差 4.15%），
+          所以那是一个不可能触发、却在看板上显示成"保护已设好"的止损。
+          三个数里只有 `爆仓距离 / 安全倍数` 这一个在数学上保证
+          「止损一定先于爆仓」，所以其他需要兜底止损的地方一律用它。
+
+        返回的是**价格百分比**（止损价 = 入场价 x (1 - 返回/100)），
+        不是保证金百分比 —— 这个名字必须让人一眼看出量纲。
+
+        `ref_price` 目前不参与计算，留着是为了将来按交易所返回的
+        `liquidationPrice` 精确核对（现货/逐仓/全仓的爆仓价不同口径）。
+        """
+        params = self._sizing_params()
+        if params is None:
+            return 0.0
+        return self._max_stop_distance_pct(params)
 
     def _trend_plan(self, price: float, equity: float, sig: dict):
         """趋势单的仓位：**只有一道闸门（仓位参数），由 gates.position_gate 统一算。**
@@ -1515,25 +4549,13 @@ class DecisionEngine:
             return
         side_txt = plan.side
         order_side = "buy" if side_txt == "long" else "sell"
-        # 开仓前先看一眼账上已有的基础币，用于把零头一起接管。
+        # ★ 现货零头接管已删（2026-11-17 只做合约）。
         #
-        # 为什么要管：现货手续费扣在基础币上，买入到账净额不是 step 整数倍，
-        # 平仓按 step 取整卖出必然留零头；下一笔又叠上去，零头单调长大。
-        # 实测每笔约留 0.0000087 BTC（78000 时约 0.68U），一年 30 笔约 12U，
-        # 约占权益 9%，而且这部分永远不参与策略、跌的时候跟着跌。
-        #
-        # 只接管【小于一个 step】的残留：那一定是我们自己取整留下的。
-        # 用户自己放在现货钱包里的 BTC 会远大于一个 step，绝不能被卖掉。
+        # 原来这段在开仓前读一次账上基础币，把小于一个 step 的零头一起卖掉；
+        # 它存在的原因是现货手续费扣在基础币上，平仓取整必然留残留。
+        # 永续按名义合约交易，不存在这个残留，而且它会多查一次权益
+        # （实盘里是一次 HTTP）、在行情最激烈的时候。
         pre_dust = 0.0
-        if self._is_spot():
-            try:
-                pre = await self.ex.equity()
-                pre_btc = float(pre.get("position_qty") or 0.0)
-                step = self._qty_step()
-                if step > 0 and 0.0 < pre_btc < step:
-                    pre_dust = pre_btc
-            except Exception:
-                logger.warning("开仓前查基础币余额失败，本轮不接管零头", exc_info=True)
         fill = await self.ex.market_order(order_side, plan.qty,
                                           reason="%s 开仓 %s" % (sig["name"], side_txt))
         self._seq += 1
@@ -1611,6 +4633,365 @@ class DecisionEngine:
                     side_txt, plan.qty, fill.price, plan.stop, plan.target, plan.risk_usdt)
 
     # ---------------- 管仓 ----------------
+    # ==================== BUS-C：守卫观察期（只记录，不执行）====================
+    def _guard_config_for_observe(self):
+        """守卫参数（观察期与人工仓出场共用）。
+
+        ★ 两个 0 是用户 2026-11-24 的明确裁决：
+          「不要分批止盈」→ `max_partials = 0`
+          「不要加仓」    → `max_adds = 0`
+
+          所以 P3/P4 分支永远不会命中 —— 这不是配置失误，是裁决结果。
+          `target_1_R` 因此失去意义（它只是 P3 的输入）。
+
+        ★★ `risk_per_trade` 必须有值，否则**整条出场链会中断**。
+
+          这不是理论风险：`GuardConfig.__post_init__` 在
+          `risk_per_trade <= 0` 时抛 ValueError。而如果让它传播出去，
+          `_step_adopted_exit` 就会在止损判断**之前**崩掉 ——
+          于是"因为算不出 R，所以不检查止损"，
+          人工仓变成完全无人保护的裸仓。这是最坏的一种安全。
+
+          所以这里宁可给一个占位值也不抛：R 只影响
+          `profit_R` 的**显示**和 P3（已按裁决关闭），
+          P0 用的是缓冲倍数、P1 用的是止损价，两者都不需要 R。
+          真实值拿不到时记 `_guard_r_known=False`，日志里能看出这是占位。
+        """
+        from .position_guard import GuardConfig
+
+        risk_u = 0.0
+        try:
+            params = self._sizing_params()
+            if params:
+                from .sizing import SizingConfig, derive
+                risk_u = float(derive(SizingConfig(
+                    capital=float(params.get("sizing.capital", 0.0) or 0.0),
+                    risk_pct=float(params.get("sizing.risk_pct", 0.0) or 1.0),
+                    leverage=float(params.get("sizing.leverage", 0.0) or 0.0),
+                )).risk_per_trade)
+        except Exception:
+            logger.warning("[守卫] 算 R 失败（只影响 R 的显示，不影响止损）",
+                           exc_info=True)
+
+        if risk_u <= 0:
+            # 占位 1.0，不是"猜一个真实风险"：它只让 profit_R 显示为
+            # 名义金额，而 P0/P1 完全不读它。
+            self._guard_r_known = False
+            risk_u = 1.0
+            # ★ F6：这个标记必须**真的被看见**。以前只赋值、从不输出，
+            #   文档却说"日志里能看出这是占位" —— 一行装成可观测的假字段。
+            #   每进程只吼一次，避免每 3 秒刷一行。
+            if not getattr(self, "_guard_r_warned", False):
+                self._guard_r_warned = True
+                logger.warning(
+                    "[守卫] 算不出 risk_per_trade，用占位 1.0 —— "
+                    "profit_R 会显示成名义金额，P0/P1 不读它，止损照常")
+        else:
+            self._guard_r_known = True
+
+        return GuardConfig(risk_per_trade=risk_u,
+                           max_adds=0,          # 用户裁决：不加仓
+                           max_partials=0,      # 用户裁决：不分批止盈
+                           safety_multiple=2.5,
+                           allow_new_risk=True)
+
+    def _resolve_liq(self, side: str, entry: float):
+        """给某一笔仓选一个爆仓价，并**说明它从哪来**：`(liq_price, 来源)`。
+
+        ★ F7（2026-11-24 全链路审查）：观察期与人工仓过去各用一套来源 ——
+          观察期用配置推算（`_liq_distance_pct`），人工仓用交易所真实值。
+          同一个账户的净仓只有一个真实爆仓价，两个数字算出来的
+          「离爆仓还有几个止损宽度」不可比，观察期的分歧统计也就白做了。
+
+          现在两边走同一个函数：**能用真实值就用真实值**，
+          用不了才退回推算，并且把来源返回给调用方去记录。
+
+        ★ 真实值必须落在入场价的**亏损侧**：
+          多单爆仓价在下方、空单在上方。交易所偶尔返回 0 或异常值，
+          方向不对一律视为不可用 —— 用错一侧会让 P0 得出
+          「已经很危险」或「绝对安全」的相反结论。
+        """
+        if entry <= 0:
+            return 0.0, "不可用"
+        sign = 1 if norm_side(side) == "long" else -1
+        cached = getattr(self, "_liq_cache", None)
+        try:
+            real = float(cached[1]) if cached else 0.0
+        except (TypeError, IndexError, ValueError):
+            real = 0.0
+        if real > 0 and (sign * (entry - real)) > 0:
+            return real, "交易所真实"
+        pct = self._liq_distance_pct()
+        if pct <= 0:
+            return 0.0, "不可用"
+        return entry * (1.0 - sign * pct / 100.0), "配置推算"
+
+    def _guard_position_for_observe(self, price):
+        """把系统仓翻译成守卫眼里的持仓。**纯读，不碰 `self.pos`。**
+
+        ★ 为什么只翻译**系统仓**（`self.pos`）而不是人工仓：
+          BUS-C 的范围是「系统仓出场」。人工仓按用户裁决只走 P0+P1
+          （没有入场结构，不许套 P2），那是 BUS-D 的事。
+
+        ★ 爆仓价来源：走 `_resolve_liq()`，与人工仓**同一个函数**。
+          以前这里固定用配置推算，注释还写着"补真实爆仓价是 BUS-D 的范围"
+          —— BUS-D 已经补完了，注释留在原地就是错的信息（F11）。
+
+        ★★ F4：`stop <= 0` 直接返回 None，**不许把它翻译成"止损在 0 元"**。
+
+          唐奇安策略合法地不设硬止损（见 `_fallback_stop`），所以它的
+          `stop` 就是 0。而守卫看到 stop=0 会算成
+          `d_stop = 入场价 - 0 = 入场价`，于是结构性缓冲
+          = 爆仓距离 / 入场价 ≈ 0.04 倍 → 判「减仓 98%」。
+
+          那不是守卫激进，是我们在用错的语言问它：它以为这家公司
+          在 0 元设了止损。观察期若照此记录，报表上会天天出现
+          「守卫要砍 98%」的假分歧，把真正的分歧淹掉。
+
+          返回 None 之后由 `_guard_observe` 写明"该仓无止损，守卫不适用"。
+        """
+        from .position_guard import GuardPosition, ST_OPEN
+
+        p = self.pos
+        if not p:
+            return None
+        side = norm_side(p.get("side"))
+        entry = float(p.get("entry") or 0.0)
+        qty = abs(float(p.get("qty") or 0.0))
+        stop = float(p.get("stop") or 0.0)
+        if entry <= 0 or qty <= 0:
+            return None
+        if stop <= 0:
+            return None
+
+        liq, src = self._resolve_liq(side, entry)
+        if liq <= 0:
+            return None
+        self._liq_src = src
+
+        tgt = float(p.get("target") or 0.0)
+        init_risk = abs(entry - stop) * qty
+        return GuardPosition(
+            symbol=str(self.tcfg.symbol),
+            direction=side,
+            avg_entry=entry,
+            qty=qty,
+            stop_price=stop,
+            liq_price=liq,
+            target_price=(tgt if tgt > 0 else None),
+            initial_risk=init_risk,
+            adds_done=0,
+            partials_done=0,
+            stop_delay_used=False,
+            state=ST_OPEN,
+        )
+
+    def _guard_observe(self, bars_by_iv, price, now_ms) -> None:
+        """观察期对照：每根 15m 收盘让守卫算一次，**只记录不执行**。
+
+        ★★ 这个函数最重要的性质是**它什么都不做**。
+          一个"观察者"如果顺手改一下 `self.pos`、或者调一次 `_close`，
+          就立刻变成第二个下单引擎 —— 两只手同时管一笔仓，
+          而其中一只的手还没被验证过。所以：
+
+            · 不写 `self.pos`、不调用任何下单/平仓函数
+            · 只调 `decide()`（纯函数：无 IO、无副作用）
+            · 只写一行 `decisions(action="guard_compare")`
+
+        ★ 为什么按 15m 节流而不是每根 3s：
+          守卫生来就是给 15m 收盘设计的（`kline_intent.read_kline`
+          的阈值 BIG_WICK/放量线都按这个尺度标定）。每 3s 跑一次等于
+          用同一根 K 线重复问同一个问题，只会灌满决策表。
+          15m 一根，一小时 4 条，一天 96 条 —— 可读。
+        """
+        from . import kline_intent as ki
+        from .position_guard import HOLD, decide
+
+        b15 = bars_by_iv.get(900000)
+        if not b15:
+            return
+        ts15 = int(getattr(b15[-1], "open_time", 0) or 0) or \
+            self._bar_ts(b15[-1])
+        if ts15 <= 0 or ts15 <= int(getattr(self, "_guard_obs_ts", 0) or 0):
+            return
+        self._guard_obs_ts = ts15
+
+        last = getattr(self, "_guard_obs_last", None)
+
+        # ---- 方向二：上次观察到有仓、这次没了 → 引擎（或交易所）先平了仓。
+        #
+        # ★ 这条覆盖「守卫说 HOLD，引擎却平了仓」的分歧，也就是"策略比守卫更急"。
+        #   不覆盖它，观察报告只会告诉我们"守卫想平而引擎没平"，
+        #   另一半真相（引擎频繁进出、守卫认为该拿住）就永远看不见。
+        if not self.pos:
+            if last:
+                _act = str(last.get("guard_action") or "")
+                _agree = (_act != HOLD)
+                self._log_decision(
+                    bars_by_iv, price, 0.0, now_ms, "guard_compare",
+                    "guard_compare",
+                    "守卫观察：仓位已不在（上次观察 guard=%s）。%s"
+                    % (_act, "双方都要出场，一致" if _agree else
+                       "分歧：guard 认为该继续持有（HOLD），引擎/交易所先平了仓"),
+                    gates=[], features=None, risk_info=None, force=True,
+                    observe=True)
+                self._guard_obs_last = None
+            return
+
+        gp = self._guard_position_for_observe(price)
+        if gp is None:
+            # ★ F4：绝大多数情况是「该仓没有硬止损」（唐奇安合法如此），
+            #   少数是拿不到爆仓价。两种都**必须写一句话**再返回 ——
+            #   静默 return 会让观察期看起来"一切正常"，
+            #   而实际上这一根根本没有对照记录。
+            _p = self.pos or {}
+            _why = ("该仓没有硬止损（stop=%.2f），守卫的 P0/P1 不适用 —— "
+                    "把它当成「止损在 0 元」会算出要减仓 98%%"
+                    % float(_p.get("stop") or 0.0)) \
+                if float(_p.get("stop") or 0.0) <= 0 else \
+                "拿不到爆仓价，本根无法对照"
+            self._log_decision(
+                bars_by_iv, price, 0.0, now_ms, "guard_compare",
+                "guard_compare", "守卫观察：跳过 —— " + _why,
+                gates=[], features={"skipped": _why}, risk_info=None,
+                force=True, observe=True)
+            return
+
+        # 15m 收盘序列 → read_kline 要求的 (ts,o,h,l,c,v) 元组
+        #   ★ 时间/价量都用 `_bar_ts` / `_bar_ohlcv`：
+        #     真实 `feed.Bar` 是 open/high/low/close，没有 `.ts`。
+        seq = [((self._bar_ts(b),) + self._bar_ohlcv(b)) for b in b15[-60:]]
+        kline = ki.read_kline(seq) if seq else None
+
+        cfg = self._guard_config_for_observe()
+        d = decide(gp, float(price), cfg, kline=kline)
+        self._guard_obs_last = {"guard_action": d.action, "ts": ts15,
+                                "price": float(price)}
+
+        # 引擎此刻的处境（只用于对照，不改任何东西）
+        _eng_stop = float(self.pos.get("stop") or 0.0)
+        _eng_tgt = float(self.pos.get("target") or 0.0)
+        _sign = 1 if gp.direction == "long" else -1
+        _profit_R = gp.profit_R(float(price))
+        _stop_would_hit = gp.remaining_to_stop(float(price)) <= 0
+
+        # 分歧定义：守卫要动手（非 HOLD）而引擎此刻仍在持有。
+        # 引擎自己会在同一根 bar 里止损/止盈，所以"引擎也会出场"这种一致情形
+        # 在下一次观察（仓位消失）时由上面那段补判。
+        _diverged = (d.action != HOLD)
+        self._log_decision(
+            bars_by_iv, price, 0.0, now_ms, "guard_compare",
+            "guard_compare",
+            "守卫观察：guard=%s（%s）｜引擎持仓 %s %.6f @ %.1f 止损 %.1f 目标 %.1f"
+            "｜profit %.2fR 爆仓缓冲 %.2f 倍%s"
+            % (d.action, d.reason, gp.direction, gp.qty, gp.avg_entry,
+               _eng_stop, _eng_tgt, _profit_R,
+               gp.liq_buffer(float(price)),
+               "" if _diverged else "｜双方一致（都持有）"),
+            gates=[{"gate": "守卫P判断", "ok": not _diverged,
+                    "detail": "%s：%s" % (d.action, d.reason)}],
+            features={"guard": d.as_dict(), "kline": (kline.as_dict() if kline else None),
+                      "engine_stop": _eng_stop, "engine_target": _eng_tgt,
+                      "stop_would_hit": _stop_would_hit,
+                      # ★ F7：记下这个爆仓价是交易所真实值还是配置推算
+                      "liq_src": getattr(self, "_liq_src", "未知")},
+            risk_info=None, force=True, observe=True)
+
+    async def _live_liq_price(self) -> float:
+        """交易所返回的**真实爆仓价**。取不到返回 0。
+
+        ★ 为什么要缓存：`_step` 每 3 秒跑一次，而 `position()` 是一次真网络
+          请求。每 3 秒问一次会把限频吃掉，而爆仓价是个慢变量（它随
+          维持保证金和浮盈动，不随秒级价格动）。缓存 5 分钟，
+          与周期对账同频。
+
+        ★ 为什么必须在失败时**明确返回 0** 而不是退回推算值：
+          调用方要靠 0 来区分"我拿到了真实值"和"我没拿到"。
+          悄悄用推算值顶替，就等于让调用方以为自己在用真实爆仓价 ——
+          这正是这个项目最反复的缺陷类型（看起来对，其实是另一个来源）。
+
+        ★ 失败也要缓存（60 秒）：BUS-D 之后人工仓的出场判断跑在 3 秒循环里
+          （F2 修的），一次取不到就每 3 秒重试一次，等于用限频去撞一个
+          正在出故障的接口。成功缓存 5 分钟、失败缓存 1 分钟 ——
+          恢复得快，又不打爆接口。
+        """
+        now = int(time.time() * 1000)
+        cached = getattr(self, "_liq_cache", None)
+        if cached and now - cached[0] < cached[2]:
+            return cached[1]
+        fn = getattr(self.ex, "position", None)
+        if fn is None:
+            return 0.0
+        try:
+            d = await fn()
+        except Exception as e:
+            logger.warning("[守卫] 取真实爆仓价失败（本轮用推算值）：%s", e)
+            self._liq_cache = (now, 0.0, 60000)
+            return 0.0
+        liq = float((d or {}).get("liq_price") or 0.0)
+        self._liq_cache = (now, liq, 300000)
+        return liq
+
+    async def _guard_position_for_adopted(self, pos, price):
+        """把**人工仓**翻译成守卫眼里的持仓（BUS-D：用真实爆仓价）。
+
+        与 `_guard_position_for_observe` 的差别只有一处、但很关键：
+        这里优先用交易所返回的 `liquidationPrice`，取不到才退回推算值，
+        并且**把用的是哪一种记进日志**（`self._liq_src`），
+        因为"守卫以为离爆仓还有 2.5 倍"这件事，取决于这个数字从哪来。
+
+        真实值为什么重要：推算公式 `(1/杠杆 - 维持保证金)` 假设逐仓、
+        且忽略维持保证金率档位与浮盈。11-24 实测同一笔仓：
+        推算 4.0455%、逐仓真实 4.15%、全仓真实 5.48%。
+        差异方向不固定，所以不能用"保守起见"一句话带过。
+
+        ★ F7：解析逻辑已收进 `_resolve_liq()`，与观察期**同一个函数**。
+          这里只负责"先问一次交易所"（结果进缓存），然后交给它选。
+          以前两处各写一套，同一账户的净仓能算出两个不同的缓冲倍数。
+        """
+        from .position_guard import GuardPosition, ST_OPEN
+
+        if not pos:
+            return None
+        side = norm_side(pos.get("side"))
+        entry = float(pos.get("entry") or 0.0)
+        qty = abs(float(pos.get("qty") or 0.0))
+        stop = float(pos.get("stop") or 0.0)
+        if entry <= 0 or qty <= 0:
+            return None
+
+        # 先刷新缓存（内部 5 分钟节流 / 失败 1 分钟节流），再统一解析
+        await self._live_liq_price()
+        liq, src = self._resolve_liq(side, entry)
+        if liq <= 0:
+            return None
+        self._liq_src = src
+
+        init_risk = abs(entry - stop) * qty
+        return GuardPosition(
+            symbol=str(self.tcfg.symbol), direction=side, avg_entry=entry,
+            qty=qty, stop_price=stop, liq_price=liq,
+            # 人工仓不设止盈：没有 R 依据，硬编目标位等于凭空造规则
+            target_price=None, initial_risk=init_risk,
+            adds_done=0, partials_done=0, stop_delay_used=False, state=ST_OPEN)
+
+    def _persist_adopted_stop(self, pos) -> None:
+        """止损变动**不落库**，这里只把这件事说清楚。
+
+        为什么不落库：这个仓库根本没有"持仓行"可写 —— `self.pos` /
+        `self.adopted_pos` 都是内存结构，重启时由 `_pos_from_row()` 从
+        `trades` 表重建。`_manage()` 抬高止损时同样是仅内存的。
+        给它单独造一张持仓表等于引入第二个真相源。
+
+        后果（可接受，方向也是安全的）：重启后止损退回接管时算出的那个值。
+        棘轮抬高的是"保护利润"，退回原值意味着仓位不会被过早保护掉，
+        而不是把仓位暴露到爆仓 —— 爆仓侧由 P0 用真实爆仓价每次重算。
+
+        故意不写成 `self.db.update_pos(...)`：那个方法不存在，
+        写了就是一行永远走不到的死代码，而"看起来保存了"比"没保存"更危险。
+        """
+        _ = pos   # 仅为签名一致；真实语义见 docstring
+
     async def _manage(self, price, bars_by_iv) -> bool:
         p = self.pos
         bar = bars_by_iv[3000][-1] if bars_by_iv.get(3000) else None
@@ -1751,9 +5132,11 @@ class DecisionEngine:
         if abs(sold_qty - p["qty"]) > 1e-9:
             logger.info("平仓实际成交 %.8f 与持仓 %.8f 不一致（step 取整残留 %.8f）",
                         sold_qty, p["qty"], p["qty"] - sold_qty)
-        gross = (fill.price - p["entry"]) * sold_qty * direction
-        fee_total = p.get("fee", 0.0) + fill.fee
-        net = gross - fee_total
+        # ★ 统一口径：毛/费/净走 `close_booking()`（和接管仓、挂单仓同一个公式）。
+        #   这一份原本就是正确的（`p.fee + fill.fee`），保留为基准；
+        #   提成纯函数的目的是让另外两条路能一起对齐，而不是三份实现各自演化。
+        gross, fee_total, net = close_booking(
+            p, fill.price, fill.fee, sold_qty, p["side"])
         self.db.log_fill({"ts": now_ms, "symbol": self.tcfg.symbol, "side": order_side,
                           "price": fill.price, "qty": sold_qty, "fee": fill.fee,
                           "fee_asset": "USDT", "paper": 1 if self.ex.name == "paper" else 0})
@@ -1812,18 +5195,45 @@ class DecisionEngine:
                            p.get("signal"), "close",
                            "平仓 %s：净 %.4fU" % (reason, net),
                            gates=[], induce_close=reason)
+        # 平完立刻刷新真账，而不是等下一轮对账（最多 5 分钟）。
+        # 用户刚看到「平仓」就想看到这一单的分数，等 5 分钟等于没做。
+        #
+        # ★ 必须是"丢出去"而不是 await：_close() 是在 self._lock 里跑的
+        # （_step 的 async with self._lock），在这里等一次 K 线拉取，
+        # 就等于把每一次报价、每一个止损判断都按住几秒钟。
+        # 止损被延后的代价远大于"报表晚 3 秒"。
+        # _ledger_busy 保证同一时刻只有一次同步在跑。
+        try:
+            asyncio.get_event_loop().create_task(self._sync_live_ledger())
+        except Exception:
+            logger.error("平仓后调度真账同步失败（不影响交易）", exc_info=True)
         return True
 
     # ---------------- 记录 ----------------
     def _log_decision(self, bars_by_iv, price, equity, now_ms, signal, action, reason,
                       gates=None, features=None, risk_info=None, signal_reason="",
-                      induce_close="") -> None:
+                      induce_close="", force=False, observe=False) -> None:
+        """写一条决策。`observe=True` 表示这是**观察记录**而不是决策本体。
+
+        ★ 为什么要区分（2026-11-24 全链路审查发现）：
+          `guard_compare` 以前用 `force=True` 写行，而这条路径会顺带把
+          `_last_bar_time` 推进到当前 3s 桶。于是同一 tick 里策略自己那条
+          `force=False` 的决策被去重规则挡掉 —— 每 15 分钟丢一条真实决策，
+          而顶替它的是一行"观察对照"。时间线看起来更热闹，信息反而更少。
+
+          观察记录必须满足两件事，缺一就会污染它想测量的东西：
+            · 不推进去重游标（否则挤掉被测对象的记录）
+            · 不计入 `self.decisions`（否则看板上的"决策数"把观察也算进去，
+              策略真的卡死时这个数字仍然在涨 —— 一条会撒谎的健康指标）
+        """
         bar = bars_by_iv.get(3000)
         bar_time = bar[-1].open_time if bar else now_ms
-        if bar_time <= self._last_bar_time:      # 同一根桶只留一条决策
+        if not force and bar_time <= self._last_bar_time:      # 同一根桶只留一条决策
             return
-        self._last_bar_time = bar_time
-        self.decisions += 1
+        if not observe and bar_time > self._last_bar_time:
+            self._last_bar_time = bar_time
+        if not observe:
+            self.decisions += 1
         d = {"ts": now_ms, "bar_time": bar_time,
              "feature_time": (features or {}).get("feature_time", bar_time),
              "symbol": self.tcfg.symbol, "price": price, "signal": signal,
@@ -1832,7 +5242,7 @@ class DecisionEngine:
              "equity": round(equity, 4)}
         self.last_decision = d
         self.db.log_decision(d)
-        if action.startswith("open") or action == "close":
+        if action.startswith("open") or action in ("close", "reduce"):
             self.feed.hub.publish({"type": "decision", **{
                 "ts": now_ms, "action": action, "signal": signal, "reason": d["reason"],
                 "price": price, "equity": round(equity, 4),
@@ -1917,9 +5327,20 @@ class DecisionEngine:
                 "close_fail_count": int(getattr(self, "_close_fail_count", 0) or 0)}
 
     def state(self) -> dict:
+        # ★ `pos` 只放系统仓（拆仓后的语义），人工仓单独给 `adopted_pos`。
+        #   两个都必须吐出去：只给 `pos` 的话，用户明明手上有仓，
+        #   看板却显示"空仓" —— 那正是 2026-11-24 用户困惑的来源
+        #   （"系统帮我在 61250 出场了，我没明白为什么"）。
+        #   `positions` 是给"我到底有多少仓"这个问题用的合计视图。
         return {"trend": self.trend_state(),
                 "equity": round(self._last_equity, 4),
-                "pos": self.pos, "block_stats": self.block_stats,
+                "pos": self.pos,
+                "adopted_pos": getattr(self, "adopted_pos", None),
+                "positions": [
+                    dict(p, slot=s) for s, p in
+                    (("system", self.pos),
+                     ("adopted", getattr(self, "adopted_pos", None))) if p],
+                "block_stats": self.block_stats,
                 "guard": self.guard_state(),
                 "executor": self.executor_state(),
                 "risk": {"day_pnl": round(self.risk.day_pnl, 4),

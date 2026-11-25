@@ -61,8 +61,11 @@ def _cfg():
     cfg.trading.sma_lookback = 200
     cfg.trading.trend_stop_pct = 25.0
     cfg.trading.trend_leverage = 1.0
-    cfg.trading.paper_balance = 100.0
-    cfg.trading.exec_market = "spot"
+    # ★ 2026-11-17 只做合约：步长 0.001（不是现货的 0.00001），
+    #   价 100000 时一手就是 100U。100U 本金在 1x 下只能取整到 0
+    #   —— 那不是 bug，是合约的结构事实。所以本金要抬到能建两手。
+    cfg.trading.paper_balance = 250.0
+    cfg.trading.exec_market = "perp"
     return cfg
 
 

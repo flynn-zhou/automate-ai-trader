@@ -18,6 +18,15 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
+#: 「这笔仓不是策略开的」在 trades.open_reason 里的唯一标记。
+#:
+#: 定义放在这里，是因为它有【两个】消费方，而它们分处不同的层：
+#:   - engine.reconcile_live() 接管孤儿仓时把这个字面量写进 open_reason
+#:   - stats() 用它把这类仓排除出「策略战绩」
+#: 两边各写一份字符串，某天改了一处就会静默对不上——而表现出来的样子是
+#: 「统计里又开始混进别人的手工单」，不会报任何错。
+ADOPT_REASON = u"实盘对账接管"
+
 def strategy_start_ts_at(path: str, strategy: str) -> int:
     """当前策略第一次发出决策的时间；查不到返回 0（= 全历史）。
 
@@ -250,7 +259,223 @@ CREATE TABLE IF NOT EXISTS guard_state (
     daily_halt_day    TEXT DEFAULT '',
     close_fail_streak INTEGER DEFAULT 0
 );
+
+-- 真实持仓回合（第 130 轮）。一张【只认交易所】的账。
+--
+-- 为什么不能靠上面那张 trades 表
+-- ----------------------------
+-- trades 只记「引擎经手过的」仓。生产实证（11-11 09:04 → 11-12 22:57）：
+--     交易所 /fapi/v1/userTrades：25 笔成交，
+--         已实现盈亏合计 +109.80，手续费 -16.92，资金费 -0.30  →  净 ≈ +92.59
+--     trades 表同一区间：只有 4 条记录                          →  净 -20.46
+-- 差 113U。差在两头：
+--   - 用户手工来回买卖的绝大多数根本没进库（引擎只在"交易所与库不一致"时
+--     才写一条接管记录，而那时已经错过了开仓）
+--   - 手续费曾经全记 0（第 129 轮修的是 live.py 的 newOrderRespType）
+-- 所以这张表的数据来源只能是交易所，不读 trades、也不和它合并——
+-- 两套账各自独立，对不上才看得见差异。对不上就是信息，合并掉就没了。
+--
+-- 为什么要有 round_key
+-- -------------------
+-- 每个对账周期（300s）都会重新抓一遍成交。没有自然键的话，
+-- 同一个回合每个周期都会多插一行，一天就是 288 条重复。
+-- round_key = symbol|entry_ts|side|qty，由 live_ledger 生成，UNIQUE 兜底。
+CREATE TABLE IF NOT EXISTS live_rounds (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_key     TEXT NOT NULL UNIQUE,
+    symbol        TEXT NOT NULL,
+    side          TEXT NOT NULL,          -- long/short
+    qty           REAL NOT NULL,          -- 开仓总量（应等于平仓总量）
+    entry_ts      INTEGER NOT NULL,       -- 首笔开仓成交的交易所 time
+    entry_price   REAL NOT NULL,          -- 开仓 VWAP（按成交量加权，不是首笔价）
+    exit_ts       INTEGER,                -- 最后一笔平仓成交时间；NULL = 还开着
+    exit_price    REAL,
+    -- 毛盈亏直接取交易所 realizedPnl 之和。不要自己用 (exit-entry)*qty 再算一遍：
+    -- 币安在部分平仓时按【自己的】持仓均价结算，和我们的 VWAP 会有微小偏差，
+    -- 而差额会全部落到"其他"里去，最后没人对得上账。
+    gross         REAL DEFAULT 0,
+    fee           REAL DEFAULT 0,         -- commission 之和，正数（支出）
+    funding       REAL DEFAULT 0,         -- 资金费之和，负数表示付出
+    net           REAL DEFAULT 0,         -- gross - fee + funding
+    hold_sec      INTEGER DEFAULT 0,
+    n_fills       INTEGER DEFAULT 0,
+    notional      REAL DEFAULT 0,         -- qty * entry_price：成本率与打分的分母
+    -- 这笔仓是谁开的。strategy = 引擎开的；adopted = 对账接管的手工仓；
+    -- manual = 纯手工（引擎从没经手）。判断依据是 trades 表的 open_reason，
+    -- 而不是"猜"——猜出来的来源没法追责。
+    source        TEXT DEFAULT 'manual',
+    trade_id      INTEGER,                -- 关联 trades.id（若引擎也记过这一笔）
+    open_reason   TEXT DEFAULT '',
+    -- 持仓期间的最大有利/不利偏移，口径与 trades 表一致：
+    -- 价格偏移、相对入场价、mfe 为正、mae 为负。
+    mfe           REAL,
+    mae           REAL,
+    score_pnl     INTEGER,
+    score_entry   INTEGER,
+    score_exit    INTEGER,
+    score_cost    INTEGER,
+    score_total   INTEGER,
+    grade         TEXT DEFAULT '',        -- A/B/C/D
+    analysis      TEXT DEFAULT '',        -- 逐项数字与判定：给解释，不只给分
+    analyzed_ts   INTEGER DEFAULT 0,      -- 0 = 还没算过 MFE/MAE 和分数
+    synced_ts     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_live_round_exit ON live_rounds(exit_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_live_round_entry ON live_rounds(entry_ts DESC);
+
+-- 挂在交易所里的单（第 131 轮）。「提前挂单」机制的本地账。
+--
+-- 为什么不能只存在内存里
+-- --------------------
+-- 挂单的生命周期是**跨进程**的：引擎重启、部署、崩溃，单子都还在交易所挂着。
+-- 只存内存的话，重启后进程不知道自己挂过什么 —— 于是
+--   * 止损单还挂着，但引擎以为没有，可能再挂一张 → 同一笔仓两个止损；
+--   * 开仓单成交了，但引擎不知道 → 账面上没仓位，交易所里有。
+-- 而且这两种都**不会报错**，只是账慢慢对不上。
+--
+-- client_order_id 为什么是主键
+-- -------------------------
+-- orderId 是交易所分配的，只有下单成功之后才知道。挂单意图必须在**发请求之前**
+-- 就落库（否则请求超时的那一刻就丢了），那时本地只有 client_order_id。
+-- 所以用本地生成的 id 做自然键，交易所 id 只是一个可空列。
+-- 格式约定：`{strategy}-{purpose}-{ts}-{rand}`，前缀让对账能按用途分组。
+CREATE TABLE IF NOT EXISTS working_orders (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_order_id   TEXT NOT NULL UNIQUE,
+    exchange_order_id TEXT DEFAULT '',
+    symbol            TEXT NOT NULL,
+    side              TEXT NOT NULL,          -- BUY / SELL
+    otype             TEXT NOT NULL,          -- LIMIT / STOP_MARKET / ...
+    qty               REAL NOT NULL,
+    executed_qty      REAL DEFAULT 0,
+    price             REAL DEFAULT 0,         -- 限价；止损单为 0
+    stop_price        REAL DEFAULT 0,         -- 触发价
+    avg_price         REAL DEFAULT 0,
+    reduce_only       INTEGER DEFAULT 0,
+    -- 交易所原生状态 + 两个本地态：
+    --   LOST    = 本地以为挂着，交易所查不到（可能成交了、也可能被手工撤了）
+    --   STALE   = 已终结但还没归档
+    status            TEXT NOT NULL,
+    purpose           TEXT DEFAULT '',        -- entry / stop / target
+    strategy          TEXT DEFAULT '',
+    round_key         TEXT DEFAULT '',        -- 关联 live_rounds.round_key
+    created_ts        INTEGER NOT NULL,
+    updated_ts        INTEGER NOT NULL,
+    synced_ts         INTEGER DEFAULT 0,      -- 0 = 还没和交易所对过账
+    note              TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_wo_status ON working_orders(status, updated_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_wo_round ON working_orders(round_key);
 """
+
+
+# 一张挂单可能以三种形状出现，必须都能归一化成 dict：
+#   * `PendingOrder`（执行器接口，P1 定的返回类型，是 dataclass，没有 .get）
+#   * 币安原始 JSON（clientOrderId / origQty / stopPrice 这套键）
+#   * 本地 working_orders 行（本来就是 dict）
+_ORDER_FIELDS = (
+    "client_order_id", "client_id", "clientOrderId",
+    "order_id", "orderId",
+    "symbol", "side", "otype", "type",
+    "qty", "origQty", "executed_qty", "executedQty",
+    "price", "stop_price", "stopPrice", "avg_price", "avgPrice",
+    "status", "reduce_only", "reduceOnly", "update_time",
+)
+
+
+def order_row(o) -> dict:
+    """把「一张挂单」统一成 dict。纯函数，不碰 DB/网络。
+
+    ★ 为什么必须有这一层（第 131 轮的缺陷根源）：
+    P2 的 `reconcile_orders()` 与 `_from_remote()` 文档都写着「两种入参都吃，
+    `PendingOrder` 有 `client_id`、币安原始 JSON 有 `clientOrderId`」，
+    但实现里只有 `o.get(...)`。而 `LiveExecutor.open_orders()` 返回的是
+    `PendingOrder` 数据类（dataclass）—— 它没有 `.get`。
+    后果不是「少字段」，是**每张单在挂单对账第一步就抛 AttributeError**，
+    被引擎的宽 except 吞成一行日志：表永远填不上、交易所有本地没有的单永远补不回来。
+
+    反证一次：这会不会是「调用方该自己转 dict」？不是。
+    `reconcile_orders` 的入参签名写的是 `List[dict]`，而交易所接口的返回类型
+    由 P1 定义为 `PendingOrder`，两者之间**没有别的转换点** —— 不在这里归一化，
+    就只能在引擎里再写一份（P4 会用同一条路，必然漏）。
+    """
+    if isinstance(o, dict):
+        return dict(o)
+    out = {}
+    for k in _ORDER_FIELDS:
+        v = getattr(o, k, None)
+        if v is not None:
+            out[k] = v
+    return out
+
+
+def _order_cid(o: dict) -> str:
+    """配对键。三种形状的键名都认：client_id / client_order_id / clientOrderId。
+
+    只认其中一两种的后果不是"少配对一张"，是那批单全部掉进 vanished
+    → 被标成 LOST。所以键名容错在这里是必需的，不是好看。
+    """
+    return (o.get("client_id") or o.get("client_order_id")
+            or o.get("clientOrderId") or "")
+
+
+def _exec_qty(o: dict) -> float:
+    """已成交量。币安原始 JSON 叫 executedQty，本地行叫 executed_qty。
+
+    这个值参与"变没变"的判断：键名认错就会把一张已经部分成交的单
+    判成"没变"，于是本地账上的 executed_qty 永远停在 0。
+    """
+    return float(o.get("executed_qty") or o.get("executedQty") or 0)
+
+
+def reconcile_orders(local: List[dict], remote: List[dict]) -> dict:
+    """把「本地以为挂着的单」和「交易所真的挂着的单」对起来。纯函数，不碰 DB/网络。
+
+    返回四组：
+
+    * `adopted`   — 交易所有、本地没有。**必须补进本地**，否则引擎不知道
+      自己还挂着一张止损单，重启后可能再挂一张 → 同一笔仓两个止损，
+      先触发的那张平掉大部分仓，后触发的那张把剩仓反向开出去。
+    * `vanished`  — 本地认为挂着、交易所查不到。**不能直接判「没有」**：
+      它可能已经成交了（那就是一笔真实成交，必须记账），也可能被手工撤了。
+      所以交给调用方去 `query_order()` 查真实终态，再决定记成交还是标记失效。
+      这里只负责把它们挑出来 —— 静默当成「不存在」是最坏的处理方式。
+    * `changed`   — 两边都有但状态/成交量变了（成交了、部分成交了、被撤了）。
+    * `same`      — 两边一致。
+
+    配对键是 `client_order_id`，不是 `exchange_order_id`：
+    挂单意图在**发请求之前**就要落库，那一刻本地还没有交易所 id。
+    用交易所 id 配对会让「下单请求超时但单子其实建成了」这一类
+    永远对不上。
+    """
+    loc = {}
+    for o in local or ():
+        o = order_row(o)
+        cid = _order_cid(o)
+        if cid:
+            loc[cid] = o
+    rem = {}
+    for o in remote or ():
+        o = order_row(o)
+        cid = _order_cid(o)
+        if cid:
+            rem[cid] = o
+
+    out = {"adopted": [], "vanished": [], "changed": [], "same": []}
+    for cid, r in rem.items():
+        l = loc.get(cid)
+        if l is None:
+            out["adopted"].append(r)
+            continue
+        if (str(l.get("status") or "") != str(r.get("status") or "")
+                or abs(_exec_qty(l) - _exec_qty(r)) > 1e-12):
+            out["changed"].append({"local": l, "remote": r})
+        else:
+            out["same"].append({"local": l, "remote": r})
+    for cid, l in loc.items():
+        if cid not in rem:
+            out["vanished"].append(l)
+    return out
 
 
 class TradeDB:
@@ -565,6 +790,48 @@ class TradeDB:
                          d.get("fee", 0), d.get("pnl_net"), d.get("mfe"), d.get("mae"),
                          d.get("close_reason"), d.get("stop_price"), d.get("target_price"),
                          d["entry_ts"], d["side"]))
+                elif kind == "working_order":
+                    # 幂等 upsert，按 client_order_id。挂单会被反复更新
+                    # （挂上 → 部分成交 → 成交/撤单），每次都是一次 upsert。
+                    #
+                    # exchange_order_id 用 COALESCE 保住已有的：本地先落库时
+                    # 这一列是空的（那时交易所还没给 id），后来的更新如果
+                    # 又没带 id，不能把之前拿到的 id 抹掉 —— 抹掉之后就
+                    # 再也查不到这张单了。
+                    c.execute(
+                        "INSERT INTO working_orders(client_order_id,"
+                        "exchange_order_id,symbol,side,otype,qty,executed_qty,"
+                        "price,stop_price,avg_price,reduce_only,status,purpose,"
+                        "strategy,round_key,created_ts,updated_ts,synced_ts,note)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(client_order_id) DO UPDATE SET"
+                        " exchange_order_id=COALESCE(NULLIF(excluded.exchange_order_id,''),"
+                        "                              working_orders.exchange_order_id),"
+                        " executed_qty=excluded.executed_qty,"
+                        " avg_price=excluded.avg_price,"
+                        " status=excluded.status,"
+                        " updated_ts=excluded.updated_ts,"
+                        " synced_ts=excluded.synced_ts,"
+                        " note=excluded.note",
+                        (d["client_order_id"],
+                         d.get("exchange_order_id") or "",
+                         d.get("symbol") or "",
+                         d.get("side") or "",
+                         d.get("otype") or d.get("type") or "",
+                         float(d.get("qty") or 0),
+                         float(d.get("executed_qty") or 0),
+                         float(d.get("price") or 0),
+                         float(d.get("stop_price") or 0),
+                         float(d.get("avg_price") or 0),
+                         int(d.get("reduce_only") or 0),
+                         d.get("status") or "NEW",
+                         d.get("purpose") or "",
+                         d.get("strategy") or "",
+                         d.get("round_key") or "",
+                         int(d.get("created_ts") or 0) or int(time.time() * 1000),
+                         int(d.get("updated_ts") or 0) or int(time.time() * 1000),
+                         int(d.get("synced_ts") or 0),
+                         d.get("note") or ""))
                 elif kind == "equity":
                     c.execute(
                         "INSERT OR REPLACE INTO equity(ts,balance,unrealized,equity,position_qty,"
@@ -601,6 +868,56 @@ class TradeDB:
                          d.get("daily_halt_day") or "",
                          int(d.get("close_fail_streak") or 0),
                          int(d.get("baseline_ts") or 0)))
+                elif kind == "live_round":
+                    # 幂等 upsert。同一个回合每个对账周期都会重抓一次，
+                    # 没有 ON CONFLICT 就会一天写 288 条重复（见建表注释）。
+                    #
+                    # 为什么用 ON CONFLICT DO UPDATE 而不是 INSERT OR REPLACE：
+                    # REPLACE 是「删掉再插」，id 每次翻新；看板按 id 锚行时
+                    # 那一行会跳。ON CONFLICT 保留原 id。
+                    #
+                    # 唯一不能覆盖的是 trade_id：引擎可能比交易所晚一拍才写出
+                    # trades 行，先抓到的 round 没有 trade_id。用 COALESCE 保住
+                    # 已经关联上的那个，否则会被后来的空值抹掉。
+                    c.execute(
+                        "INSERT INTO live_rounds(round_key,symbol,side,qty,"
+                        "entry_ts,entry_price,exit_ts,exit_price,gross,fee,funding,"
+                        "net,hold_sec,n_fills,notional,source,trade_id,open_reason,"
+                        "mfe,mae,score_pnl,score_entry,score_exit,score_cost,"
+                        "score_total,grade,analysis,analyzed_ts,synced_ts)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(round_key) DO UPDATE SET"
+                        " exit_ts=excluded.exit_ts,"
+                        " exit_price=excluded.exit_price,"
+                        " qty=excluded.qty, gross=excluded.gross,"
+                        " fee=excluded.fee, funding=excluded.funding,"
+                        " net=excluded.net, hold_sec=excluded.hold_sec,"
+                        " n_fills=excluded.n_fills, notional=excluded.notional,"
+                        " source=excluded.source,"
+                        " trade_id=COALESCE(excluded.trade_id, live_rounds.trade_id),"
+                        " open_reason=excluded.open_reason,"
+                        " mfe=excluded.mfe, mae=excluded.mae,"
+                        " score_pnl=excluded.score_pnl,"
+                        " score_entry=excluded.score_entry,"
+                        " score_exit=excluded.score_exit,"
+                        " score_cost=excluded.score_cost,"
+                        " score_total=excluded.score_total,"
+                        " grade=excluded.grade, analysis=excluded.analysis,"
+                        " analyzed_ts=excluded.analyzed_ts,"
+                        " synced_ts=excluded.synced_ts",
+                        (d["round_key"], d["symbol"], d["side"], d["qty"],
+                         d["entry_ts"], d["entry_price"], d.get("exit_ts"),
+                         d.get("exit_price"), d.get("gross", 0),
+                         d.get("fee", 0), d.get("funding", 0), d.get("net", 0),
+                         d.get("hold_sec", 0), d.get("n_fills", 0),
+                         d.get("notional", 0), d.get("source", "manual"),
+                         d.get("trade_id"), d.get("open_reason", ""),
+                         d.get("mfe"), d.get("mae"),
+                         d.get("score_pnl"), d.get("score_entry"),
+                         d.get("score_exit"), d.get("score_cost"),
+                         d.get("score_total"), d.get("grade", ""),
+                         d.get("analysis", ""), int(d.get("analyzed_ts") or 0),
+                         int(d.get("synced_ts") or time.time() * 1000)))
             c.commit()
         except Exception:
             logger.error("trade_db flush 失败", exc_info=True)
@@ -643,6 +960,35 @@ class TradeDB:
                 "entry_price": r[5], "stop_price": r[6], "target_price": r[7],
                 "open_reason": r[8], "paper": r[9], "max_hold_bars": r[10],
                 "fee": float(r[11] or 0.0)}
+
+    def open_trades(self, limit: int = 5) -> List[dict]:
+        """**所有**未平仓记录，按 id 倒序。
+
+        ★ 为什么需要复数版本（2026-11-24）：
+          引擎现在把持仓拆成两个来源记账 —— `self.pos`（系统仓）和
+          `self.adopted_pos`（接管来的人工仓）。两笔仓可能同时在账上开着，
+          而 `open_trade()` 只返回最新的一行（`LIMIT 1`）。
+          只用它恢复，重启后必然丢掉其中一个来源，而且丢哪个取决于 id 顺序
+          —— 这正是「同一件事两个来源」的又一次变形。
+
+        ★ 保持 `open_trade()` 原样不动：它是别处（close_trade 记账等）的
+          既有契约，改它的返回值等于静默改变所有调用方的行为。
+        """
+        c = self._ro()
+        try:
+            rows = c.execute(
+                "SELECT id,symbol,side,qty,entry_ts,entry_price,stop_price,target_price,"
+                "open_reason,paper,COALESCE(max_hold_bars,0),"
+                "COALESCE(fee,0) FROM trades"
+                " WHERE exit_ts IS NULL ORDER BY id DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        finally:
+            c.close()
+        return [{"id": r[0], "symbol": r[1], "side": r[2], "qty": r[3],
+                 "entry_ts": r[4], "entry_price": r[5], "stop_price": r[6],
+                 "target_price": r[7], "open_reason": r[8], "paper": r[9],
+                 "max_hold_bars": r[10], "fee": float(r[11] or 0.0)}
+                for r in rows]
 
     def closed_trades(self, limit: int = 200) -> List[dict]:
         c = self._ro()
@@ -711,10 +1057,24 @@ class TradeDB:
         c = self._ro()
         try:
             where = " WHERE exit_ts IS NOT NULL"
-            args: tuple = ()
+            # 「对账接管」的仓不是策略开的，绝不能被算进策略战绩（第 129 轮）。
+            #
+            # 生产实证（11-11）：用户手工来回买卖 BTC，每一次数量变化
+            # 都被对账接管、又被策略平掉，一天之内写出 12 条
+            # pnl_gross=0 / fee=0 / pnl_net=0 的空记录。
+            # 这 12 条如果算进 donchian 的战绩：
+            #   交易数 12 笔全"记账"、胜率按 pnl_net>0 判全部算负、
+            #   而它们既不是策略开的、也不是策略平的。
+            # 用户看大屏会以为策略在密集交易并且全亏。
+            #
+            # 为什么用 open_reason 而不是新加一列：这 12 条历史记录已经写进库了，
+            # 加列只能影响未来，改不掉"历史统计里混着手工单"这件事。
+            # open_reason 是当时就写下去的，能回溯。
+            where += " AND COALESCE(open_reason,'') <> ?"
+            args: tuple = (ADOPT_REASON,)
             if strategy:
                 where += " AND strategy=?"
-                args = (strategy,)
+                args = args + (strategy,)
             n, wins, pnl, fee = c.execute(
                 "SELECT COUNT(*), SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END),"
                 " SUM(pnl_net), SUM(fee) FROM trades" + where, args).fetchone()
@@ -725,7 +1085,9 @@ class TradeDB:
                     "SELECT COALESCE(strategy,'') AS st, paper, COUNT(*),"
                     " SUM(CASE WHEN pnl_net>0 THEN 1 ELSE 0 END), SUM(pnl_net)"
                     " FROM trades WHERE exit_ts IS NOT NULL"
-                    " GROUP BY COALESCE(strategy,''), paper", ()).fetchall():
+                    "   AND COALESCE(open_reason,'') <> ?"
+                    " GROUP BY COALESCE(strategy,''), paper",
+                    (ADOPT_REASON,)).fetchall():
                 key = s or "(未标注)"
                 d = by.setdefault(key, {"trades": 0, "wins": 0, "pnl_net": 0.0})
                 d["trades"] += cnt or 0
@@ -741,6 +1103,247 @@ class TradeDB:
         if strategy:
             out["strategy"] = strategy
         return out
+
+    # ---------------- 真实持仓回合（第 130 轮） ----------------
+    def upsert_live_rounds(self, rows: List[dict]) -> None:
+        """把从交易所还原出来的回合写进去。幂等（按 round_key）。"""
+        now = int(time.time() * 1000)
+        for r in rows or ():
+            d = dict(r)
+            d.setdefault("synced_ts", now)
+            self._put(("live_round", d))
+
+    # ---------------- 挂单账本 ----------------
+    WORKING_ORDER_COLS = (
+        "client_order_id", "exchange_order_id", "symbol", "side", "otype",
+        "qty", "executed_qty", "price", "stop_price", "avg_price",
+        "reduce_only", "status", "purpose", "strategy", "round_key",
+        "created_ts", "updated_ts", "synced_ts", "note")
+
+    def upsert_working_orders(self, rows: List[dict]) -> None:
+        """写/更新挂单。幂等（按 client_order_id）。"""
+        now = int(time.time() * 1000)
+        for r in rows or ():
+            d = dict(r)
+            d.setdefault("created_ts", now)
+            d.setdefault("updated_ts", now)
+            if not d.get("client_order_id"):
+                raise ValueError("working_orders 必须有 client_order_id")
+            self._put(("working_order", d))
+
+    def working_orders(self, active_only: bool = True,
+                       limit: int = 0) -> List[dict]:
+        """本地记着的挂单。active_only 只返回「还挂着」的。"""
+        c = self._ro()
+        try:
+            sql = ("SELECT " + ", ".join(self.WORKING_ORDER_COLS)
+                   + " FROM working_orders")
+            args: List = []
+            if active_only:
+                sql += " WHERE status IN ('NEW','PARTIALLY_FILLED')"
+            sql += " ORDER BY updated_ts DESC, id DESC"
+            if limit:
+                sql += " LIMIT ?"
+                args.append(limit)
+            rows = c.execute(sql, tuple(args)).fetchall()
+        finally:
+            c.close()
+        return [dict(zip(self.WORKING_ORDER_COLS, r)) for r in rows]
+
+    def find_working_order(self, client_order_id: str) -> Optional[dict]:
+        got = self.working_orders(active_only=False)
+        for o in got:
+            if o["client_order_id"] == client_order_id:
+                return o
+        return None
+
+    def apply_order_reconciliation(self, result: dict, now_ms: int = 0
+                                   ) -> dict:
+        """把 `reconcile_orders()` 的结果落到本地账上。
+
+        * `adopted` → 补进本地（status 取交易所的）
+        * `changed` → 用交易所的状态覆盖本地
+        * `vanished` → 标记 `LOST`，**不删**。
+          删掉就等于认定「它从没存在过」，而它可能是一笔已经成交的单。
+          留成 LOST 才能被后续 `query_order()` 查清真实终态，
+          也才能在对账报表里被看见。
+        * `same` → 只更新 `synced_ts`（表示"这一轮对过了"）
+        """
+        now_ms = now_ms or int(time.time() * 1000)
+        n_adopt = n_changed = n_lost = n_same = 0
+        for r in result.get("adopted") or ():
+            self.upsert_working_orders([self._from_remote(r, now_ms)])
+            n_adopt += 1
+        for pair in result.get("changed") or ():
+            self.upsert_working_orders([self._from_remote(pair["remote"], now_ms,
+                                                          pair["local"])])
+            n_changed += 1
+        for l in result.get("vanished") or ():
+            d = dict(l)
+            d["status"] = "LOST"
+            d["updated_ts"] = now_ms
+            d["synced_ts"] = now_ms
+            d["note"] = (d.get("note") or "") + " | 对账：交易所查不到"
+            self.upsert_working_orders([d])
+            n_lost += 1
+        for pair in result.get("same") or ():
+            d = self._from_remote(pair["remote"], now_ms, pair["local"])
+            d["synced_ts"] = now_ms
+            self.upsert_working_orders([d])
+            n_same += 1
+        return {"adopted": n_adopt, "changed": n_changed,
+                "lost": n_lost, "same": n_same}
+
+    @staticmethod
+    def _from_remote(r: dict, now_ms: int, local: Optional[dict] = None) -> dict:
+        """把交易所返回的订单（或 PendingOrder）转成 working_orders 的一行。
+
+        两种入参都吃：`PendingOrder` 有 `client_id`，币安原始 JSON 有
+        `clientOrderId`。本地原有的 purpose/strategy/round_key 要保留 ——
+        那些信息交易所不知道，丢了就再也补不回来。
+        """
+        r = order_row(r)
+        loc = local or {}
+        cid = (r.get("client_id") or r.get("client_order_id")
+               or r.get("clientOrderId") or loc.get("client_order_id") or "")
+        return {
+            "client_order_id": cid,
+            "exchange_order_id": str(r.get("order_id") or r.get("orderId")
+                                     or loc.get("exchange_order_id") or ""),
+            "symbol": r.get("symbol") or loc.get("symbol") or "",
+            "side": r.get("side") or loc.get("side") or "",
+            "otype": (r.get("type") or r.get("otype")
+                      or loc.get("otype") or ""),
+            "qty": float(r.get("qty") or r.get("origQty")
+                         or loc.get("qty") or 0),
+            "executed_qty": float(r.get("executed_qty") or r.get("executedQty")
+                                  or 0),
+            "price": float(r.get("price") or loc.get("price") or 0),
+            "stop_price": float(r.get("stop_price") or r.get("stopPrice")
+                                or loc.get("stop_price") or 0),
+            "avg_price": float(r.get("avg_price") or r.get("avgPrice") or 0),
+            "reduce_only": int(bool(r.get("reduce_only")
+                                    or r.get("reduceOnly")
+                                    or loc.get("reduce_only"))),
+            "status": r.get("status") or loc.get("status") or "NEW",
+            "purpose": loc.get("purpose") or "",
+            "strategy": loc.get("strategy") or "",
+            "round_key": loc.get("round_key") or "",
+            "created_ts": int(loc.get("created_ts") or now_ms),
+            "updated_ts": now_ms,
+            "synced_ts": now_ms,
+            "note": loc.get("note") or "",
+        }
+
+    def recent_live_rounds(self, limit: int = 20,
+                           closed_only: bool = False) -> List[dict]:
+        """最近 N 单。默认「只看已平仓」——还没平的仓没有出场价，
+        也没有 MFE/MAE 和分数，混在表里会让"平均分"失真。"""
+        c = self._ro()
+        try:
+            where = " WHERE 1=1"
+            if closed_only:
+                where += " AND exit_ts IS NOT NULL"
+            rows = c.execute(
+                "SELECT round_key,symbol,side,qty,entry_ts,entry_price,exit_ts,"
+                "exit_price,gross,fee,funding,net,hold_sec,n_fills,notional,"
+                "source,trade_id,open_reason,mfe,mae,score_pnl,score_entry,"
+                "score_exit,score_cost,score_total,grade,analysis,analyzed_ts,"
+                "synced_ts FROM live_rounds" + where +
+                " ORDER BY COALESCE(exit_ts, entry_ts) DESC, id DESC LIMIT ?",
+                (limit,)).fetchall()
+        finally:
+            c.close()
+        keys = ("round_key", "symbol", "side", "qty", "entry_ts", "entry_price",
+                "exit_ts", "exit_price", "gross", "fee", "funding", "net",
+                "hold_sec", "n_fills", "notional", "source", "trade_id",
+                "open_reason", "mfe", "mae", "score_pnl", "score_entry",
+                "score_exit", "score_cost", "score_total", "grade", "analysis",
+                "analyzed_ts", "synced_ts")
+        return [dict(zip(keys, r)) for r in rows]
+
+    def live_rounds_summary(self, limit: int = 20) -> dict:
+        """最近 N 单的汇总。分开给「已平仓」和「含未平仓」两个口径，
+        因为未平仓的 net 是浮的，混进胜率就是错的。"""
+        c = self._ro()
+        try:
+            rows = c.execute(
+                "SELECT net, score_total, exit_ts, fee, funding, gross"
+                " FROM (SELECT net, score_total, exit_ts, fee, funding, gross"
+                "       FROM live_rounds"
+                "       ORDER BY COALESCE(exit_ts, entry_ts) DESC, id DESC LIMIT ?)",
+                (limit,)).fetchall()
+        finally:
+            c.close()
+        closed = [r for r in rows if r[2] is not None]
+        scored = [r for r in closed if r[1] is not None]
+        net = sum(r[0] or 0.0 for r in closed)
+        return {
+            "n": len(rows),
+            "n_closed": len(closed),
+            "n_open": len(rows) - len(closed),
+            "n_win": sum(1 for r in closed if (r[0] or 0.0) > 0),
+            "win_rate": (round(sum(1 for r in closed if (r[0] or 0.0) > 0)
+                               / len(closed), 4) if closed else None),
+            "net": round(net, 4),
+            "gross": round(sum(r[5] or 0.0 for r in closed), 4),
+            "fee": round(sum(r[3] or 0.0 for r in closed), 4),
+            "funding": round(sum(r[4] or 0.0 for r in closed), 4),
+            "avg_score": (round(sum(r[1] for r in scored) / len(scored), 1)
+                          if scored else None),
+        }
+
+    def live_round_keys(self) -> dict:
+        """已入库的回合：round_key -> 上一次的分析结果与来源标注。
+
+        两个用途：
+        1. 同步时跳过「已经算过、成交笔数没变」的回合，
+           否则每个对账周期都要为每一单重拉一次 1m K 线去算 MFE/MAE。
+        2. **把旧的分析结果搬回来**。同步是整行覆盖，而重新还原出来的行
+           没有分数（分数要额外拉 K 线才算）。不搬的话，已经算过的单
+           每 5 分钟就会被清空一次，看板上刚出现的分数又消失。
+        """
+        c = self._ro()
+        try:
+            out = {}
+            for r in c.execute(
+                    "SELECT round_key, n_fills, analyzed_ts, mfe, mae,"
+                    " score_pnl, score_entry, score_exit, score_cost,"
+                    " score_total, grade, analysis, trade_id, open_reason"
+                    " FROM live_rounds").fetchall():
+                out[r[0]] = {
+                    "n_fills": r[1] or 0, "analyzed_ts": r[2] or 0,
+                    "mfe": r[3], "mae": r[4],
+                    "score_pnl": r[5], "score_entry": r[6],
+                    "score_exit": r[7], "score_cost": r[8],
+                    "score_total": r[9], "grade": r[10] or "",
+                    "analysis": r[11] or "", "trade_id": r[12],
+                    "open_reason": r[13] or "",
+                }
+            return out
+        finally:
+            c.close()
+
+    def trade_ids_for_adoption(self) -> dict:
+        """trades 表里「引擎经手过」的仓：entry_ts -> {id, open_reason, strategy}。
+
+        用来给回合标 source。按 entry_ts 匹配，因为引擎写 trades 时
+        entry_ts 就是它认定的开仓时刻；差一秒就标不上，
+        宁可标 manual（不知道）也不猜。
+        """
+        c = self._ro()
+        try:
+            out = {}
+            for tid, ets, side, why, stg in c.execute(
+                    "SELECT id, entry_ts, COALESCE(side,''),"
+                    " COALESCE(open_reason,''), COALESCE(strategy,'')"
+                    " FROM trades WHERE entry_ts IS NOT NULL").fetchall():
+                out.setdefault(int(ets), {"id": tid, "side": side,
+                                          "open_reason": why,
+                                          "strategy": stg})
+            return out
+        finally:
+            c.close()
 
 
 def _j(s):

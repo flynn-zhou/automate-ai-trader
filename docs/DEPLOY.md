@@ -16,7 +16,7 @@
 | 健康日志 | `/home/cryptobot/ai-trader/logs/healthcheck.log` |
 | Web 端口 | `8090`（Flask） |
 | WS 端口 | `8091`（看板推送） |
-| 对外域名 | `cbot.speaklingo.top`（Caddy 反代） |
+| 对外域名 | `flynn.pumacash.top`（Caddy 反代；2026-11-20 由 `cbot.speaklingo.top` 迁来，老域名暂留在同一 block 里便于回滚） |
 | 磁盘 | 59G，当前用 12G（22%）；`data/` 占 747M，`.venv` 占 38M |
 
 ## 二、连接（第一个卡点）
@@ -240,11 +240,20 @@
 
 ## 七、对外暴露（Caddy）
 
-    cbot.speaklingo.top {
+    flynn.pumacash.top, cbot.speaklingo.top {
         reverse_proxy /ws* 127.0.0.1:8091
         reverse_proxy 127.0.0.1:8090
         encode gzip
     }
+
+- **加域名的顺序**：先把域名写进 Caddyfile → `caddy validate` → `systemctl reload caddy`。
+  Caddy 会自动去 Let's Encrypt 申请证书（HTTP-01 走 80，TLS-ALPN 走 443），
+  **不需要手工传证书**。
+- ★ 一个真踩过的坑（2026-11-20）：域名 A 记录已经指过来，但 Caddyfile 里没有这个站点，
+  浏览器报的是「证书错误」，看起来像证书配错了 —— 实际是 **Caddy 没有该域名的证书，
+  TLS 握手直接回 `tlsv1 alert internal error`**。判断方法：
+  `echo | openssl s_client -connect 127.0.0.1:443 -servername <域名>` 看它出的是谁的证书。
+  这种情况下**改 nginx/caddy 的 ssl_certificate 是白费力气**，缺的是站点。
 
 - `/ws*` 必须**排在前面**，否则 WebSocket 会被普通反代吞掉
 - Caddy 自动签发证书，443/80 由 caddy 监听

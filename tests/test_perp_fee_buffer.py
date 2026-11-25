@@ -59,10 +59,11 @@ def test_perp_fee_buffer_is_not_zero():
     eng = _eng("perp")
     assert eng._fee_buffer() > 0, (
         "永续缓冲为 0：名义额可以吃满权益，保证金+手续费必然不足")
-    assert eng._fee_buffer() < eng._fee_buffer() + 1   # 平凡但防止被改成负数
-    spot = _eng("spot")
-    assert spot._fee_buffer() > eng._fee_buffer(), (
-        "现货缓冲应大于永续（现货手续费更高）")
+    # ★ 2026-11-17：现货那个 0.3% 已从令牌上删掉，所以不再比较两个市场。
+    #   但“缓冲必须盖得住 taker”这条不变式要钉死：
+    assert eng._fee_buffer() >= float(eng.tcfg.taker_fee) * 2, (
+        "缓冲 %.4f 盖不住双边 taker %.4f"
+        % (eng._fee_buffer(), float(eng.tcfg.taker_fee) * 2))
 
 
 def test_perp_plan_leaves_room_for_fee():
@@ -82,14 +83,14 @@ def test_perp_plan_leaves_room_for_fee():
         "留给手续费的空间 %.4f 不够付 %.4f" % (room, fee))
 
 
-def test_spot_plan_leaves_more_room():
-    """现货同理，而且留得更多（手续费 0.1%）。"""
-    eng = _eng("spot")
-    price = 78015.0
-    equity = price * 0.01
-    plan = eng._trend_plan(price, equity, {"name": "trend_entry"})
-    assert plan.ok, plan.reason
-    assert plan.notional < equity
-    room = equity - plan.notional
-    assert room > plan.notional * 0.001, (
-        "现货留给手续费的空间 %.4f 不够付 0.1%%" % room)
+def test_buffer_is_one_value_not_two():
+    """★ 缓冲只有一个值。无论配置写 spot 还是执行器名字叫 spot。
+
+    这条是反向锁：只要有人把 `if self._is_spot(): return 0.003`
+    加回去，这里就会红。
+    """
+    a = _eng("perp")
+    b = _eng("spot")
+    a.tcfg.exec_market = "spot"
+    a.ex.name = "spot"
+    assert a._fee_buffer() == b._fee_buffer() == 0.001

@@ -126,7 +126,7 @@ def _lot(qty=0.032, entry=60880.0, stop=59894.81):
 _METHODS = ("_adopted_slot", "_is_adopted", "_adopted_stop_state",
             "_adopted_stop_cid", "_sync_adopted_stop_order",
             "_cancel_adopted_stop_order", "_adopted_close",
-            "_nope")
+            "_maintain_adopted_protection", "_nope")
 
 
 def _engine(adopted=None, pos=None, ex=None, step=0.001):
@@ -493,6 +493,40 @@ def test_liq_cache_is_not_clobbered_by_a_missing_liq_value():
         assert st._liq_cache == (1, 58356.2, 60000), "被 %r 清掉了" % (eq,)
 
 
+def test_maintain_adopted_protection_places_the_order():
+    """具名入口本身必须真的挂单（否则「提前」只是把空调用提前了）。
+
+    ★ 为什么单独测这个方法：`_step` 的调用点只能靠源码顺序断言（那函数太重，
+      跑不起来）。如果只测「调用了」，把方法体改成 `pass` 也能全绿 —— 变异
+      当场抓到过这种存活。所以方法体必须有行为断言。
+    """
+    st = _engine(adopted=_lot())
+    _run(E.DecisionEngine._maintain_adopted_protection(st, 61250.0))
+    assert len(st.ex.placed) == 1, (
+        "维护入口没有挂出保护单（placed=%r）" % (st.ex.placed,))
+    o = st.ex.placed[0]
+    assert o["type"] == "STOP_MARKET"
+    assert o["reduce_only"] is True
+    assert o["side"] == "SELL"
+
+
+def test_maintain_adopted_protection_is_a_noop_without_a_position():
+    """没有接管仓时什么都不许做（不撤单、不挂单）。"""
+    st = _engine(adopted=None, pos=None)
+    _run(E.DecisionEngine._maintain_adopted_protection(st, 61250.0))
+    assert st.ex.placed == []
+    assert st.ex.cancelled == []
+
+
+def test_maintain_adopted_protection_swallows_errors():
+    """挂单失败只能记日志，不能把主循环带崩（抄底仓下一 tick 还要重试）。"""
+    st = _engine(adopted=_lot(), ex=_LiveEx(place_err="网络断了"))
+    _run(E.DecisionEngine._maintain_adopted_protection(st, 61250.0))
+    assert st.ex.placed, "应当尝试过挂单"
+    # 失败后状态清空 → 下一轮重试
+    assert st._adopted_stop_state() == {}
+
+
 def test_step_calls_the_liq_cache_seeder():
     """结构性判据：`_step` 必须真的调它（否则抽出来的函数是死代码）。"""
     src = inspect.getsource(E.DecisionEngine._step)
@@ -518,11 +552,16 @@ def test_step_calls_the_liq_cache_seeder():
 #   保护单调用必须**先于**那个会提前 return 的出场判断。
 
 def test_step_maintains_the_protective_order_before_the_15m_guard():
-    """`_step` 里保护单维护必须在「没接管后 15m 就 return」之前。"""
+    """`_step` 里保护单维护必须在「没接管后 15m 就 return」之前。
+
+    ★ 盯的是具名入口 `_maintain_adopted_protection`（而不是就地写两行
+      `_sync_adopted_stop_order`）：保护单是**无条件该有**的东西，抽成名字
+      之后这条意图能被测试和变异直接盯住，不靠读调用点周围的缩进去猜。
+    """
     src = inspect.getsource(E.DecisionEngine._step)
     body = "\n".join(l for l in src.splitlines()
                      if not l.strip().startswith("#"))
-    i_sync = body.find("_sync_adopted_stop_order(")
+    i_sync = body.find("_maintain_adopted_protection(")
     i_exit = body.find("_step_adopted_exit(")
     assert i_sync != -1, (
         "`_step` 没有维护保护单 —— 接管后要等一根 15m K 线才有交易所侧保护")
@@ -542,10 +581,9 @@ def test_reconcile_places_the_protective_order_at_adoption_time():
     src = inspect.getsource(E.DecisionEngine._reconcile_positions)
     body = "\n".join(l for l in src.splitlines()
                      if not l.strip().startswith("#"))
-    assert "_sync_adopted_stop_order(" in body, (
+    assert "_maintain_adopted_protection(" in body, (
         "对账接管之后没有立刻挂保护单 —— 接管到第一轮 `_step` 之间是裸奔的")
     # 而且必须真的传了价（传 0 会跳过「已经触发过就别挂」的判断）
-    assert "self.adopted_pos, _px" in body.replace(
-        "self.adopted_pos, _px)", "self.adopted_pos, _px"), \
+    assert "_maintain_adopted_protection(_px)" in body, \
         "对账里挂保护单没有传当前价"
 

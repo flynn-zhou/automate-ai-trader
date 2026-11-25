@@ -1308,11 +1308,7 @@ class DecisionEngine:
                 #   重复调用只多一次本地比较。
                 if self.adopted_pos:
                     _px = float(getattr(self.feed, "last_price", 0.0) or 0.0)
-                    try:
-                        await self._sync_adopted_stop_order(self.adopted_pos, _px)
-                    except Exception as e:
-                        logger.error("[对账] 接管瞬间挂保护单失败（下一 tick 重试）：%s",
-                                     e)
+                    await self._maintain_adopted_protection(_px)
 
         # guard.notify 可能本身是 None：没配 AI_FEISHU_WEBHOOK 时
         # feishu_notifier() 返回 None，Guard 把它原样存进 self.notify。
@@ -1699,12 +1695,7 @@ class DecisionEngine:
             #    剩下的判断（P0 保命 / P1 止损）确实需要结构数据才算，而
             #    「挂一张保护单」只依赖 stop 和 qty —— 接管时两者就有。
             #    把**无条件该做的事**摆在有条件判断前面，顺序才不会反过来。
-            _ap, _ = self._adopted_slot()
-            if _ap:
-                try:
-                    await self._sync_adopted_stop_order(_ap, price)
-                except Exception as e:
-                    logger.error("[接管] 保护单维护失败（下一 tick 重试）：%s", e)
+            await self._maintain_adopted_protection(price)
             try:
                 _b15 = self._to_pending_bars((bars_by_iv or {}).get(900000))
                 await self._step_adopted_exit(bars_by_iv, _b15, price, now_ms,
@@ -5790,6 +5781,30 @@ class DecisionEngine:
         # 无论成败都清掉本地记录：下一轮 `_sync` 会按现状重新收敛
         # （成功 → 不再挂；失败 → 重挂一张新的，而不是永远卡在旧 id 上）。
         self._adopted_stop = {}
+
+    async def _maintain_adopted_protection(self, price: float) -> None:
+        """确保接管仓在交易所侧**有**保护单。幂等，失败只记日志不抛。
+
+        ★ 2026-11-25（用户裁决）：「我们做的是抄底行为，可能在 10 分钟内
+          发生超级大波动」。所以这件事必须从**接管那一刻**开始、每 tick 都做，
+          而不是等「接管之后第一根已收盘 15m」。
+
+        三个调用点都用这一个入口：
+          · `_reconcile_positions` —— 接管落地那一瞬
+          · `_step` —— 每 3 秒（与 K 线无关）
+
+        ★ 为什么抽成一个具名方法而不是就地在调用点写两行：
+          保护单是**无条件该有**的东西，它的存在与否不该取决于
+          「有没有新的已收盘 15m」。抽成名字之后，这条意图能被测试
+          （和变异）直接盯住，而不是靠读调用点周围的缩进猜。
+        """
+        pos, _slot = self._adopted_slot()
+        if not pos:
+            return
+        try:
+            await self._sync_adopted_stop_order(pos, price)
+        except Exception as e:                       # noqa: BLE001
+            logger.error("[接管] 保护单维护失败（下一 tick 重试）：%s", e)
 
     async def _sync_adopted_stop_order(self, pos, price: float) -> None:
         """让交易所侧的保护性止损单与内存里的止损/手数保持一致。

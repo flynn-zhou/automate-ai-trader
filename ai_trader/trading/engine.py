@@ -1300,6 +1300,20 @@ class DecisionEngine:
                     logger.critical("[对账] 接管人工仓：%s %.6f @ %.2f（熔断 %.2f）",
                                     side, qty_delta, entry, stop)
 
+                # ★ 2026-11-25（用户裁决）：接管的那一瞬就要挂上交易所侧保护单。
+                #   放在对账里而不是等 `_step`，是因为对账可能在启动时跑，
+                #   而 `_step` 的第一轮要等行情；抄底仓 10 分钟内就可能遇到
+                #   超级大波动，那段时间里裸奔的敞口没有第二次机会。
+                #   幂等：已在 `_sync_adopted_stop_order` 里做「已对齐不发请求」，
+                #   重复调用只多一次本地比较。
+                if self.adopted_pos:
+                    _px = float(getattr(self.feed, "last_price", 0.0) or 0.0)
+                    try:
+                        await self._sync_adopted_stop_order(self.adopted_pos, _px)
+                    except Exception as e:
+                        logger.error("[对账] 接管瞬间挂保护单失败（下一 tick 重试）：%s",
+                                     e)
+
         # guard.notify 可能本身是 None：没配 AI_FEISHU_WEBHOOK 时
         # feishu_notifier() 返回 None，Guard 把它原样存进 self.notify。
         # Guard.alert() 里检查了这一点，但这里直接调用就会 TypeError，
@@ -1667,6 +1681,30 @@ class DecisionEngine:
         #      而是**只留一个调用点，放在这里**：3 秒粒度、与策略无关、
         #      `_step_pending` 不再调用它。
         if self._is_adopted():
+            # ★★ 2026-11-25（用户裁决）保护单必须在**接管那一刻**就存在，
+            #    不能等「接管之后第一根已收盘 15m」。
+            #
+            #    根因：`_sync_adopted_stop_order` 原来只挂在
+            #    `_step_adopted_exit` 的两处（`plan.is_noop` 分支与出场之后），
+            #    而这两处都在「没有接管之后的已收盘 15m 就 return」之后。
+            #    于是从接管到挂单之间，最长 = 一根 15m K 线 + 一个 tick
+            #    ≈ 15 分钟，交易所侧**完全没有保护**，进程内 3 秒轮询是唯一
+            #    防线 —— 进程一挂就是裸奔。
+            #
+            #    用户的理由（原话）：「我们做的是抄底行为，可能在 10 分钟内
+            #    发生超级大波动」。15 分钟的空窗比一次死机还长，而且是
+            #    22 倍杠杆：1.6% 的逆向插针就是全部保证金。
+            #
+            #    放这里而不是放进 `_step_adopted_exit` 的开头：那函数里
+            #    剩下的判断（P0 保命 / P1 止损）确实需要结构数据才算，而
+            #    「挂一张保护单」只依赖 stop 和 qty —— 接管时两者就有。
+            #    把**无条件该做的事**摆在有条件判断前面，顺序才不会反过来。
+            _ap, _ = self._adopted_slot()
+            if _ap:
+                try:
+                    await self._sync_adopted_stop_order(_ap, price)
+                except Exception as e:
+                    logger.error("[接管] 保护单维护失败（下一 tick 重试）：%s", e)
             try:
                 _b15 = self._to_pending_bars((bars_by_iv or {}).get(900000))
                 await self._step_adopted_exit(bars_by_iv, _b15, price, now_ms,

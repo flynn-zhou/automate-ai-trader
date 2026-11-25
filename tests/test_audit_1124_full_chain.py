@@ -518,20 +518,51 @@ def test_adopted_exit_has_exactly_one_call_site_and_pending_does_not_gate_it():
     # （第一版只看紧邻一行，于是把 `_b15 = ...` 当成"没有判据"，
     #   测试自己先红了 —— 变异验证会因此得出假结论。）
     gate = ""
-    for ln in reversed(lines[:idx]):
+    # ★ 2026-11-25 改：判据取法要跟上调用点结构的变化，但不能因此放松。
+    #
+    #   原来取「最近的任意 `if`（缩进比调用行浅）」。现在调用点上方多了
+    #   一层保护单维护用的 `if _ap:`（用户裁决：保护单不能再等 15m），
+    #   于是判据被读成 `if _ap:`，测试红在了一句**不是它想守的事**上。
+    #
+    #   这条测试真正要守的：① 不被 `_is_pending()` 排除；
+    #   ② 有 `_is_adopted()` 判据（不能对空仓也跑一遍 —— 对空仓跑会
+    #      拿不到 stop，历史上有过空仓触发一轮无意义判断的事故）。
+    #
+    #   所以改成认两种合法形状：
+    #     · 最近判据本身就是 `if self._is_adopted():`
+    #     · 最近判据是「收窄接管槽」的（`if _ap:` / `_adopted_slot`），
+    #       且它的上一层确实是 `_is_adopted`
+    #   别的形状一律判红 —— 放宽等于把这条守卫变空。
+    upto = list(lines[:idx])
+    gates = []
+    for ln in reversed(upto):
         s = ln.strip()
         if not s or s.startswith("#"):
             continue
         ind = len(ln) - len(ln.lstrip())
         if s.startswith("if ") and ind < call_indent:
-            gate = s
-            break
+            gates.append(s)
+            if len(gates) >= 3:
+                break
+    gate = gates[0] if gates else ""
     assert gate, "调用点上方找不到 `if` 判据"
-    assert "_is_pending" not in gate, (
-        "人工仓出场被 `_is_pending()` 排除了（判据：%r）—— "
-        "生产跑的正是 strategy=pending，它会退回每 5 分钟判一次" % gate)
-    assert "_is_adopted" in gate, (
-        "调用点的判据里没有 `_is_adopted()`（判据：%r）—— 那会对空仓也跑一遍" % gate)
+    if "_is_adopted" not in gate:
+        # 只允许「先收窄接管槽、外面一层是 _is_adopted」这一种嵌套
+        assert ("_ap" in gate or "_adopted_slot" in gate), (
+            "调用点的判据既不是 `_is_adopted()` 也不是在收窄接管槽"
+            "（判据：%r）—— 那会对空仓也跑一遍" % gate)
+        assert any("_is_adopted" in g for g in gates[1:]), (
+            "收窄接管槽的那层 `if` 外面没有 `_is_adopted()` 兜着"
+            "（判据链：%r）" % (gates,))
+    # ★ `_is_pending` 必须查**整条判据链**，不能只查最内层。
+    #   我自己踩过：只查内层时，`if (not self._is_pending()) and self._is_adopted():`
+    #   这种写法会静默通过（变异验证当场抓住：那条变异存活了）。
+    #   这行判据的真实意图是「不许被 _is_pending 排除」，链上任何一层出现它
+    #   都可能把人工仓出场退回每 5 分钟判一次。
+    for g in gates:
+        assert "_is_pending" not in g, (
+            "人工仓出场的判据链里出现了 `_is_pending()`（%r）—— "
+            "生产跑的正是 strategy=pending，它会退回每 5 分钟判一次" % g)
 
 
 # =================================================== F9：陈旧的路由结果

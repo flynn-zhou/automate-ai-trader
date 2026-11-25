@@ -499,3 +499,53 @@ def test_step_calls_the_liq_cache_seeder():
     body = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
     assert "_seed_liq_cache_from_equity(eq" in body, \
         "`_step` 没有使用 equity() 带回的真实爆仓价"
+
+
+# ------------------------------------------------ 保护单必须挂在接管那一刻
+#
+# ★★ 2026-11-25（用户裁决）：15 分钟的空窗不是"迟滞"，是裸奔。
+#
+#   `_sync_adopted_stop_order` 原来只挂在 `_step_adopted_exit` 的两处，
+#   而那两处都在「还没有接管之后的已收盘 15m，本轮不判出场」的 return
+#   之后。于是从接管到挂上保护单之间，最长 = 一根 15m K 线 + 一个 tick，
+#   交易所侧**一张保护单都没有**。
+#
+#   用户的理由（原话）：「我们做的是抄底行为，可能在 10 分钟内发生超级
+#   大波动」。22 倍杠杆下 1.6% 的逆向插针就是全部保证金 —— 15 分钟的
+#   空窗比一次死机还长。
+#
+#   这两个缺陷的形状是「代码看起来做了、其实没做」，所以判据用源码顺序：
+#   保护单调用必须**先于**那个会提前 return 的出场判断。
+
+def test_step_maintains_the_protective_order_before_the_15m_guard():
+    """`_step` 里保护单维护必须在「没接管后 15m 就 return」之前。"""
+    src = inspect.getsource(E.DecisionEngine._step)
+    body = "\n".join(l for l in src.splitlines()
+                     if not l.strip().startswith("#"))
+    i_sync = body.find("_sync_adopted_stop_order(")
+    i_exit = body.find("_step_adopted_exit(")
+    assert i_sync != -1, (
+        "`_step` 没有维护保护单 —— 接管后要等一根 15m K 线才有交易所侧保护")
+    assert i_exit != -1, "`_step` 没有调用出场判断"
+    assert i_sync < i_exit, (
+        "保护单维护被放在出场判断**之后**：`_step_adopted_exit` 在没有接管后 "
+        "15m 时会提前 return（「本轮不判出场」），它后面的代码根本不会执行 —— "
+        "这正是 15 分钟裸奔窗口的成因")
+
+
+def test_reconcile_places_the_protective_order_at_adoption_time():
+    """接管那一瞬就要挂上保护单，不能等下一轮 `_step`。
+
+    对账在启动时就会跑，而 `_step` 的第一轮要等行情；这中间行情可能已经
+    走完一整段。所以对账里也要调一次（幂等，已对齐不发请求）。
+    """
+    src = inspect.getsource(E.DecisionEngine._reconcile_positions)
+    body = "\n".join(l for l in src.splitlines()
+                     if not l.strip().startswith("#"))
+    assert "_sync_adopted_stop_order(" in body, (
+        "对账接管之后没有立刻挂保护单 —— 接管到第一轮 `_step` 之间是裸奔的")
+    # 而且必须真的传了价（传 0 会跳过「已经触发过就别挂」的判断）
+    assert "self.adopted_pos, _px" in body.replace(
+        "self.adopted_pos, _px)", "self.adopted_pos, _px"), \
+        "对账里挂保护单没有传当前价"
+

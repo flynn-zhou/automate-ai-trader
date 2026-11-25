@@ -108,7 +108,8 @@ def _engine_stub(adopted=None, pos=None, ex=None):
                   # A1（2026-11-25 交易域审查）：平仓之后要撤/改交易所侧
                   # 那张保护性止损单，`_adopted_close` 会调它们。
                   "_adopted_stop_state", "_adopted_stop_cid",
-                  "_sync_adopted_stop_order", "_cancel_adopted_stop_order"):
+                  "_sync_adopted_stop_order", "_cancel_adopted_stop_order",
+                   "_pending_plan_ts", "_pending_repair_params"):
         _fn = E.DecisionEngine.__dict__[_name]
         _fn = getattr(_fn, "__func__", _fn)
         setattr(st, _name, _types.MethodType(_fn, st))
@@ -216,7 +217,9 @@ def test_thesis_brief_describes_what_it_is_waiting_for():
     st.adopted_pos = None
     th = _thesis()
     txt = E.DecisionEngine._pending_thesis_brief(st, th, T.EXPECTED, 61000.0)
-    assert "等触发" in txt
+    # ★ 2026-11-25：必须写明「未挂单」。原来只写「等触发」，
+    #   而生产上 EXPECTED 一条单都没挂到交易所 —— 那句话是误导性的。
+    assert "未挂单" in txt
     assert "61178" in txt, "必须报出挂单价"
     assert "距挂单价" in txt, "必须报出距离（回溯时最想知道的就是这个）"
 

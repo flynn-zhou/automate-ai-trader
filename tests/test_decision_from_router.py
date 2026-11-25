@@ -98,7 +98,12 @@ def test_blocked_and_waiting_are_different_sentences():
     blocked = E.DecisionEngine._pending_thesis_brief(
         eng, th, "EXPECTED", 61000.0, blocked=GATE_SIZING + "：名义 12U < 55U")
     assert waiting != blocked
-    assert "等触发" in waiting
+    # ★ 2026-11-25：EXPECTED 的文案改成「计划已采集、未挂单」。
+    #   原来这里钉的是「等触发」，而那句话被读成「交易所上有一张单挂着」——
+    #   生产上 4 条 EXPECTED 一张单都没有（用户就是被这句话误导的）。
+    assert "未挂单" in waiting
+    assert "等触发" not in waiting, (
+        "EXPECTED 不许再说「等触发」—— 它的真实含义是「声明还没成立，单没挂」")
     assert "等触发" not in blocked, (
         "被拦下时绝不能再说「等触发」—— 那句话是假的，单根本没挂出去")
     assert GATE_SIZING in blocked
@@ -116,11 +121,11 @@ def test_suppressed_still_wins_over_blocked():
 
 
 def test_empty_block_reason_keeps_the_old_text():
-    """没被拦时行为必须和以前逐字一致（BUS-B 不许改顺手其它东西）。"""
+    """没被拦时的文案契约（2026-11-25 改为「计划已采集、未挂单」）。"""
     eng = types.SimpleNamespace()
     th, _ = _row("丁|up|1795400000000|61400.0", 61400.0)
     txt = E.DecisionEngine._pending_thesis_brief(eng, th, "EXPECTED", 61000.0)
-    assert txt.startswith("丁 等触发（挂单 61400.00 / 止损 ")
+    assert txt.startswith("丁 计划已采集、**未挂单**（拟挂 61400.00 / 止损 ")
     assert "被【" not in txt
 
 

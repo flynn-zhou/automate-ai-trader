@@ -2604,8 +2604,13 @@ class DecisionEngine:
             return
         self._pending_harvest_ts = cur
 
+        # ★ 参数**只生成一次**，计划发现和建预期共用同一份。
+        #   分两次调 `_pending_params()` 就等于两个来源：一旦其中一次拿到
+        #   None（`_sizing_params()` 失败时的兜底），计划按 A 组参数算、
+        #   预期按 B 组参数落库，止损/超时/衰减会各说各话。
+        params = self._pending_params()
         try:
-            plans, stats = self.pending_source(self._pending_params())
+            plans, stats = self.pending_source(params)
         except Exception as e:
             logger.error("[挂单] 计划源出错，本根不采集：%s", e, exc_info=True)
             try:
@@ -2614,6 +2619,7 @@ class DecisionEngine:
                 pass
             return
 
+        from . import pending_plan as _P
         from . import pending_thesis_store as _PTS
         from . import thesis as _T
         added = 0
@@ -2629,13 +2635,24 @@ class DecisionEngine:
                 logger.warning("[挂单] 计划自洽性不过，丢弃 %s：%s", getattr(pl, "kind", ""), e)
                 continue
             tid = self._pending_plan_key(pl)
-            th = _T.Thesis(
-                thesis_id=tid, kind=pl.kind, direction=pl.direction,
-                order_price=float(pl.order_price),
-                stop_price=float(pl.stop_price),
-                target_price=float(pl.target_price),
-                order_type=pl.order_type, family=pl.family,
-                surprise_pts=float(getattr(pl, "surprise_pts", 0.0) or 0.0))
+            # ★★ P1（2026-11-25 交易域审查）：**必须**走 `to_thesis()`。
+            #
+            #   这里原来是手工拼 `_T.Thesis(...)`，只传了形态/方向/价格/止损/
+            #   止盈/order_type/family，漏掉了 `horizon_bars`、`stale_distance`、
+            #   `surprise_pts` 三个参数 —— 于是它们取了 `Thesis` 的默认值 0。
+            #
+            #   后果是三条规则**在生产上静默关闭**（实测库里 22/22 行全为 0）：
+            #     · horizon_bars=0  → 挂单超时永不过期
+            #     · stale_distance=0 → 挂单期跑偏永不撤销（僵尸计划越积越多）
+            #     · surprise_pts=0  → `_surprise_hit` 遇 pts<=0 直接返回 None，
+            #                          「单根 5m 顺向 ≥500 点立即止盈」彻底失效
+            #
+            #   而 `PendingParams` 里这三个值本来是 12 / 止损距离×1.0 / 500。
+            #   唯一会把它们带下去的函数就是 `to_thesis()`，测试也都在测它 ——
+            #   但生产走的是另一条手工路径，所以测试全绿、线上全 0。
+            #   这是本项目第十次栽在「同一事实两个来源」上，所以这次不是
+            #   "补三个参数"，而是**把生产路径换成那个唯一实现**。
+            th = _P.to_thesis(pl, thesis_id=tid, params=params)
             try:
                 if self.pending.add_if_new(_PTS.row_of(
                         th, state=_T.EXPECTED, next_index=0,
@@ -3365,6 +3382,81 @@ class DecisionEngine:
             return len(arr)
         return max(0, i)
 
+    def _pending_plan_ts(self, row) -> int:
+        """这条预期**最初那根计划 K** 的时间戳（稳定锚点）。
+
+        ★★ 为什么不能直接用 `row["bar_ts"]`：那一列在每次推进之后会被覆盖成
+          当前 5m 的 ts（`upsert_thesis(..., bar_ts=ts)`），因为动作 id 是
+          `thesis_id:bar_ts:kind`，bar_ts 固定就会让不同步骤的同类动作撞成
+          同一个 id、被幂等逻辑当重放丢掉。所以它**必须**往前走 ——
+          但也因此**不能**用来回答「这条计划是哪根出来的」。
+
+        ★ 稳定事实在哪：`thesis_id` 是 `_pending_plan_key()` 造出来的
+          `形态|方向|声明时刻|挂单价`，落库后永不改写。取倒数第二个字段
+          就是那条计划自己的声明时刻，进程重启、游标推进都不影响。
+
+        ★ 解析不出来（自检单 `selfcheck-<ts>` 这类）就退回 `bar_ts` ——
+          宁可拿到一个会漂的值，也不能抛错让整条链停摆。
+        """
+        tid = str((row or {}).get("thesis_id") or "")
+        parts = tid.split("|")
+        if len(parts) >= 3:
+            try:
+                ts = int(parts[-2])
+                if ts > 0:
+                    return ts
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int((row or {}).get("bar_ts") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _pending_repair_params(self, row, th):
+        """把**旧代码落库的 0 参数**按当前口径补上（一次性数据修复）。
+
+        ★ 为什么需要：P1 修好的是"新计划不再丢参数"，但 2026-11-25 之前
+          落库的行里 `horizon_bars/stale_distance/surprise_pts` 全是 0。
+          这些行还在 live 列表里，一旦挂上/成交，它们就是**没有超时、
+          没有跑偏撤销、没有惊喜欢出场**的仓位 —— 等于规则依旧关闭。
+
+        ★ 只补 0 值，不覆盖任何非 0 值：将来的口径变化不会把历史行改掉。
+        ★ stale_distance 用行内已有的 `order_price` / `stop_price` 反算
+          （|挂单价−止损价| 就是 1R，与 `_stop_distance` 同一口径），
+          所以不需要原始 evidence。
+        """
+        try:
+            params = self._pending_params()
+        except Exception:
+            return th
+        from . import thesis as _THESIS
+        import dataclasses
+        # ★ `Thesis` 是 **frozen dataclass**：直接赋值会抛 FrozenInstanceError
+        #   （而 `_step_pending` 外面那层 `except` 会把它记成「推进失败」
+        #   然后跳过这条预期 —— 静默失效，正是本项目最难查的一类）。
+        #   所以一律用 `dataclasses.replace` 造新对象。
+        patch = {}
+        if not int(getattr(th, "horizon_bars", 0) or 0) \
+                and int(getattr(params, "horizon_bars", 0) or 0) > 0:
+            patch["horizon_bars"] = int(params.horizon_bars)
+        if not float(getattr(th, "surprise_pts", 0.0) or 0.0) \
+                and float(getattr(params, "surprise_pts", 0.0) or 0.0) > 0:
+            patch["surprise_pts"] = float(params.surprise_pts)
+        if not float(getattr(th, "stale_distance", 0.0) or 0.0) \
+                and getattr(th, "family", "") == _THESIS.FAMILY_REVERSAL:
+            sd = abs(float(getattr(th, "order_price", 0.0) or 0.0)
+                     - float(getattr(th, "stop_price", 0.0) or 0.0))
+            mult = float(getattr(params, "stale_stop_mult", 1.0) or 0.0)
+            if sd > 0 and mult > 0:
+                patch["stale_distance"] = round(sd * mult, 4)
+        if not patch:
+            return th
+        logger.warning(
+            "[挂单] %s 旧行参数全是 0（规则处于关闭状态）→ 按当前口径补：%s",
+            str(getattr(th, "thesis_id", "") or "")[:40],
+            "、".join("%s=%r" % (k, v) for k, v in patch.items()))
+        return dataclasses.replace(th, **patch)
+
     async def _step_pending(self, bars_by_iv, price, equity, now_ms) -> None:
         """把每条 live 预期往前推一根 5m，然后执行状态机产出的动作。
 
@@ -3489,6 +3581,13 @@ class DecisionEngine:
             try:
                 th = _PTS.thesis_of(row)
                 prog = _PTS.progress_of(row)
+                where_px = float(getattr(th, "order_price", 0.0) or 0.0)
+                # ★ 旧行参数补 0 修复（见 `_pending_repair_params` 的 docstring）：
+                #   不补的话历史行永远带着「无超时/无跑偏撤销/无惊喜欢出场」。
+                th = self._pending_repair_params(row, th)
+                # ★ 稳定的计划锚点：`bar_ts` 列会被推进覆盖，只有 `thesis_id`
+                #   里的声明时刻不变（见 `_pending_plan_ts`）。
+                _plan_ts = self._pending_plan_ts(row)
 
                 # ★★★ 幽灵成交自愈（2026-11-24）。
                 #
@@ -3528,6 +3627,52 @@ class DecisionEngine:
                     _briefs.append("幽灵成交已按 CANCELLED 终结")
                     continue
 
+                # ★★ 入场价已被穿过 → 这条预期作废（2026-11-25 交易域审查）。
+                #
+                #   三条形态都是「等价格**回到**这个位置再进」（限价/止损单），
+                #   前提是价格还没到过那儿。可一旦状态机被冻住（见下面游标
+                #   那段），计划会在 EXPECTED 里躺几十个小时 —— 期间价格早就
+                #   穿过去了。
+                #
+                #   这时再挂出去是什么后果，实测算得出来：
+                #     本地 4 条预期挂单价 60221.10 / 60447.90 / 59892.90，
+                #     而当时市价 59329.60 —— 多头限价挂在市价**上方**。
+                #     限价买单一挂出**立刻按市价成交**，可止损还是按原计划
+                #     算的 59289.77：离成交价只剩 0.07%，22 倍杠杆下等于
+                #     开仓即爆仓。这不是「滑点」，是拿一个已经不存在的
+                #     入场价在算风险。
+                #
+                #   判据是**二值事实**，不是可调阈值：价格有没有穿过入场价。
+                #   方向复用 `triggers_when_price_falls`（全仓唯一来源），
+                #   不在这里按 side/direction 另写一份。
+                if (str(row.get("state") or "") == "EXPECTED"
+                        and price > 0 and where_px > 0):
+                    _crossed = (price < where_px) if th.triggers_when_price_falls \
+                        else (price > where_px)
+                    if _crossed:
+                        logger.warning(
+                            "[挂单] %s 入场价 %.2f 已被穿过（现价 %.2f）→ "
+                            "「等价格回到这里」的前提不成立，计划作废",
+                            tid, where_px, price)
+                        try:
+                            self.db.log_risk(
+                                "pending_entry_crossed",
+                                "%s: 入场价 %.2f，现价 %.2f，"
+                                "挂出去会立即成交且止损只剩 %.3f%%"
+                                % (tid, where_px, price,
+                                   abs(where_px - float(th.stop_price))
+                                   / where_px * 100.0))
+                        except Exception:
+                            pass
+                        _row = dict(row)
+                        _row["state"] = "CANCELLED"
+                        _row["note"] = ("入场价已被穿过：计划那根之后价格"
+                                        "已越过 %.2f，不再具备「等回踩」的前提"
+                                        % where_px)
+                        self.pending.upsert_thesis(_row)
+                        _briefs.append("%s 入场价已被穿过 → 计划作废" % tid[:12])
+                        continue
+
                 # ★★ 首次推进：起点必须是这条 thesis 自己的那根计划 K。
                 #
                 #   `row["bar_ts"]` 在第一次 upsert 之前仍然是计划的那根
@@ -3538,10 +3683,52 @@ class DecisionEngine:
                 #   不能改成「让 bar_ts 永不更新」：action_id 是
                 #   `thesis_id:bar_ts:kind`，bar_ts 一旦固定，不同步骤产出的
                 #   同类动作 id 会撞，第二次会被幂等逻辑当成重放而丢掉。
-                if not int(prog.get("next_index") or 0):
+                # ★★ 游标冻结修复（2026-11-25 交易域审查）。
+                #
+                #   `_pending_start_index` 在「计划那根还没进 15m 缓冲」时
+                #   返回 `len(b15)` 当哨兵（见它自己的 docstring）。但历史上
+                #   这个哨兵被**当成合法游标落了库**。而下面的 `if not next_index`
+                #   只对 0 重算，于是下一轮直接拿 `start_at = len(b15)`：
+                #
+                #       range(len(b15), len(b15))  →  一根都不遍历
+                #
+                #   → 状态机**永久冻结**：既不挂单、也不过期，决策里还每 5 分钟
+                #     复述一遍「N 条预期在管」。实测生产 4 条 EXPECTED 全部
+                #     `next_index=400`（`feed.history` 的 deque maxlen 正好 400）、
+                #     `armed_at_bar=None`、动作表零行 —— 就是冻在这里。
+                #
+                #   修法两件：
+                #     1. 哨兵值不再落库（否则 0 与非 0 的语义就混了）；
+                #     2. 已经落库的哨兵（下一句的重算能算进缓冲了）清回 0 重算。
+                _ni = int(prog.get("next_index") or 0)
+                _nb = len(b15)
+                #: 落库时要写的游标。None = 用状态机返回的 newp；
+                #: 数字 = 「计划那根还没进缓冲」，本轮空转且**不许前移游标**。
+                _persist_next = None
+                if _ni and _ni >= _nb and _nb > 0:
+                    # 游标停在缓冲末尾：只有在「重算能拿到合法下标」时才清 —
+                    # 拿不到就说明计划那根还没进来，保持不动是对的。
+                    _re = self._pending_start_index(b15, _plan_ts)
+                    if _re < _nb:
+                        logger.warning(
+                            "[挂单] %s 游标卡在 %d（=缓冲长度 %d），哨兵值被误落库 → "
+                            "清回重算（真实起点 %d）", tid, _ni, _nb, _re)
+                        _ni = 0
+                        prog = dict(prog)
+                        prog["next_index"] = 0
+                if not _ni:
                     prog = dict(prog)
-                    prog["next_index"] = self._pending_start_index(
-                        b15, int(row.get("bar_ts") or 0))
+                    _start = self._pending_start_index(b15, _plan_ts)
+                    if _start >= _nb:
+                        # ★ 计划那根比缓冲里所有 K 都新 → 本轮不推进。
+                        #   但**必须照常走完一轮**（决策连续性：被压制/被闸门
+                        #   拦下的计划也要逐条留痕），所以让 step 空转
+                        #   （start=len），并把游标锁回 0 落库 ——
+                        #   落 len 的话下一轮 `if not next_index` 不重算，
+                        #   就固化成上面那个永久冻结。
+                        _persist_next = 0
+                        _start = _nb
+                    prog["next_index"] = _start
                 res, newp = _T.step(th, b15, book, progress=prog,
                                     entry_bars=b5, kbar=kbar_view)
             except Exception as e:
@@ -3636,9 +3823,13 @@ class DecisionEngine:
                 _p_ref = None
 
             # ★ 动作落地之后才前移游标（不变量 2）
+            #   `_persist_next` 非 None = 计划那根还没进缓冲、本轮空转：
+            #   此时**绝不能**把 `len(b15)` 这个哨兵写进库（写进去就永久冻结）。
+            _next_index = newp["next_index"] if _persist_next is None \
+                else int(_persist_next)
             try:
                 self.pending.upsert_thesis(_PTS.row_of(
-                    th, state=_p_state, next_index=newp["next_index"],
+                    th, state=_p_state, next_index=_next_index,
                     armed_at_bar=_p_armed,
                     armed_ref_close=_p_ref,
                     bar_ts=ts, ambiguous=bool(res.ambiguous),
@@ -3764,7 +3955,21 @@ class DecisionEngine:
                         % (short, str(getattr(th, "direction", "") or ""),
                            _qty, where, stop, _tgt, dist, blocked))
             if st == "EXPECTED":
-                return "%s 等触发（挂单 %.2f / 止损 %.2f）%s" % (short, where, stop, dist)
+                # ★ P2（2026-11-25 交易域审查）：EXPECTED 的真实含义是
+                #   「计划已采集，但**声明(claim)还没成立，因此一张单都没挂**」。
+                #
+                #   原来这里写「等触发（挂单 60221.10 / 止损 59289.77）」——
+                #   读起来完全是「交易所上有一张单挂在 60221 等成交」。
+                #   用户据此以为有 4 张单在等工作，实际交易所上一张都没有
+                #   （日志每 5 分钟都在喊「对账：交易所 1 张 / 本地 1 张」，
+                #   而那张是别人的遗留单）。
+                #
+                #   BUS-B 已经修过一次同类问题（被闸门拦下时不能说"等触发"），
+                #   但 EXPECTED 这一支漏了 —— 它压根不是失败，是"还没到那一步"。
+                #   所以这里必须把「未挂单」写出来，而不是留一个能被读成
+                #   "已挂单"的句子。
+                return ("%s 计划已采集、**未挂单**（拟挂 %.2f / 止损 %.2f）"
+                        "%s——等声明成立才下单" % (short, where, stop, dist))
             if st == "ARMED":
                 return "%s 挂单在交易所（%.2f）%s" % (short, where, dist)
             if st in ("FILLED", "PARTIALLY_FILLED"):
@@ -4386,6 +4591,36 @@ class DecisionEngine:
         except Exception as e:
             logger.error("[挂单] %s 平仓已成交但关账失败：%s", tid, e, exc_info=True)
             self.db.log_risk("pending_close_book_failed", "%s: %s" % (tid, str(e)[:200]))
+        # ★★ P3：把 R 倍数补上（2026-11-25 交易域审查）。
+        #
+        #   `pending_thesis_store.set_exit()` 从写出来那天起**零调用** ——
+        #   全仓 grep 过：只有定义，没有任何调用点。于是生产库 22/22 行
+        #   `net_r` 全是 0.0，连 6 笔止盈、9 笔止损都是 0。
+        #
+        #   这不是"少一列统计"：回测按 R 说话、实盘只记了 USDT，两者之间
+        #   就少了一个兑换率 —— 库里根本回答不了「这套策略到底赚不赚」。
+        #
+        #   1R 的口径与开仓时**同一个**：`qty × |入场价 − 止损价|`
+        #   （止损距离就是 1R，见 `pending_plan._stop_distance` 的 docstring）。
+        #   分母为 0（没止损）时**不写**，而不是写 0 —— 写 0 会被读成
+        #   "打平"，把"量不了"伪装成一个结论。
+        try:
+            _stop = float(pos.get("stop") or 0.0) or float(
+                getattr(thesis_obj, "stop_price", 0.0) or 0.0)
+            _risk = abs(entry - _stop) * qty
+            if _risk > 0:
+                self.pending.set_exit(
+                    tid, int(time.time() * 1000), exit_price, pnl_net / _risk,
+                    note="R = 净盈亏 ÷ (手数 × 入场到止损的距离)")
+                logger.info("[挂单] %s 落 R：净 %+.2f / 1R %.4f = %+.3fR",
+                            tid, pnl_net, _risk, pnl_net / _risk)
+            else:
+                logger.warning("[挂单] %s 平仓但算不出 1R（入场 %.2f / 止损 %r）"
+                               "→ net_r 不写，保持原值", tid, entry, _stop)
+        except Exception as e:
+            logger.error("[挂单] %s 写 net_r 失败：%s", tid, e, exc_info=True)
+            self.db.log_risk("pending_net_r_failed", "%s: %s" % (tid, str(e)[:200]))
+
         self.pos = None
         logger.info("[挂单] %s %s 平 %.6f @ %.2f（%s，毛 %+.2f / 费 %.4f / 净 %+.2f）",
                     tid, side, qty, exit_price, getattr(act, "reason", ""),

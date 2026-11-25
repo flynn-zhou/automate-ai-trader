@@ -106,7 +106,10 @@ _ENGINE_METHODS = ("_is_adopted", "_pending_place", "_pending_close",
                    # reduceOnly 止损单，`_adopted_close`/`_step_adopted_exit`
                    # 都要调这三个才能跑完（桩上没有它们会 AttributeError）。
                    "_adopted_stop_state", "_adopted_stop_cid",
-                   "_sync_adopted_stop_order", "_cancel_adopted_stop_order")
+                   "_sync_adopted_stop_order", "_cancel_adopted_stop_order",
+                   # SIG-PARAMS（2026-11-25）：游标锚点与旧行参数修复。
+                   # `_step_pending` 现在每条预期都要调这两个才能跑完。
+                   "_pending_plan_ts", "_pending_repair_params")
 
 
 class FakePending(object):
@@ -547,9 +550,14 @@ def test_every_suppressed_plan_gets_its_own_trace(monkeypatch):
         return th, PTS.row_of(th, state=T.EXPECTED, next_index=0,
                               bar_ts=1795400000000, ambiguous=False, note="")
 
-    th_a, row_a = _mk("甲|up|1795400000000|61100.0", 61100.0)
-    th_b, row_b = _mk("乙|up|1795400000000|61200.0", 61200.0)
-    th_c, row_c = _mk("丙|up|1795400000000|61300.0", 61300.0)
+    # ★ 挂单价必须**在市价下方**：这三条是 `up`+LIMIT 的「等回踩」买单，
+    #   市价 61000 之下才成立。原来的 61100/61200/61300 在市价**上方**，
+    #   等于「限价买单挂在卖价之上」= 一挂出就按市价成交，
+    #   2026-11-25 新增的「入场价已被穿过」规则会先把它作废 ——
+    #   而本用例要验的是「人工仓压制逐条留痕」，不该被那条规则打断。
+    th_a, row_a = _mk("甲|up|1795400000000|60900.0", 60900.0)
+    th_b, row_b = _mk("乙|up|1795400000000|60800.0", 60800.0)
+    th_c, row_c = _mk("丙|up|1795400000000|60700.0", 60700.0)
 
     mapd = {tid: th for tid, th in ((th_a.thesis_id, th_a), (th_b.thesis_id, th_b),
                                     (th_c.thesis_id, th_c))}
@@ -584,7 +592,7 @@ def test_every_suppressed_plan_gets_its_own_trace(monkeypatch):
     for w in st.pending.written:
         assert w["state"] == T.EXPECTED
     blob = repr(st.decisions_log)
-    assert "61100" in blob and "61200" in blob and "61300" in blob, (
+    assert "60900" in blob and "60800" in blob and "60700" in blob, (
         "三条不同的挂单价都必须出现在决策里（否则被去重丢掉了），实际：%s"
         % blob)
     assert blob.count("应挂") >= 3, (

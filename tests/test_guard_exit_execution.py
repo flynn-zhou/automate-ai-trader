@@ -222,7 +222,8 @@ def _adopted_engine(bars_n=30, liq=_LIQ_SAFE, stop=_STOP_SAFE, entry=61000.0,
                  # A1（2026-11-25 交易域审查）：持有期间要在交易所侧
                  # 维持一张 reduceOnly 止损单。
                  "_adopted_stop_state", "_adopted_stop_cid",
-                 "_sync_adopted_stop_order", "_cancel_adopted_stop_order"):
+                 "_sync_adopted_stop_order", "_cancel_adopted_stop_order",
+                   "_pending_plan_ts", "_pending_repair_params"):
         raw = E.DecisionEngine.__dict__[name]
         if isinstance(raw, staticmethod):
             setattr(st, name, raw.__func__)

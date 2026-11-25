@@ -780,6 +780,64 @@ class LiveExecutor(Executor):
 
     _PENDING_TYPES = ("LIMIT", "STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET")
 
+    #: 必须走 **Algo Order** 端点的条件单类型。
+    #:
+    #: ★★ 2026-11-25 生产实测（不是猜的）：币安已把条件单从 `/fapi/v1/order`
+    #:    下线，旧端点一律返回
+    #:        -4120 Order type not supported for this endpoint.
+    #:              Please use the Algo Order API endpoints instead.
+    #:    证据：`tools/probe_algo_order.py` 在同一账户上跑出来的对照 ——
+    #:        ① POST /fapi/v1/order  STOP_MARKET → HTTP 400 -4120
+    #:        ② POST /fapi/v1/algoOrder（algoType=CONDITIONAL） → HTTP 200
+    #:           {"algoId": 3000002442338017, "algoStatus": "NEW", ...}
+    #:        ③ GET  /fapi/v1/openAlgoOrders 能看到它
+    #:        ④ DELETE /fapi/v1/algoOrder?algoId= 撤得掉
+    #:
+    #:    后果（这一条很重要）：A1 那版「接管仓交易所侧保护单」自上线起
+    #:    **一次都没挂成功过** —— 近 1 小时 1725 条 adopted_stop_order_failed，
+    #:    也就是说人工仓在交易所侧从来没有保护，进程内 3 秒轮询是唯一防线。
+    #:    这不是"某个接口偶尔失败"，是端点整体迁移，所以走类型分流而不是重试。
+    _ALGO_TYPES = ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET")
+
+    @classmethod
+    def _needs_algo(cls, order_type: str) -> bool:
+        return (order_type or "").upper() in cls._ALGO_TYPES
+
+    @staticmethod
+    def _as_algo_pending(d: dict, fallback_client: str = "") -> PendingOrder:
+        """把 Algo Order 的响应/查询结果翻译成 `PendingOrder`。
+
+        ★ 字段名**全部不同**，这是最容易写错的地方（写错了不报错，
+          只会让"已挂上"被读成"没挂上"，于是每 3 秒重挂一张）：
+            orderId    → algoId
+            clientOrderId → clientAlgoId
+            type       → orderType
+            stopPrice  → triggerPrice
+            status     → algoStatus（NEW / TRIGGERED / FINISHED / CANCELLED…）
+            origQty    → quantity
+            executedQty → actualQty
+        """
+        return PendingOrder(
+            order_id=str(d.get("algoId", "") or ""),
+            client_id=str(d.get("clientAlgoId", "") or fallback_client),
+            symbol=str(d.get("symbol", "") or ""),
+            side=str(d.get("side", "") or ""),
+            type=str(d.get("orderType", "") or ""),
+            qty=float(d.get("quantity", 0) or 0),
+            executed_qty=float(d.get("actualQty", 0) or 0),
+            price=float(d.get("price", 0) or 0),
+            stop_price=float(d.get("triggerPrice", 0) or 0),
+            # Algo 单的成交价在触发后由 `actualOrderId` 指向的真实单承载；
+            # 这里没有 avgPrice 字段，保持 0 —— 调用方靠 `actual_order_id`
+            # 去 /fapi/v1/order 取真实成交价（见 `_resolve_closed_slot_price`）。
+            avg_price=0.0,
+            status=str(d.get("algoStatus", "") or ""),
+            reduce_only=bool(d.get("reduceOnly", False)),
+            update_time=int(d.get("updateTime", 0) or 0),
+            # 触发后指向真实订单：还原成交价只能靠它（Algo 响应本身没有均价）
+            actual_order_id=str(d.get("actualOrderId", "") or ""),
+        )
+
     @staticmethod
     def _as_pending(d: dict, fallback_client: str = "") -> PendingOrder:
         return PendingOrder(
@@ -864,6 +922,11 @@ class LiveExecutor(Executor):
         if client_id:
             params["newClientOrderId"] = client_id
 
+        if self._needs_algo(order_type):
+            return await self._place_algo(side, qty, order_type, stop_price,
+                                          reduce_only, client_id, working_type,
+                                          spec)
+
         try:
             r = await self._req("POST", "/fapi/v1/order", params)
         except LiveError as e:
@@ -874,6 +937,35 @@ class LiveExecutor(Executor):
         logger.info("[实盘] 挂单 #%s %s %s %.6f 价 %s 触发 %s → %s",
                     o.order_id, o.side, o.type, o.qty,
                     params.get("price", "-"), params.get("stopPrice", "-"),
+                    o.status)
+        return o, ""
+
+    async def _place_algo(self, side, qty, order_type, stop_price,
+                          reduce_only, client_id, working_type, spec):
+        """条件单走 Algo Order 端点（字段名与旧端点不同，见 `_ALGO_TYPES`）。"""
+        algo = {"algoType": "CONDITIONAL",
+                "symbol": self.cfg.trading.symbol,
+                "side": side,
+                "type": order_type,
+                "quantity": "%.*f" % (spec["qty_precision"], qty),
+                "triggerPrice": "%.*f" % (spec["price_precision"],
+                                          self._round_px(float(stop_price), spec)),
+                "workingType": working_type}
+        if reduce_only:
+            algo["reduceOnly"] = "true"
+        if client_id:
+            # ★ 不是 newClientOrderId：字段名不同，混用会被静默忽略，
+            #   于是重启后按 clientOrderId 查回来变成"查不到"→ 重挂第二张。
+            algo["clientAlgoId"] = client_id
+        try:
+            r = await self._req("POST", "/fapi/v1/algoOrder", algo)
+        except LiveError as e:
+            logger.error("[实盘] 挂条件单失败 %s %s %.6f 触发 %s: %s",
+                         order_type, side, qty, algo.get("triggerPrice"), e)
+            return PendingOrder(status="REJECTED"), str(e)[:200]
+        o = self._as_algo_pending(r or {}, client_id)
+        logger.info("[实盘] 挂条件单 algo=%s %s %s %.6f 触发 %s → %s",
+                    o.order_id, o.side, o.type, o.qty, algo.get("triggerPrice"),
                     o.status)
         return o, ""
 
@@ -897,6 +989,10 @@ class LiveExecutor(Executor):
         try:
             await self._req("DELETE", "/fapi/v1/order", params)
         except LiveError as e:
+            # ★ 条件单不在旧端点（2026-11-25 实测）：id 是 algoId，
+            #   要发 DELETE /fapi/v1/algoOrder?algoId= 或 clientAlgoId=。
+            if await self._cancel_algo(order_id, client_id, sym):
+                return True
             cur = await self.query_order(order_id=order_id,
                                          client_id=client_id, symbol=sym)
             if cur is None or not cur.working:
@@ -909,21 +1005,77 @@ class LiveExecutor(Executor):
         logger.info("[实盘] 已撤单 %s", order_id or client_id)
         return True
 
+    async def _cancel_algo(self, order_id: str, client_id: str,
+                           sym: str) -> bool:
+        """按 algoId / clientAlgoId 撤条件单。撤不掉返回 False（不抛）。"""
+        p = {"symbol": sym}
+        if order_id:
+            p["algoId"] = str(order_id)
+        elif client_id:
+            p["clientAlgoId"] = client_id
+        else:
+            return False
+        try:
+            await self._req("DELETE", "/fapi/v1/algoOrder", p)
+        except LiveError as e:
+            # -2013 = 本来就不在（已触发/已撤）：目的达成，按成功处理
+            if "-2013" in str(e) or "Order does not exist" in str(e):
+                logger.info("[实盘] 条件单已不在（%s），按撤单成功处理",
+                            order_id or client_id)
+                return True
+            logger.debug("[实盘] 撤条件单失败 %s：%s",
+                         order_id or client_id, e)
+            return False
+        logger.info("[实盘] 已撤条件单 %s", order_id or client_id)
+        return True
+
+    async def open_algo_orders(self, symbol: Optional[str] = None
+                              ) -> List[PendingOrder]:
+        """交易所里还挂着的**条件单**（Algo Order）。
+
+        ★ 必须单独拉（2026-11-25 实测）：Algo 单**不出现在**
+          `/fapi/v1/openOrders` 里 —— 两个挂单簿是分开的。只看旧列表就会
+          得出"没有保护单"的错误结论，然后重挂第二张。
+        """
+        sym = symbol or self.cfg.trading.symbol
+        try:
+            rows = await self._req("GET", "/fapi/v1/openAlgoOrders",
+                                   {"symbol": sym})
+        except LiveError as e:
+            # 拉不到**不能**返回空列表：那等于告诉调用方"没有保护单"，
+            # 于是每 3 秒重挂一张。抛出去让调用方按"未知"处理（保留本地记录）。
+            logger.error("[实盘] 拉条件单列表失败：%s", e)
+            raise
+        return [self._as_algo_pending(d) for d in (rows or [])]
+
     async def open_orders(self, symbol: Optional[str] = None
                           ) -> List[PendingOrder]:
-        """交易所里还挂着的单。启动对账靠它。"""
+        """交易所里还挂着的单 —— **两个挂单簿合并**（普通 + 条件单）。"""
         sym = symbol or self.cfg.trading.symbol
         try:
             rows = await self._req("GET", "/fapi/v1/openOrders", {"symbol": sym})
         except LiveError as e:
             logger.error("[实盘] 拉挂单列表失败：%s", e)
             raise
-        return [self._as_pending(d) for d in (rows or [])]
+        out = [self._as_pending(d) for d in (rows or [])]
+        try:
+            out.extend(await self.open_algo_orders(sym))
+        except LiveError:
+            # 条件单簿拉不到 → 至少把普通挂单交出去（部分真相好过没有），
+            # 但要留痕：调用方据此判断"这次看到的不是全貌"。
+            logger.warning("[实盘] 条件单簿不可用，本次挂单列表只有普通单")
+        return out
 
     async def query_order(self, order_id: str = "", client_id: str = "",
                           symbol: Optional[str] = None
                           ) -> Optional[PendingOrder]:
-        """查一张单的当前状态。查不到返回 None（不抛）。"""
+        """查一张单的当前状态。查不到返回 None（不抛）。
+
+        ★ 条件单要拐一次（2026-11-25 实测）：币安**没有**单张查询 Algo 单的
+          接口（`GET /fapi/v1/algoOrder` 一律 -2013 / 404），只能拉
+          `openAlgoOrders` 列表再按 `clientAlgoId` 匹配。
+          所以这里先按普通订单查，查不到再退到条件单列表。
+        """
         if not order_id and not client_id:
             return None
         sym = symbol or self.cfg.trading.symbol
@@ -934,7 +1086,58 @@ class LiveExecutor(Executor):
             params["origClientOrderId"] = client_id
         try:
             d = await self._req("GET", "/fapi/v1/order", params)
+            return self._as_pending(d or {}, client_id)
         except LiveError as e:
-            logger.warning("[实盘] 查订单 %s 失败：%s", order_id or client_id, e)
+            logger.debug("[实盘] 普通订单查不到 %s（%s），改查条件单",
+                         order_id or client_id, e)
+        if not client_id:
             return None
-        return self._as_pending(d or {}, client_id)
+        try:
+            for o in await self.open_algo_orders(sym):
+                if o.client_id == client_id:
+                    return o
+        except LiveError:
+            return None
+        return None
+
+    async def closed_order_by_client_id(self, client_id: str,
+                                        symbol: Optional[str] = None
+                                        ) -> Optional[PendingOrder]:
+        """按 clientOrderId 找**已经成交**的单（含条件单触发出来的真实单）。
+
+        用途只有一个：仓位在交易所侧消失时，反查"是谁平的、平在什么价"
+        （`engine._resolve_closed_slot_price`）。
+
+        尝试顺序（每一层都只认**精确 id 匹配**，绝不按时间/价格猜）：
+          1. `GET /fapi/v1/order?origClientOrderId=` —— 普通单（含已成交）
+          2. `GET /fapi/v1/allOrders` —— 兜底，处理"普通单接口查不到但确实存在"
+          3. `GET /fapi/v1/openAlgoOrders` —— 还没触发的条件单
+
+        ★ 查不到返回 None，**不猜价**：调用方退回占位记账并记风险事件，
+          那笔交易的盈亏会被标记成"未定价"，而不是伪造一个 0。
+        """
+        if not client_id:
+            return None
+        sym = symbol or self.cfg.trading.symbol
+        try:
+            d = await self._req("GET", "/fapi/v1/order",
+                                {"symbol": sym, "origClientOrderId": client_id})
+            if d:
+                return self._as_pending(d, client_id)
+        except LiveError:
+            pass
+        try:
+            rows = await self._req("GET", "/fapi/v1/allOrders",
+                                   {"symbol": sym, "limit": 200})
+            for d in (rows or []):
+                if str(d.get("clientOrderId", "") or "") == client_id:
+                    return self._as_pending(d, client_id)
+        except LiveError as e:
+            logger.debug("[实盘] allOrders 查不到 %s：%s", client_id, e)
+        try:
+            for o in await self.open_algo_orders(sym):
+                if o.client_id == client_id:
+                    return o
+        except LiveError:
+            pass
+        return None

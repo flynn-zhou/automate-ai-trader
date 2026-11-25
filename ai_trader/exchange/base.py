@@ -46,6 +46,13 @@ class PendingOrder:
     status: str = ""
     reduce_only: bool = False
     update_time: int = 0
+    #: Algo 单触发后指向的**真实订单** id（`actualOrderId`）。
+    #:
+    #: ★ 为什么必须留这个字段（2026-11-25，实测）：Algo 单本身**不带成交价**
+    #:   （响应里没有 avgPrice，只有 triggerPrice），触发之后真实成交记在
+    #:   另一张普通订单上。想还原「地板单成交在什么价」就只能拿这个 id
+    #:   再去查真实订单。不留它，那条链永远拿不到成交价。
+    actual_order_id: str = ""
 
     @property
     def working(self) -> bool:

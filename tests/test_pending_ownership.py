@@ -118,7 +118,9 @@ _ENGINE_METHODS = ("_is_adopted", "_pending_place", "_pending_close",
                    # 它们会 AttributeError —— 那是"桩缺方法"，不是产品缺陷，
                    # 所以绑产品真实现，而不是在桩上写个空壳掩盖过去）。
                    "_system_stop_state", "_cancel_system_stop_order",
-                   "_maintain_system_protection", "_push")
+                   "_maintain_system_protection", "_push",
+                   # 保护单挂失败的**退避记录**（1 小时 1725 条刷屏的修法）。
+                   "_stop_fail_once")
 
 
 class FakePending(object):

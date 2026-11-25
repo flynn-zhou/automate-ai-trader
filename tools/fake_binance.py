@@ -103,6 +103,14 @@ class FakeBinance:
         app.router.add_get("/fapi/v2/positionRisk", self._perp_position)
         app.router.add_post("/fapi/v1/order", self._perp_order)
         app.router.add_get("/fapi/v1/openOrders", self._perp_open_orders)
+        # ★ 条件单（2026-11-25 实测的真实行为）：必须走 Algo 端点。
+        #   旧端点对条件单返回 -4120 —— 这条也照实模拟，否则
+        #   「迁回旧端点」这个回归在测试里永远抓不住。
+        app.router.add_post("/fapi/v1/algoOrder", self._perp_algo_order)
+        app.router.add_get("/fapi/v1/openAlgoOrders",
+                           self._perp_open_algo_orders)
+        app.router.add_delete("/fapi/v1/algoOrder",
+                              self._perp_cancel_algo_order)
         app.router.add_get("/fapi/v1/userTrades", self._perp_user_trades)
         app.router.add_get("/fapi/v1/allOrders", self._perp_all_orders)
         app.router.add_get("/fapi/v1/order", self._perp_query_order)
@@ -552,6 +560,15 @@ class FakeBinance:
             return web.json_response({"code": -2010, "msg": msg}, status=400)
 
         if otype != "MARKET":
+            # ★ 忠实模拟真实行为（2026-11-25 实测）：条件单已从本端点下线。
+            #   照实返回 -4120，这样"迁回旧端点"的回归能被测试抓住，
+            #   而不是靠人记得「币安改过接口」。
+            if otype in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET"):
+                return web.json_response(
+                    {"code": -4120,
+                     "msg": "Order type not supported for this endpoint. "
+                            "Please use the Algo Order API endpoints instead."},
+                    status=400)
             body, code = self._place_pending(p, side, otype, qty)
             return web.json_response(body, status=code)
 
@@ -661,7 +678,9 @@ class FakeBinance:
         if err:
             return web.json_response(err, status=400)
         out = [self._order_json(o) for o in self.order_book.values()
-               if o["status"] in ("NEW", "PARTIALLY_FILLED")]
+               if o["status"] in ("NEW", "PARTIALLY_FILLED")
+               # ★ 条件单不进这个簿（真实交易所就是这样）
+               and not o.get("is_algo")]
         out.sort(key=lambda x: x["orderId"])
         return web.json_response(out)
 
@@ -690,8 +709,115 @@ class FakeBinance:
         o["updateTime"] = self._now_ms()
         return web.json_response(self._order_json(o))
 
+    # ---------------- Algo（条件单）端点 ----------------
+    #
+    # ★ 忠实模拟（2026-11-25 实测记录）：
+    #   · POST /fapi/v1/algoOrder 需要 algoType=CONDITIONAL + triggerPrice
+    #         + clientAlgoId；响应字段是 algoId/clientAlgoId/orderType/
+    #         triggerPrice/algoStatus/quantity/actualQty
+    #   · 条件单**不出现在** /fapi/v1/openOrders 里（两个挂单簿分开）
+    #   · 没有单张查询接口（GET /fapi/v1/algoOrder → -2013）：
+    #         调用方只能拉 openAlgoOrders 列表按 clientAlgoId 匹配
+    #   · DELETE /fapi/v1/algoOrder?algoId= 撤销
+
+    @staticmethod
+    def _algo_json(o):
+        """把内部订单行翻译成 Algo 端点形状（字段名与普通单完全不同）。"""
+        return {
+            "algoId": o["orderId"],
+            "clientAlgoId": o["clientOrderId"],
+            "algoType": "CONDITIONAL",
+            "orderType": o["type"],
+            "symbol": o["symbol"],
+            "side": o["side"],
+            "positionSide": "BOTH",
+            "timeInForce": "GTC",
+            "quantity": "%.3f" % o["origQty"],
+            "algoStatus": o["status"],
+            "actualOrderId": o.get("actualOrderId", ""),
+            "actualQty": "%.3f" % o["executedQty"],
+            "triggerPrice": "%.1f" % o["stopPrice"],
+            "price": "0.0",
+            "reduceOnly": o["reduceOnly"],
+            "workingType": o.get("workingType", "CONTRACT_PRICE"),
+            "closePosition": False,
+            "createTime": o.get("updateTime", 0),
+            "updateTime": o.get("updateTime", 0),
+        }
+
+    async def _perp_algo_order(self, request):
+        self.calls.append(("POST", "/fapi/v1/algoOrder"))
+        raw = await request.text()
+        err = self._verify(request, raw)
+        if err:
+            return web.json_response(err, status=400)
+        p = dict(parse_qsl(raw))
+        if (p.get("algoType") or "").upper() != "CONDITIONAL":
+            return web.json_response(
+                {"code": -1102, "msg": "Mandatory parameter 'algoType' "
+                                       "was not sent, was empty/null, "
+                                       "or malformed."}, status=400)
+        if not p.get("triggerPrice"):
+            return web.json_response(
+                {"code": -1102, "msg": "Mandatory parameter 'triggerPrice' "
+                                       "was not sent, was empty/null, "
+                                       "or malformed."}, status=400)
+        side = p["side"].upper()
+        otype = (p.get("type") or "").upper()
+        qty = float(p.get("quantity") or 0.0)
+        if self.reject_next_order:
+            msg = self.reject_next_order
+            self.reject_next_order = None
+            return web.json_response({"code": -2010, "msg": msg}, status=400)
+        # 复用挂单逻辑，但字段名不同：triggerPrice→stopPrice、
+        # clientAlgoId→newClientOrderId
+        p2 = dict(p)
+        p2["stopPrice"] = p.get("triggerPrice")
+        p2["newClientOrderId"] = p.get("clientAlgoId") or ""
+        body, code = self._place_pending(p2, side, otype, qty)
+        if code != 200:
+            return web.json_response(body, status=code)
+        o = self.order_book[int(body["orderId"])]
+        o["is_algo"] = True
+        return web.json_response(self._algo_json(o))
+
+    async def _perp_open_algo_orders(self, request):
+        self.calls.append(("GET", "/fapi/v1/openAlgoOrders"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        out = [self._algo_json(o) for o in self.order_book.values()
+               if o.get("is_algo") and o["status"] in ("NEW", "PARTIALLY_FILLED")]
+        out.sort(key=lambda x: x["algoId"])
+        return web.json_response(out)
+
+    async def _perp_cancel_algo_order(self, request):
+        self.calls.append(("DELETE", "/fapi/v1/algoOrder"))
+        err = self._verify(request, request.query_string)
+        if err:
+            return web.json_response(err, status=400)
+        q = dict(parse_qsl(request.query_string))
+        o = None
+        if q.get("algoId"):
+            try:
+                o = self.order_book.get(int(q["algoId"]))
+            except (TypeError, ValueError):
+                o = None
+        elif q.get("clientAlgoId"):
+            for x in self.order_book.values():
+                if x["clientOrderId"] == q["clientAlgoId"]:
+                    o = x
+                    break
+        if o is None or o["status"] in ("FILLED", "CANCELED"):
+            return web.json_response(
+                {"code": -2013, "msg": "Order does not exist."}, status=400)
+        o["status"] = "CANCELED"
+        o["updateTime"] = self._now_ms()
+        return web.json_response({"algoId": o["orderId"],
+                                  "clientAlgoId": o["clientOrderId"],
+                                  "code": "200", "msg": "success"})
+
     async def _perp_cancel_all(self, request):
-        self.calls.append(("DELETE", "/fapi/v1/allOpenOrders"))
         err = self._verify(request, request.query_string)
         if err:
             return web.json_response(err, status=400)

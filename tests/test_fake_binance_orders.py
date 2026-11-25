@@ -83,6 +83,30 @@ class Cli(object):
         async with self.sess.request(method, url, headers=headers) as r:
             return r.status, await r.json()
 
+    async def stop_req(self, side, qty, trigger, reduce_only=False):
+        """挂一张条件单 —— **必须走 Algo 端点**（2026-11-25 真实行为）。
+
+        `STOP_MARKET` 等条件单已从 `/fapi/v1/order` 下线，旧端点固定 -4120。
+        这个 helper 把 Algo 端点用的字段名翻译好，并把响应补上
+        `orderId` / `status` 两个别名，好让断言读起来和普通单一致。
+
+        ★ 刻意**不**在 helper 里兜住 -4120：如果哪天假币安放行了旧端点，
+          本条测试应当立刻变红，而不是被 helper 悄悄掩盖。
+        """
+        p = {"algoType": "CONDITIONAL", "symbol": "BTCUSDT",
+             "side": side, "type": "STOP_MARKET",
+             "quantity": "%.3f" % float(qty), "triggerPrice": str(trigger),
+             "workingType": "CONTRACT_PRICE"}
+        if reduce_only:
+            p["reduceOnly"] = "true"
+        st, body = await self.req("POST", "/fapi/v1/algoOrder", p)
+        if st != 200:
+            return st, body
+        out = dict(body)
+        out.setdefault("orderId", body.get("algoId"))
+        out.setdefault("status", body.get("algoStatus"))
+        return st, out
+
 
 def test_limit_buy_does_not_fill_until_price_comes_down():
     """限价买单挂在下方：价格没跌到就不该成交，持仓也不该变。
@@ -169,10 +193,7 @@ def test_stop_market_sell_triggers_on_the_way_down():
         srv = await FakeBinance(price=75000.0).start()
         try:
             async with Cli(srv) as c:
-                st, body = await c.req("POST", "/fapi/v1/order", {
-                    "symbol": "BTCUSDT", "side": "SELL",
-                    "type": "STOP_MARKET", "quantity": "0.010",
-                    "stopPrice": "74000"})
+                st, body = await c.stop_req("SELL", 0.010, "74000")
                 assert st == 200, body
                 assert body["status"] == "NEW"
                 srv.set_price(74500.0)
@@ -193,9 +214,7 @@ def test_stop_market_buy_triggers_on_the_way_up():
         srv = await FakeBinance(price=75000.0).start()
         try:
             async with Cli(srv) as c:
-                st, body = await c.req("POST", "/fapi/v1/order", {
-                    "symbol": "BTCUSDT", "side": "BUY", "type": "STOP_MARKET",
-                    "quantity": "0.010", "stopPrice": "76000"})
+                st, body = await c.stop_req("BUY", 0.010, "76000")
                 assert body["status"] == "NEW"
                 srv.set_price(75990.0)
                 assert srv.order_book[body["orderId"]]["status"] == "NEW"
@@ -208,6 +227,14 @@ def test_stop_market_buy_triggers_on_the_way_up():
 
 
 def test_open_orders_only_lists_live_orders():
+    """`openOrders` 只列还活着的**普通**挂单。
+
+    ★ 2026-11-25 语义变更（真实交易所行为）：条件单（STOP_MARKET 等）
+      已经从 `openOrders` 移到 `openAlgoOrders` —— **两个挂单簿是分开的**。
+      所以这里同时钉住：普通挂单进 openOrders、条件单进 openAlgoOrders、
+      条件单**不**出现在 openOrders 里（漏了这条，引擎会误判成
+      "没有保护单" 然后每 3 秒重挂一张）。
+    """
     async def run():
         srv = await FakeBinance(price=75000.0).start()
         try:
@@ -215,22 +242,25 @@ def test_open_orders_only_lists_live_orders():
                 _, a = await c.req("POST", "/fapi/v1/order", {
                     "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
                     "quantity": "0.010", "price": "70000"})
-                _, b = await c.req("POST", "/fapi/v1/order", {
-                    "symbol": "BTCUSDT", "side": "SELL",
-                    "type": "STOP_MARKET", "quantity": "0.010",
-                    "stopPrice": "74000"})
+                _, b = await c.stop_req("SELL", 0.010, "74000")
                 st, lst = await c.req("GET", "/fapi/v1/openOrders",
                                       {"symbol": "BTCUSDT"})
                 assert st == 200
-                assert sorted(x["orderId"] for x in lst) == \
-                    sorted([a["orderId"], b["orderId"]])
-                # 一张成交、一张撤掉之后，列表应该空
+                assert [x["orderId"] for x in lst] == [a["orderId"]], (
+                    "openOrders 里混进了条件单（条件单在另一个簿里）")
+                _, algos = await c.req("GET", "/fapi/v1/openAlgoOrders",
+                                       {"symbol": "BTCUSDT"})
+                assert [x["algoId"] for x in algos] == [b["algoId"]]
+                # 一张成交、一张撤掉之后，两个列表都应该空
                 srv.set_price(70000.0)
-                await c.req("DELETE", "/fapi/v1/order",
-                            {"orderId": b["orderId"]})
+                await c.req("DELETE", "/fapi/v1/algoOrder",
+                            {"algoId": b["algoId"]})
                 _, lst2 = await c.req("GET", "/fapi/v1/openOrders",
                                       {"symbol": "BTCUSDT"})
                 assert lst2 == [], lst2
+                _, algos2 = await c.req("GET", "/fapi/v1/openAlgoOrders",
+                                        {"symbol": "BTCUSDT"})
+                assert algos2 == [], algos2
         finally:
             await srv.stop()
 
@@ -298,10 +328,7 @@ def test_partial_fill_accumulates_to_filled():
         try:
             srv.partial_fill_ratio = 0.5
             async with Cli(srv) as c:
-                _, body = await c.req("POST", "/fapi/v1/order", {
-                    "symbol": "BTCUSDT", "side": "SELL",
-                    "type": "STOP_MARKET", "quantity": "1.000",
-                    "stopPrice": "74000"})
+                _, body = await c.stop_req("SELL", 1.000, "74000")
                 oid = body["orderId"]
                 srv.set_price(73900.0)          # 触发 → 只成交一半
                 o = srv.order_book[oid]
@@ -363,14 +390,16 @@ def test_limit_without_price_is_rejected():
 
 
 def test_stop_without_stop_price_is_rejected():
+    """条件单没给触发价 → -1102（Algo 端点自己校验 triggerPrice）。"""
     async def run():
         srv = await FakeBinance(price=75000.0).start()
         try:
             async with Cli(srv) as c:
-                st, err = await c.req("POST", "/fapi/v1/order", {
-                    "symbol": "BTCUSDT", "side": "SELL",
-                    "type": "STOP_MARKET", "quantity": "0.010"})
-                assert st == 400 and err["code"] == -1102
+                st, err = await c.req("POST", "/fapi/v1/algoOrder", {
+                    "algoType": "CONDITIONAL", "symbol": "BTCUSDT",
+                    "side": "SELL", "type": "STOP_MARKET",
+                    "quantity": "0.010"})
+                assert st == 400 and err["code"] == -1102, err
         finally:
             await srv.stop()
 
@@ -416,10 +445,8 @@ def test_reduce_only_close_does_not_flip_the_position():
                 await c.req("POST", "/fapi/v1/order", {
                     "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET",
                     "quantity": "0.010"})
-                _, body = await c.req("POST", "/fapi/v1/order", {
-                    "symbol": "BTCUSDT", "side": "SELL",
-                    "type": "STOP_MARKET", "quantity": "0.010",
-                    "stopPrice": "74000", "reduceOnly": "true"})
+                _, body = await c.stop_req("SELL", 0.010, "74000",
+                                           reduce_only=True)
                 srv.set_price(73900.0)
                 o = srv.order_book[body["orderId"]]
                 assert o["status"] == "FILLED"

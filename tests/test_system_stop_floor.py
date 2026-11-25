@@ -97,6 +97,7 @@ def _st(pos=None, ex=None):
     st._norm_side = lambda s: (s or "").lower()
     for n in ("_push", "_system_stop_state", "_cancel_system_stop_order",
               "_maintain_system_protection", "_resolve_closed_slot_price",
+              "_algo_fill_price", "_stop_fail_once",
               "_adopted_stop_cid", "_adopted_stop_state"):
         raw = E.DecisionEngine.__dict__.get(n)
         if isinstance(raw, staticmethod):

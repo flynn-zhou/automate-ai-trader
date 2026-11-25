@@ -126,7 +126,9 @@ def _lot(qty=0.032, entry=60880.0, stop=59894.81):
 _METHODS = ("_adopted_slot", "_is_adopted", "_adopted_stop_state",
             "_adopted_stop_cid", "_sync_adopted_stop_order",
             "_cancel_adopted_stop_order", "_adopted_close",
-            "_maintain_adopted_protection", "_nope")
+            "_maintain_adopted_protection",
+            # 挂失败的**退避记录**（生产实测 1725 条/小时的修法）
+            "_stop_fail_once", "_nope")
 
 
 def _engine(adopted=None, pos=None, ex=None, step=0.001):

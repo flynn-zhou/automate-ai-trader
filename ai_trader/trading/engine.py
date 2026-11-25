@@ -6107,11 +6107,8 @@ class DecisionEngine:
         if err or not oid:
             logger.error("[地板] 挂地板单失败（%.2f / %.6f）：%s",
                          stop, qty, err or "无返回 id")
-            try:
-                self.db.log_risk("system_stop_order_failed",
-                                 "%.2f / %.6f：%s" % (stop, qty, (err or "")[:180]))
-            except Exception:                            # noqa: BLE001
-                pass
+            self._stop_fail_once("system_stop_order_failed",
+                                 "%.2f / %.6f：%s" % (stop, qty, err or "无返回 id"))
             self._system_stop = {}
             return
         self._system_stop = {"oid": oid, "px": stop, "qty": qty}
@@ -6147,24 +6144,28 @@ class DecisionEngine:
             if entry_ts <= 0:
                 return None
             qty = abs(float(slot.get("qty") or 0.0))
+            # ★ 先问执行器有没有专门的"按 clientId 找已成交单"能力
+            #   （它内部会依次查普通单 / allOrders / 条件单簿）。
+            #   没有就退回通用 query_order（纸面/测试桩）。
+            finder = getattr(self.ex, "closed_order_by_client_id", None)
+            querier = getattr(self.ex, "query_order", None)
+            if finder is None and querier is None:
+                return None
             for _cid, _src in ((_system_stop_cid(entry_ts), "策略仓地板单"),
                                (self._adopted_stop_cid(slot), "接管仓保护单")):
                 if not _cid:
                     continue
                 try:
-                    o = await self.ex.query_order(client_id=_cid)
+                    o = (await finder(_cid) if finder is not None
+                         else await querier(client_id=_cid))
                 except Exception as e:                       # noqa: BLE001
                     logger.warning("[对账] 查平仓单 %s 失败：%s", _cid, e)
                     continue
                 if o is None:
                     continue
-                if str(getattr(o, "status", "") or "").upper() != "FILLED":
-                    continue
-                px = float(getattr(o, "avg_price", 0.0) or 0.0)
+                px, got = await self._algo_fill_price(o)
                 if px <= 0:
-                    # 极少数情况 avgPrice 缺失：拿成交额/成交量也拿不到就放弃
                     continue
-                got = abs(float(getattr(o, "executed_qty", 0.0) or 0.0))
                 if qty > 0 and got > 0 and got + 1e-9 < qty:
                     # 只成交了一部分：剩下的不是这张单平的，别拿它当整笔的价
                     logger.warning("[对账] %s 只成交 %.6f/%.6f，不据此还原整笔",
@@ -6175,6 +6176,39 @@ class DecisionEngine:
         except Exception as e:                               # noqa: BLE001
             logger.warning("[对账] 还原平仓价失败（退回占位记账）：%s", e)
         return None
+
+    async def _algo_fill_price(self, o):
+        """从一张"可能是条件单"的订单对象里取出**真实成交价与成交量**。
+
+        ★ 为什么不能直接读 `avg_price`（2026-11-25 实测）：
+          币安的条件单（Algo Order）**没有** avgPrice 字段 —— 响应里只有
+          triggerPrice，真实成交记在另一张普通订单上，id 在
+          `actualOrderId` 里。所以这里分两条路：
+            · 普通单（FILLED 且有 avg_price）→ 直接用
+            · 条件单（有 actual_order_id）→ 再用 id 查一次真实订单
+          两条都拿不到就返回 (0, 0)，调用方按"未定价"处理，绝不猜。
+        """
+        status = str(getattr(o, "status", "") or "").upper()
+        px = float(getattr(o, "avg_price", 0.0) or 0.0)
+        got = abs(float(getattr(o, "executed_qty", 0.0) or 0.0))
+        if px > 0 and (status in ("FILLED", "TRIGGERED", "FINISHED")
+                       or got > 0):
+            return px, got
+        actual = str(getattr(o, "actual_order_id", "") or "")
+        if not actual:
+            return 0.0, 0.0
+        q_fn = getattr(self.ex, "query_order", None)
+        if q_fn is None:
+            return 0.0, 0.0
+        try:
+            real = await q_fn(order_id=actual)
+        except Exception as e:                               # noqa: BLE001
+            logger.warning("[对账] 查条件单触发的真实订单 %s 失败：%s", actual, e)
+            return 0.0, 0.0
+        if real is None:
+            return 0.0, 0.0
+        return (float(getattr(real, "avg_price", 0.0) or 0.0),
+                abs(float(getattr(real, "executed_qty", 0.0) or 0.0)))
 
     def _push(self, title: str, body: str, key: str = "",
               min_gap_s: int = 0) -> None:
@@ -6248,6 +6282,39 @@ class DecisionEngine:
             await self._sync_adopted_stop_order(pos, price)
         except Exception as e:                       # noqa: BLE001
             logger.error("[接管] 保护单维护失败（下一 tick 重试）：%s", e)
+
+    def _stop_fail_once(self, kind: str, detail: str, tag: str = "") -> None:
+        """保护单（地板单/接管止损）挂失败时**退避记录**，不要每 tick 一条。
+
+        ★ 为什么必须退避（2026-11-25 生产实录，这是真实教训）：
+          币安把条件单迁到 Algo 端点后，旧端点每 tick 都返回 -4120。
+          失败分支里「清空本地记录 → 下一轮重试」看着无害，实际是
+          **每 3 秒重试一次、每次都写一条 risk_events**：
+          1 小时内 `adopted_stop_order_failed` 写了 **1725 条**，
+          「最近出过什么事」这个视图被彻底淹没 —— 真出事时看不见。
+
+          所以：失败**必须**仍然重试（保护不能没有），但**记录**退避：
+          同一个 kind + 同一段错误文本，10 分钟只写一条，
+          并且把"已经连续失败多少次"写进去 —— 次数本身就是信号。
+        """
+        key = "%s|%s" % (kind, str(detail)[:80])
+        now = time.time()
+        st = getattr(self, "_stop_fail_last", None)
+        if st is None:
+            st = self._stop_fail_last = {}
+        last, n = st.get(key, (0.0, 0))
+        st[key] = (now, n + 1)
+        if len(st) > 64:                       # 键不会很多，随手清一下
+            for k in sorted(st, key=lambda x: st[x][0])[:32]:
+                st.pop(k, None)
+        if now - float(last) < 600:
+            return                             # 10 分钟内已经记过同一条
+        try:
+            self.db.log_risk(
+                kind, "%s%s（已连续失败 %d 次）"
+                % ((tag + "：") if tag else "", str(detail)[:180], n + 1))
+        except Exception:                      # noqa: BLE001
+            pass
 
     async def _sync_adopted_stop_order(self, pos, price: float) -> None:
         """让交易所侧的保护性止损单与内存里的止损/手数保持一致。
@@ -6351,11 +6418,9 @@ class DecisionEngine:
         if err or not oid:
             logger.error("[接管] 挂交易所侧止损单失败（%.2f / %.6f）：%s",
                          stop, qty, err or "无返回 id")
-            try:
-                self.db.log_risk("adopted_stop_order_failed",
-                                 "%.2f / %.6f：%s" % (stop, qty, (err or "")[:180]))
-            except Exception:
-                pass
+            # 退避记录：失败要重试，但**不许**每 3 秒写一条风险事件
+            self._stop_fail_once("adopted_stop_order_failed",
+                                 "%s / %.6f：%s" % (stop, qty, err or "无返回 id"))
             self._adopted_stop = {}       # 下一轮重试
             return
 

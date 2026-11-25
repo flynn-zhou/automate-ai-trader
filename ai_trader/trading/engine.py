@@ -2866,19 +2866,29 @@ class DecisionEngine:
                         plan.qty, decision.reason)
             await self._adopted_close(plan.qty, side, entry,
                                       "守卫 REDUCE：%s" % decision.reason)
+            # ★ 实际剩余从**槽里读回来**，不拿 plan.qty 推算。
+            #   `_adopted_close` 按 fill.qty（实际成交量）减仓，可能与计划量
+            #   不同；粉尘还会被升格成"全部平完"（槽清空）。
+            #   拿计划量算剩余，就等于在决策行里写了一个没发生的数字 ——
+            #   而这条记录正是用来事后追溯的。
+            _left = self._adopted_slot()[0]
+            _remain = abs(float(_left.get("qty") or 0.0)) if _left else 0.0
+            _sold = qty - _remain
             self._log_decision(
                 bars_by_iv, price, float(getattr(self, "_last_equity", 0.0) or 0.0),
                 now_ms, "adopted_reduce", "reduce",
-                "接管仓减仓 %.6f / 共 %.6f（守卫 REDUCE）：%s｜剩余 %.6f"
+                "接管仓减仓 %.6f / 共 %.6f（守卫 REDUCE）：%s｜剩余 %.6f%s"
                 "｜爆仓价来源 %s"
-                % (plan.qty, qty, decision.reason, qty - plan.qty,
+                % (_sold, qty, decision.reason, _remain,
+                   "（剩余不足一个步长，已一次平完）" if _left is None else "",
                    getattr(self, "_liq_src", "未知")),
                 gates=[{"gate": "守卫P判断", "ok": True,
                         "detail": "%s：%s" % (decision.action, decision.reason)}],
                 features={"guard": decision.as_dict(), "liq_src": getattr(
-                    self, "_liq_src", "未知"), "sold": plan.qty,
-                    "remain": qty - plan.qty},
-                risk_info={"sold": plan.qty, "remain": qty - plan.qty})
+                    self, "_liq_src", "未知"), "planned": plan.qty,
+                    "sold": _sold, "remain": _remain},
+                risk_info={"planned": plan.qty, "sold": _sold,
+                           "remain": _remain})
             return
 
         if plan.action == "MOVE_STOP":

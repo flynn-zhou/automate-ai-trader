@@ -3892,6 +3892,44 @@ class DecisionEngine:
             _p_armed = newp.get("armed_at_bar")
             _p_armed_sub = newp.get("armed_at_sub_ts")
             _p_ref = newp.get("armed_ref_close")
+            # ★★ 诊断埋点：arming 到底走的是哪条分支（2026-11-25）。
+            #
+            #   两条 arming 分支只有一条会设 `armed_at_sub_ts`：
+            #     子根分支（thesis.py 1200）设 = 那个 5m 根的 ts
+            #     粗粒度分支（thesis.py 1362）**不设**
+            #   代码里对 None 有显式兜底（退回 `armed_at_bar` 索引判据），
+            #   所以「生产库 28 行全是 NULL」有两种可能，而这两种在库里
+            #   长得一模一样：
+            #     (a) 一直走粗粒度分支 → 正常，这列是没用上的兜底
+            #     (b) 子根分支设了但没落库 → 真缺陷，索引锚点会漂
+            #   不埋这个点就永远分不清；埋一次新 arming 就有答案。
+            #
+            #   ★ 只记**原始事实**、不下结论：我最初想让它自己判
+            #     「桶内有几根 5m 子根 → 粗粒度/缺陷」，但那条判据自己
+            #     没通过验证（构造场景跑出来判据不可分）。一个没验过的
+            #     判据比没有判据更坏 —— 它会把结论伪装成证据。
+            #     所以这里只落：armed_at_bar、本轮 15m 的 ts、本轮 5m 缓冲
+            #     的条数与首尾 ts。够人一眼看出走的是哪条路。
+            if (str(_p_state) == _T.ARMED and _p_armed_sub is None
+                    and str(row.get("state") or "") != _T.ARMED):
+                try:
+                    _b5n = len(b5 or ())
+                    _b5s = _b5e = None
+                    if _b5n:
+                        def _bts(_b):
+                            return int(getattr(_b, "open_time", 0)
+                                       or getattr(_b, "ts", 0) or 0)
+                        _b5s, _b5e = _bts(b5[0]), _bts(b5[-1])
+                    logger.warning(
+                        "[挂单] %s arming 未带子根锚点：armed_at_bar=%s "
+                        "本轮 15m ts=%s｜5m 缓冲 %d 根 [%s .. %s]",
+                        tid, _p_armed, ts, _b5n, _b5s, _b5e)
+                    self.db.log_risk(
+                        "pending_armed_without_sub_anchor",
+                        "%s: armed_at_bar=%s bar15_ts=%s b5=%d [%s..%s]"
+                        % (tid, _p_armed, ts, _b5n, _b5s, _b5e))
+                except Exception:                    # noqa: BLE001
+                    pass
             # ★★ 自相矛盾终态拦截（2026-11-25 真钱事故）。
             #
             #   `CLOSED_TP/SL/THESIS` 的前提是「有一笔仓被平掉了」。

@@ -167,6 +167,9 @@ def _place_engine_stub(can_open=True, place_err=""):
 
     for name in ("_pending_place", "_pending_router",
                  "_gate_pending_unattended", "_gate_pending_size",
+            # MGN-2（2026-11-25）：可用保证金闸排在仓位闸之后（要用它的手数）。
+            "_gate_pending_margin", "_pending_need_margin",
+            "_reclaim_margin",
                  "_place_pending_order"):
         raw = E.DecisionEngine.__dict__[name]
         if isinstance(raw, staticmethod):

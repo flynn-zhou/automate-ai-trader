@@ -94,6 +94,9 @@ _ENGINE_METHODS = ("_is_adopted", "_pending_place", "_pending_close",
                    # 不绑它们，桩上的 `_pending_place` 就调不到产品代码。
                    "_pending_router", "_gate_pending_unattended",
                    "_gate_pending_size", "_place_pending_order",
+                   # MGN-2：可用保证金闸要先跳过（桩上没有 available_margin）。
+                   "_gate_pending_margin", "_pending_need_margin",
+                   "_reclaim_margin",
                    # BUS-D：人工仓出场改由 position_guard 判（P0+P1），
                    # `_step_adopted_exit` 现在要调这四个才能跑完。
                    "_guard_position_for_adopted", "_live_liq_price",

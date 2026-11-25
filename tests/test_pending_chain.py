@@ -61,6 +61,12 @@ class FakeEx(object):
         self.order_filled = order_filled
         self.order_status = order_status
         self.queried = []
+        # ★ FILL-1：空仓平仓要撤掉交易所那张单，撤了什么必须可断言。
+        self.cancelled = []
+
+    async def cancel_order(self, order_id="", client_id="", symbol=None):
+        self.cancelled.append(client_id or order_id)
+        return True
 
     async def query_order(self, order_id="", client_id="", symbol=None):
         """按 client_id 查单 —— 归属证据的唯一来源。"""
@@ -244,10 +250,26 @@ def test_close_failure_raises_and_keeps_position():
 
 
 def test_close_without_position_is_a_noop():
+    """空仓却要平仓 → 不下市价单，但**必须撤掉交易所上那张单**。
+
+    ★ 契约在 2026-11-25 变了（FILL-1）。原来这里只 `return`，于是
+      「本地以为成交、实际没成交」的那张真实挂单留在交易所变成孤儿
+      （线上实测：两张 AI-pend 单 NEW、executed_qty=0，状态已进
+      CLOSED_TP，没有任何预期再管它们）。空仓撤的是挂单，
+      不可能亏钱 —— 所以撤单才是正确动作。
+    """
     st = _engine_stub(pos={})
+    st._pending_cancel = E.DecisionEngine._pending_cancel.__get__(st)
     act = SimpleNamespace(thesis_id="selfcheck-1", reason="x")
     _run(E.DecisionEngine._pending_close(st, act, None))
-    assert st.ex.market_calls == []
+    assert st.ex.market_calls == [], "空仓不该下市价平仓单"
+    assert len(st.ex.cancelled) == 1, (
+        "空仓时没撤掉交易所上的挂单 → 留下孤儿单：%r" % (st.ex.cancelled,))
+    assert st.ex.cancelled[0].startswith("AI-pend-"), (
+        "撤单用的 client_id 前缀不对（撤不到自己的单）：%r"
+        % (st.ex.cancelled,))
+    assert any(k == "pending_close_without_position" for k, _ in st.db.risks), (
+        "幽灵成交没留风险事件：%r" % (st.db.risks,))
 
 
 # ------------------------------------------------------- 3. 来源分类

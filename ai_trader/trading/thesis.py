@@ -1201,6 +1201,31 @@ def run(thesis: Thesis,
                 continue
 
             if state == ARMED:
+                # ★★ 成交只能发生在**挂单之后**（2026-11-25 真钱事故）。
+                #
+                #   挂单那一轮的 `continue` 只保护**同一次调用**。但游标
+                #   `next_index` 会被解冻重算（SIG-PARAMS：卡住的 400 被清回
+                #   真实起点 386），于是**下一次**调用从 386 开始遍历，而
+                #   `armed_at_bar` 是 399 —— ARMED 状态把挂单**之前**的
+                #   386..399 又扫了一遍，并在其中一根上判出"成交"。
+                #
+                #   实测后果（14:50→14:55）：交易所那两张 `AI-pend-*` 单
+                #   始终 NEW、executed_qty=0，本地却推出 FILLED → close →
+                #   CLOSED_TP，两张真实挂单变成孤儿（无人再管；一旦成交
+                #   会被判成"我方成交"而硬停）。
+                #
+                #   ★ 判据用**时间戳**而不是 15m 索引：双节奏（`ask_on_subs`）
+                #     下挂单发生在某个 5m 子根，**同一根 15m 之内之后的子根**
+                #     是合法的（5m 入场粒度本来就是这样），用 `i <= armed_at_bar`
+                #     会把这批合法成交一起挡掉（test_run_plan_fills_the_inverse_v_
+                #     on_a_later_5m_bar 当场变红）。
+                #   单在 `armed_at_sub_ts` 收盘之后才存在 → 那之前（含）的
+                #   子根里不可能成交。这是二值事实，不是阈值。
+                if armed_at_sub_ts is not None:
+                    if int(sb_ts) <= int(armed_at_sub_ts):
+                        continue
+                elif armed_at_bar is not None and i <= int(armed_at_bar):
+                    continue
                 # 先看成交（保守：同根既成交又失效时，按先成交再平掉）
                 filled = FILL_BEFORE_INVALIDATION and _fill_condition(sb, thesis)
                 # ★ 挂单后按**细周期根数**容忍（用户 2026-11-20：

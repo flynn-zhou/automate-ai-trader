@@ -18,7 +18,8 @@ from typing import Optional
 from ..trade_db import TradeDB, ADOPT_REASON, reconcile_orders
 from . import features as feat_mod
 from . import signals as sig_mod
-from .events import (GATE_SIZING, GATE_UNATTENDED, EntryIntent, GateResult)
+from .events import (GATE_MARGIN, GATE_SIZING, GATE_UNATTENDED, EntryIntent,
+                     GateResult)
 from .order_router import OrderRouter
 from .risk import RiskState, build_plan, check_risk_state, roll_day
 
@@ -3742,6 +3743,10 @@ class DecisionEngine:
             # ★ BUS-B：这条预期的挂单被**哪道闸**拦住、理由是什么。
             #   空串 = 没被拦（要么挂了、要么压根没到挂单那一步）。
             blocked = ""
+            # ★ MGN-3：本轮算出的手数（只有真走到仓位闸才有）。每条预期重置。
+            #   不重置的话，上一条的手数会被写进这一条的决策文案 ——
+            #   与 F9 记录的 `_last_route` 串台是同一个坑。
+            _placed_qty = 0.0
             for act in res.actions:
                 # ★ 有接管来的人工仓时：**只压住 place_order 这一个动作**，
                 #   其它动作（成交落账、出场）照常执行 —— 用户 2026-11-24：
@@ -3781,6 +3786,9 @@ class DecisionEngine:
                         blocked = str(getattr(_r, "rejection", "") or "")
                     if not blocked:
                         blocked = "挂单未成功（路由层未给出原因，查 risk_events）"
+                    # ★ MGN-3：手数记在路由过程上（与 `_last_route` 同源、同时清空），
+                    #   决策文案才能写出「本应挂多少」。取不到就是 0，文案不写手数。
+                    _placed_qty = float(getattr(self, "_last_route_qty", 0.0) or 0.0)
                     # ★★ 挂单没成 → 本批**后续动作一律不做**。
                     #
                     #   同一批 actions 里 place_order 后面的成交/出场动作，
@@ -3807,6 +3815,30 @@ class DecisionEngine:
             _p_state = newp["state"]
             _p_armed = newp.get("armed_at_bar")
             _p_ref = newp.get("armed_ref_close")
+            # ★★ 自相矛盾终态拦截（2026-11-25 真钱事故）。
+            #
+            #   `CLOSED_TP/SL/THESIS` 的前提是「有一笔仓被平掉了」。
+            #   而引擎的仓位事实（`self.pos`）才是唯一口径 ——
+            #   状态机只从 K 线推演，它不知道单到底有没有挂出去、有没有成交。
+            #
+            #   实测：14:50 挂单成功、14:55 推出 CLOSED_TP，而交易所
+            #   executed_qty=0、self.pos 为空。落成终态之后就不会再有
+            #   任何一轮来管这张单，于是它变成孤儿。
+            #
+            #   所以：没有仓位事实就不许进 CLOSED_*。退回 ARMED 让下一轮
+            #   继续用「挂单之后的 K」判成交（配合 thesis.py 的
+            #   `i > armed_at_bar` 守卫），并留一条风险事件说明这次拦截。
+            if (str(_p_state) in (_T.CLOSED_TP, _T.CLOSED_SL,
+                                 _T.CLOSED_THESIS)
+                    and not float((self.pos or {}).get("qty") or 0.0)):
+                logger.error(
+                    "[挂单] %s 状态机推出终态 %s，但引擎没有对应的仓位事实"
+                    " → 拦截（不落终态，退回 ARMED 重新判）",
+                    tid, _p_state)
+                self.db.log_risk(
+                    "pending_terminal_without_position",
+                    "%s: 状态机给出 %s，但 self.pos 为空" % (tid, _p_state))
+                _p_state = _T.ARMED
             if failed_place:
                 _p_state = _T.EXPECTED
                 _p_armed = None
@@ -3859,7 +3891,8 @@ class DecisionEngine:
             #   因为 `_log_decision` 本身按 3s 桶去重（同一根 bar 只保留第一条），
             #   在循环里写会被静默丢掉，只剩最后一条/第一条，等于没有。
             _desc = self._pending_thesis_brief(th, _p_state, price, suppressed,
-                                               blocked=blocked)
+                                               blocked=blocked,
+                                               qty=_placed_qty)
             if _desc:
                 _briefs.append(_desc)
             if blocked:
@@ -3916,7 +3949,7 @@ class DecisionEngine:
         return "出站拦截"
 
     def _pending_thesis_brief(self, th, state, price, suppressed=False,
-                              blocked="") -> str:
+                              blocked="", qty=0.0) -> str:
         """把一条预期的当前处境压成一句话（给决策表用）。
 
         ★ 只描述**事实**，不做判断：这条 thesis 现在在哪一步、在等什么、
@@ -3935,25 +3968,34 @@ class DecisionEngine:
             dist = ""
             if where > 0 and price > 0:
                 dist = "，距挂单价 %.2f%%" % (abs(price - where) / where * 100.0)
+            # ★ MGN-3（2026-11-25）：手数**只能**由调用方传进来。
+            #   原来这两支写 `getattr(th, "qty", 0.0)`，而 `Thesis` 根本没有
+            #   qty 字段 —— 于是决策行长期写着「应挂 up 0.000000 @ 58930.00」，
+            #   读起来像"算出来的手数是 0"，真实手数要到仓位闸里才产生。
+            #   （我自己就被这行字误导过一次，以为定仓算出了 0。）
+            #   未知就不写手数，绝不编一个 0 出来。
+            try:
+                _qty = float(qty or 0.0)
+            except (TypeError, ValueError):
+                _qty = 0.0
+            _qty_s = (" %.6f" % _qty) if _qty > 0 else ""
             st = str(state or "")
             if suppressed:
                 # ★ A2：被压制的那条计划必须**逐条**记清「本应挂什么价、多少量、
                 #   止损在哪、为什么没下」。只记一个计数等于没记 —— 回溯时
                 #   看不出系统当时到底想做什么。
-                _qty = float(getattr(th, "qty", 0.0) or 0.0)
                 _tgt = float(getattr(th, "target_price", 0.0) or 0.0)
-                return ("%s 应挂%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）%s"
+                return ("%s 应挂%s%s @ %.2f（止损 %.2f / 止盈 %.2f）%s"
                         "——因存在接管的人工仓，只决策不下单"
                         % (short, str(getattr(th, "direction", "") or ""),
-                           _qty, where, stop, _tgt, dist))
+                           _qty_s, where, stop, _tgt, dist))
             if blocked:
                 # 决策为「应挂单」但被闸门拦下：写清**本应挂什么** + **被谁拦的**。
-                _qty = float(getattr(th, "qty", 0.0) or 0.0)
                 _tgt = float(getattr(th, "target_price", 0.0) or 0.0)
-                return ("%s 应挂%s %.6f @ %.2f（止损 %.2f / 止盈 %.2f）%s"
+                return ("%s 应挂%s%s @ %.2f（止损 %.2f / 止盈 %.2f）%s"
                         "——被【%s】拦下，未下单"
                         % (short, str(getattr(th, "direction", "") or ""),
-                           _qty, where, stop, _tgt, dist, blocked))
+                           _qty_s, where, stop, _tgt, dist, blocked))
             if st == "EXPECTED":
                 # ★ P2（2026-11-25 交易域审查）：EXPECTED 的真实含义是
                 #   「计划已采集，但**声明(claim)还没成立，因此一张单都没挂**」。
@@ -4403,11 +4445,16 @@ class DecisionEngine:
         #   "证据"比没有证据更糟，排查时会一路追错方向。
         #   清空之后，上层走的是那句诚实的兜底文案。
         self._last_route = None
+        # ★ MGN-3：手数与 `_last_route` **同时清空、同时赋值**。
+        #   只清 `_last_route` 不清手数，就会出现「闸门名字是这一条的、
+        #   手数是上一条的」——F9 已经因为同类串台追错一次方向。
+        self._last_route_qty = 0.0
         res = await self._pending_router().route(intent, ctx)
         # ★ BUS-B：把路由结果留在引擎上，让上层能把**是哪道闸拦的**写进决策。
         #   这是"拒绝也必然产出一条决策"的传话通道：路由层不碰数据库
         #   （它只做编排），落库仍然只有引擎一个写入口。
         self._last_route = res
+        self._last_route_qty = float(ctx.get("qty") or 0.0)
         return res.placed
 
     # ---------------- 挂单路径的闸门与下单动作 ----------------
@@ -4416,13 +4463,24 @@ class DecisionEngine:
 
         1. 无人值守闸 —— 数据源/日亏损/连亏/熔断/持仓不一致
         2. 仓位闸     —— `sizing.plan_position()` 唯一口径 + 交易所规格
-        3. 下单       —— 只有前两关都放行才会执行
+        3. 可用保证金闸 —— 账户付得起吗；不够先撤外来占位单（MGN-2）
+        4. 下单       —— 只有前面的闸都放行才会执行
+
+        ★ 为什么可用保证金闸必须排在仓位闸**之后**：
+          它要用仓位闸算出来的手数（`ctx["qty"]`）去算"需要多少保证金"。
+          排在前面就只能算用配置本金估的缺口，那和真实手数不是一个数。
+
+        ★ 为什么必须排在**下单之前**（而不是等交易所回 -2019）：
+          2026-11-25 生产上每一笔挂单都被 -2019 拒绝，而系统每 5 分钟
+          重试一次、每次只落一行 ERROR，永远不恢复 —— 因为占住保证金的
+          是别人的单，不清理就永远不会变得够用。
 
         每次调用现建一个（闸门是绑定方法，构造成本可忽略；
         缓存反而会让"配置改了但链还是旧的"这种问题重新出现）。
         """
         return OrderRouter(
-            gates=[self._gate_pending_unattended, self._gate_pending_size],
+            gates=[self._gate_pending_unattended, self._gate_pending_size,
+                   self._gate_pending_margin],
             placer=self._place_pending_order)
 
     async def _gate_pending_unattended(self, intent, ctx) -> Optional[GateResult]:
@@ -4455,6 +4513,197 @@ class DecisionEngine:
         ctx["size_why"] = why
         return GateResult(gate=GATE_SIZING, ok=True,
                           detail="%.6f 张" % qty)
+
+    async def _gate_pending_margin(self, intent, ctx) -> Optional[GateResult]:
+        """可用保证金闸：**下单前**确认账户还付得起这张单的保证金。
+
+        ★ 为什么需要这道闸（2026-11-25 生产实录）：
+          游标修好之后，预期第一次真的推进到"去挂单"，结果交易所回
+
+              HTTP 400 /fapi/v1/order: {"code":-2019,
+                                        "msg":"Margin is insufficient."}
+
+          账户权益 114.18U，但交易所上有一张**遗留的、不属于系统的**
+          挂单 `0.06 @ 57839`（名义 3470U，22 倍下要 ≈158U 保证金）——
+          它把可用余额吃成了负数。于是每一笔新挂单都必然被拒，
+          而系统每 5 分钟重试一次、每次都只留一行 ERROR，永远不恢复。
+
+          这不是策略问题，是**账户资源管理**问题：余额被别人的单占着。
+
+        ★ 用户的授权口径（2026-11-25 原话）：
+          「你每次挂单前看一下当前可用保证金够不够，有没有挂单占用，
+            这个账户余额完全归系统管理，不够就要撤单！系统完全拥有操作权限」
+
+        ★ 判定只用**一个数**：`availableBalance`。
+          它由交易所扣除了「持仓占用 + 所有未成交委托占用」，
+          所以"够不够"不需要我们自己再减一遍挂单占用 ——
+          自己减就会出现两个来源，而这个项目已经栽过很多次。
+
+        ★★ 为什么不撤 `reduceOnly` 的外来单（重要）：
+          reduceOnly 单只能减仓、开不出新仓，占用的保证金近乎为零；
+          撤掉它**唯一**的后果是某个真实持仓失去保护（那可能是用户手工
+          给人工仓挂的止损）。所以它落在"宁可不动手"那一侧：
+          跳过并记一笔日志，绝不当成占位单清理。
+          这条不是我在放宽授权 —— 撤它不解决保证金问题，只会制造裸仓。
+        """
+        tid = str(getattr(intent, "thesis_id", "") or "")
+        # 纸面/不可查余额的执行器：跳过（没有"可用保证金"这个概念）。
+        fn = getattr(self.ex, "available_margin", None)
+        if fn is None:
+            return GateResult(gate=GATE_MARGIN, ok=True,
+                              detail="执行器不支持查可用保证金，跳过")
+
+        need = self._pending_need_margin(ctx.get("qty"), intent.entry)
+        if need <= 0:
+            # 算不出需要多少，就不该用这个数去拦单 —— 但也不能默认放行。
+            return GateResult(gate=GATE_MARGIN, ok=False,
+                              detail="算不出本单需要的保证金（qty=%r entry=%r）"
+                                     % (ctx.get("qty"), intent.entry))
+
+        avail = await fn()
+        if avail < 0:
+            # ★ 未知 ≠ 没钱。查不到就按"不够"处理（保守），但要写明是查不到，
+            #   否则报告会把"网络失败"说成"余额不足"，下次排查会一路追错方向。
+            logger.warning("[挂单] %s 读不到可用保证金，本轮不挂单", tid)
+            self.db.log_risk("pending_margin_unknown", tid)
+            return GateResult(gate=GATE_MARGIN, ok=False,
+                              detail="读不到可用保证金（交易所查询失败），不挂单")
+
+        ctx["need_margin"] = need
+        ctx["avail_margin"] = avail
+        if avail + 1e-9 >= need:
+            # 够就放行，**一张别人的单都不碰**。
+            return GateResult(gate=GATE_MARGIN, ok=True,
+                              detail="可用 %.2fU ≥ 需要 %.2fU" % (avail, need))
+
+        # ---- 不够：清掉外来占位单 ----
+        freed, kept_reduce_only, failures = await self._reclaim_margin(tid, need)
+        avail2 = await fn()
+        if avail2 >= 0:
+            ctx["avail_margin"] = avail2
+        if avail2 + 1e-9 >= need:
+            logger.warning("[挂单] %s 可用保证金不足（%.2fU < %.2fU），"
+                           "已撤 %d 张外来占位单释放保证金，现可用 %.2fU → 放行",
+                           tid, avail, need, freed, avail2)
+            self.db.log_risk(
+                "pending_margin_reclaimed",
+                "%s: 可用 %.2fU < 需要 %.2fU，撤销 %d 张外来挂单后可用 %.2fU"
+                % (tid, avail, need, freed, avail2))
+            return GateResult(gate=GATE_MARGIN, ok=True,
+                              detail="撤销 %d 张外来挂单后可用 %.2fU ≥ %.2fU"
+                                     % (freed, avail2, need))
+
+        why = ("可用 %.2fU < 需要 %.2fU，已撤 %d 张外来挂单仍不足"
+               % (avail2 if avail2 >= 0 else avail, need, freed))
+        if kept_reduce_only:
+            why += "（另跳过 %d 张 reduceOnly 外来单：撤它只会让持仓失去保护）" \
+                   % kept_reduce_only
+        if failures:
+            why += "（%d 张撤单失败）" % failures
+        logger.error("[挂单] %s %s", tid, why)
+        self.db.log_risk("pending_margin_short", "%s: %s" % (tid, why))
+        return GateResult(gate=GATE_MARGIN, ok=False, detail=why)
+
+    def _pending_need_margin(self, qty, entry) -> float:
+        """这张单需要多少保证金 = 名义 ÷ 杠杆。
+
+        ★ 杠杆取 `_sizing_params()["sizing.leverage"]` —— 与
+          `_pending_size()` 算仓位时用的**同一个来源**。
+          另取一个"交易所实际杠杆"会造出两个真相：算仓位用 22 倍、
+          查保证金用别的倍数，于是"算出来能开"和"实际开不了"永远对不上。
+        """
+        try:
+            q = float(qty or 0.0)
+            px = float(entry or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if q <= 0 or px <= 0:
+            return 0.0
+        params = self._sizing_params() or {}
+        try:
+            lev = float(params.get("sizing.leverage", 0) or 0)
+        except (TypeError, ValueError):
+            lev = 0.0
+        if lev <= 0:
+            return 0.0
+        return q * px / lev
+
+    async def _reclaim_margin(self, tid: str, need: float):
+        """撤掉**外来**占位挂单，直到可用保证金够用（或没得撤了）。
+
+        Returns:
+            (撤掉张数, 跳过的 reduceOnly 张数, 撤单失败张数)
+
+        ★ 只撤「开仓方向」的外来单：
+          `client_id` 不以 `AI-` 开头 = 不是系统发的（`AI-pend-` / `AI-SL-`
+          都带这个前缀）；且 `reduce_only` 为假。
+          两个条件都满足它才可能是"占着保证金不让系统开仓"的那一类。
+
+        ★ 每撤一张就重读一次可用余额并**立刻停止**：
+          撤单是真实动作，多撤一张就是多改变一次账户状态。
+          够用即停，不做"一次清空"。
+        """
+        freed = 0
+        kept_ro = 0
+        failed = 0
+        try:
+            rows = await self.ex.open_orders()
+        except Exception as e:
+            logger.warning("[挂单] %s 拉挂单列表失败，无法清理外来占位单：%s",
+                           tid, e)
+            return 0, 0, 1
+        # 先按"能腾出的保证金"从大到小排：一张大单往往就够了，
+        # 避免为了凑小钱撤掉一堆单。
+        cands = []
+        for o in (rows or []):
+            try:
+                cid = str(getattr(o, "client_id", "") or "")
+                if cid.startswith(AI_CLIENT_PREFIX):
+                    continue            # 自己的单，交给状态机管
+                if bool(getattr(o, "reduce_only", False)):
+                    kept_ro += 1        # 保护性单：撤它只会制造裸仓
+                    continue
+                q = float(getattr(o, "qty", 0) or 0)
+                px = float(getattr(o, "price", 0) or 0) \
+                    or float(getattr(o, "stop_price", 0) or 0)
+                cands.append((q * px, cid, o))
+            except Exception:
+                continue
+        cands.sort(key=lambda x: -x[0])
+
+        fn_avail = getattr(self.ex, "available_margin", None)
+        for notion, cid, o in cands:
+            try:
+                # 撤之前确认还挂着：已成交的单撤不掉，而"撤单失败"会
+                # 把一次正常成交记成故障。
+                qo = None
+                qfn = getattr(self.ex, "query_order", None)
+                if qfn is not None:
+                    qo = await qfn(client_id=cid)
+                if qo is not None and not getattr(qo, "working", True):
+                    continue
+                ok = await self.ex.cancel_order(
+                    client_id=cid, order_id=str(getattr(o, "order_id", "") or ""))
+            except Exception as e:
+                logger.warning("[挂单] %s 撤外来挂单 %s 失败：%s", tid, cid, e)
+                failed += 1
+                continue
+            if not ok:
+                failed += 1
+                continue
+            freed += 1
+            logger.warning(
+                "[挂单] %s 撤掉外来占位挂单 %s（名义≈%.0fU，"
+                "它把账户保证金占住了，系统无法开仓）", tid, cid, notion)
+            self.db.log_risk("pending_foreign_order_cancelled",
+                             "%s: 撤销外来挂单 %s（名义≈%.0fU）"
+                             % (tid, cid, notion))
+            if fn_avail is None:
+                break
+            cur = await fn_avail()
+            if cur >= 0 and cur + 1e-9 >= need:
+                break               # 够用即停
+        return freed, kept_ro, failed
 
     async def _place_pending_order(self, intent, ctx):
         """真正的下单动作。**只有全部闸门放行才会被调用。**"""
@@ -4510,7 +4759,23 @@ class DecisionEngine:
         pos = self.pos or {}
         qty = abs(float(pos.get("qty") or 0.0))
         if qty <= 0:
-            logger.warning("[挂单] %s 需要平仓，但引擎认为空仓－仍然记账", tid)
+            # ★★ 空仓却要平仓 = 状态机推演出了「不存在的仓位」。
+            #
+            #   2026-11-25 线上实证：14:50 挂单成功、14:55 就来了一条 close，
+            #   而交易所那两张 `AI-pend-*` 单始终是 NEW、executed_qty=0。
+            #   原来这里只 `return` —— 于是那张**真实挂单**留在交易所，
+            #   没有任何预期再管它（孤儿单）。若它之后成交，会被归因成
+            #   "我方成交"从而触发硬停；不成交则白占保证金。
+            #
+            #   正确动作：这张单本来就不该存在，**撤掉它**。
+            #   撤单是安全的：没有仓位，撤的是挂单，不可能亏钱。
+            logger.warning("[挂单] %s 需要平仓但引擎认为空仓 →"
+                           "判定为幽灵成交，撤掉交易所上这张单", tid)
+            self.db.log_risk("pending_close_without_position", tid)
+            from . import thesis as _T
+            await self._pending_cancel(_T.Action(
+                kind="cancel", thesis_id=tid,
+                reason="幽灵成交（本地认为已成交，实际未成交）"))
             return
 
         # ★★ 只能平**自己开的**仓（2026-11-24 生产事故的第二道闸）。

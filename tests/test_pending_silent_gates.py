@@ -288,6 +288,56 @@ def test_step_pending_repairs_legacy_zero_params():
         "预期依旧处于关闭状态" % (w["horizon_bars"], w["surprise_pts"]))
 
 
+def test_terminal_state_without_position_is_rejected():
+    """状态机推出 `CLOSED_TP` 但引擎没有仓位 → 不许落终态（FILL-1）。
+
+    ★ 2026-11-25 真钱事故：状态机只从 K 线推演，它不知道单有没有挂出去。
+      14:50 挂单成功、14:55 就推出 CLOSED_TP，而交易所 executed_qty=0、
+      `self.pos` 为空 —— 一旦落成终态，就不会再有任何一轮来管那张真实
+      挂单，它就此变成孤儿（成交还会被判成"我方成交"而硬停）。
+
+    ★ 用 spy 直接给出「已填好仓位的状态机结果」，因为真实的 K 线回放
+      会先撞上已有的 `pending_phantom_filled` 分支（那条只处理
+      **库里已经是 FILLED** 的旧行），测不到这条新拦截的接线。
+    """
+    b15 = _bars15(4, start_ts=1000)
+    plan_ts = 1000
+    th = P.to_thesis(_plan(bar_ts=plan_ts, order_price=60000.0,
+                           stop_price=59000.0, target_price=61000.0),
+                     thesis_id="自相矛盾|up|%d|60000.0" % plan_ts)
+    row = PTS.row_of(th, state=T.ARMED, next_index=0, bar_ts=plan_ts)
+
+    st = _step_env([row])
+    st.pos = {}                      # ★ 引擎侧**没有**仓位事实
+
+    fake_res = SimpleNamespace(
+        state=T.CLOSED_TP, actions=[], ambiguous=[], next_index=1,
+        armed_at_bar=0, armed_ref_close=60000.0,
+        armed_at_sub_ts=int(b15[0].ts), best_favorable_px=61000.0,
+        next_index_used=1,
+        states=lambda: [T.ARMED, T.FILLED, T.CLOSED_TP])
+    orig = T.step
+    T.step = lambda *a, **kw: (fake_res, {
+        "state": T.CLOSED_TP, "next_index": 1, "armed_at_bar": 0,
+        "armed_ref_close": 60000.0, "armed_at_sub_ts": int(b15[0].ts),
+        "best_favorable_px": 61000.0})
+    try:
+        _run(E.DecisionEngine._step_pending(
+            st, _bars_iv(b15), 62000.0, 100.0, int(time.time() * 1000)))
+    finally:
+        T.step = orig
+
+    assert st.pending.written, "这一轮没有写回，无法验证拦截"
+    for w in st.pending.written:
+        assert str(w["state"]) not in (T.CLOSED_TP, T.CLOSED_SL,
+                                       T.CLOSED_THESIS), (
+            "没有仓位事实却落了终态 %r → 真实挂单会变成孤儿"
+            % (w["state"],))
+    kinds = [k for k, _ in st.db.risks]
+    assert "pending_terminal_without_position" in kinds, (
+        "拦截了却没留风险事件，静默失败：%r" % (kinds,))
+
+
 def test_sentinel_never_lands_in_the_store():
     """计划那根还没进缓冲：本轮空转，但落库的游标必须是 0。
 

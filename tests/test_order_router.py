@@ -291,6 +291,8 @@ def _pending_engine_stub(can_open=True, place_err=""):
 
     for name in ("_pending_place", "_pending_router",
                  "_gate_pending_unattended", "_gate_pending_size",
+            "_gate_pending_margin", "_pending_need_margin",
+            "_reclaim_margin",
                  "_place_pending_order"):
         raw = E.DecisionEngine.__dict__[name]
         if isinstance(raw, staticmethod):
@@ -365,5 +367,6 @@ def test_pending_router_declares_its_gates_in_order():
     """拦截链的顺序必须可直接读出：无人值守闸 → 仓位闸。"""
     st, _ = _pending_engine_stub()
     names = st._pending_router().gate_names()
-    assert names == ["_gate_pending_unattended", "_gate_pending_size"]
+    assert names == ["_gate_pending_unattended", "_gate_pending_size",
+                     "_gate_pending_margin"]
 

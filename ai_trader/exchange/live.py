@@ -252,7 +252,47 @@ class LiveExecutor(Executor):
                 "position_qty": pos["qty"], "position_side": pos["side"],
                 # ★ 与 `position()["liq_price"]` 同一个来源、同一次请求。
                 #   0 表示交易所未给出（无仓或该字段为空），调用方用 > 0 判有效。
-                "liq_price": float(pos.get("liq_price") or 0.0)}
+                "liq_price": float(pos.get("liq_price") or 0.0),
+                # ★ MGN-1（2026-11-25）：**可用保证金**。
+                #
+                #   在这之前这个数从来没被读过一眼 —— 重要性不在于"少一个字段"，
+                #   而在于「还能不能再开一张单」这个问题的答案只有交易所知道，
+                #   而我们一直在靠它回 -2019 才知道不够。
+                #
+                #   语义（币安 USDT 本位）：`availableBalance` 已经扣掉了
+                #   ①持仓占用的起始保证金 ②**所有挂着未成交委托**占用的保证金。
+                #   所以「一张遗留挂单吃光余额」这件事，在这个数上直接可见，
+                #   不需要我们自己去减一遍挂单占用（自己减就会有两个来源）。
+                "available_balance": float(d.get("availableBalance", 0) or 0.0),
+                # 仅供可观测/记账：挂单占用的那部分是多少。
+                # ★ 不参与判定 —— 判据只用 available_balance 一个数。
+                "open_order_margin": float(
+                    d.get("totalOpenOrderInitialMargin", 0) or 0.0)}
+
+    async def available_margin(self) -> float:
+        """**可用保证金**（`availableBalance`），下单前现读。
+
+        ★ 为什么不复用 `equity()`：它内部还要再调一次 `position()`。
+          下单前的判定只需要一个数，多一次 HTTP 就多一次失败可能，
+          而失败会让「够不够」变成未知 —— 未知必须按「不够」处理，
+          于是白白拦掉一笔本可以下的单。
+
+        ★ 返回 `-1.0` 表示**读不到**（网络/鉴权失败），调用方必须把它
+          与「可用为 0」区分开：0 是事实（真的没钱），-1 是未知。
+          这两者混成一个数，就会把「查不到」说成「没钱」。
+        """
+        try:
+            d = await self._req("GET", "/fapi/v2/account")
+        except LiveError as e:
+            logger.warning("[实盘] 读可用保证金失败：%s", e)
+            return -1.0
+        v = (d or {}).get("availableBalance")
+        if v is None:
+            return -1.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return -1.0
 
     async def last_trade_price(self) -> float:
         """交易所的**最新成交价**（`/fapi/v1/ticker/price`）。

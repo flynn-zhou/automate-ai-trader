@@ -80,6 +80,51 @@ async def test_spot_equity_reads_balances(fake):
 
 
 @pytest.mark.asyncio
+async def test_perp_equity_carries_available_margin(fake):
+    """`equity()` 必须把**可用保证金**带回来（MGN-1）。
+
+    ★ 为什么这条必须是端到端而不是看源码：`availableBalance` 要从真实
+      JSON 里取，抄错键名（比如抄成 `totalOpenOrderInitialMargin`）同样
+      能返回一个 float，而那个数在"没有挂单"时恒为 0 —— 于是
+      「可用保证金闸」会把所有单都判成付不起，而且不报错。
+      这个项目已经出现过一次"字段名凭想象写、永远返回 0"的假字段。
+    """
+    ex = _perp(fake)
+    try:
+        e = await ex.equity()
+        assert e["available_balance"] == pytest.approx(100.0), (
+            "equity() 没带回可用保证金（键名读错了？）：%r"
+            % (e.get("available_balance"),))
+        assert e["open_order_margin"] == 0.0, "没有挂单时挂单占用必须是 0"
+        # 独立方法：只打一个端点，供下单前现读
+        assert await ex.available_margin() == pytest.approx(100.0), (
+            "available_margin() 与 equity() 口径不一致")
+    finally:
+        await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_available_margin_returns_minus_one_when_unreadable(fake):
+    """读不到余额必须返回 -1（未知），不能返回 0（0 会被读成"没钱"）。
+
+    ★ 用 `_req` 抛 LiveError 来造"读不到"，而不是改密钥 ——
+      假币安并不真的校验 API secret，改它测出来的是"还是读到了"，
+      测不到「查询失败」这一支。
+    """
+    ex = _perp(fake)
+    try:
+        async def _boom(*a, **kw):
+            raise LiveError("网络失败（测试注入）")
+        ex._req = _boom
+        got = await ex.available_margin()
+        assert got == -1.0, (
+            "读不到时返回了 %r —— 0 会被当成'没钱'，而'查不到'与'没钱'"
+            "必须能被上层区分开" % (got,))
+    finally:
+        await ex.close()
+
+
+@pytest.mark.asyncio
 async def test_spot_buy_then_sell_roundtrip(fake):
     """真实走一遍：签名 -> 下单 -> 解析成交 -> 余额核对。"""
     ex = _spot(fake)

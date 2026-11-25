@@ -43,7 +43,8 @@ class PartialExecutor:
         return {"balance": 100.0, "unrealized": 0.0, "equity": 100.0,
                 "position_qty": self.pos_qty, "position_side": "long" if self.pos_qty else ""}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         got = round(qty * self.ratio, 8)
         self.pos_qty += got
         return FillResult(ok=True, price=30000.0, qty=got, fee=0.03,
@@ -106,3 +107,41 @@ async def test_open_records_full_qty_on_full_fill():
     await eng._open({"name": "trend_up", "reason": "测试"}, plan,
                     30000.0, 100.0, 1700000000000, {}, {})
     assert eng.pos["qty"] == pytest.approx(plan.qty, rel=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_open_sends_client_id_at_order_time():
+    """开仓的 clientOrderId 必须在**下单那一刻**就下发给交易所。
+
+    ★ 2026-11-25：原来 `_open` 是先下单、后算 `client_id`（那是给
+      `log_order` 用的），于是交易所那张单上是它自己生成的随机串，
+      本地这条 id 永远对不上任何成交 —— 成交归因（靠 `AI-` 前缀认领）
+      对此完全失明，我们自己的开仓成交会被判成「用户手工仓」接管。
+
+    这条断言的样子就是证据：桩收到的 `client_id` 必须非空且带 AI- 前缀。
+    """
+    cfg = AppCfg()
+    cfg.trading.strategy = "trend"
+    cfg.trading.exec_market = "spot"
+    feed = Feed()
+    ex = PartialExecutor(fill_ratio=1.0)
+    seen = []
+    orig = ex.market_order
+
+    async def _spy(side, qty, reason="", reduce_only=False, client_id=""):
+        seen.append(client_id)
+        return await orig(side, qty, reason=reason,
+                          reduce_only=reduce_only, client_id=client_id)
+
+    ex.market_order = _spy
+    eng = DecisionEngine(cfg, feed, ex, _DB())
+    eng.db = _DB()
+
+    plan = eng._trend_plan(30000.0, 100.0, {"ok": True})
+    await eng._open({"name": "trend_up", "reason": "测试"}, plan,
+                    30000.0, 100.0, 1700000000000, {}, {})
+
+    assert seen, "没下单？"
+    assert seen[0], ("开仓单没有下发 clientOrderId —— 成交会被判成人工仓")
+    assert str(seen[0]).startswith("AI-"), (
+        "归因靠 AI- 前缀认领，实际 %r" % (seen[0],))

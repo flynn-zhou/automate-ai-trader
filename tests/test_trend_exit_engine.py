@@ -37,7 +37,8 @@ class _Ex:
         self.px = px
         self.sold = []
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.sold.append((side, qty, reason))
         return type("F", (), {"ok": True, "price": self.px, "qty": qty,
                               "fee": 0.0, "order_id": "x", "status": "FILLED",

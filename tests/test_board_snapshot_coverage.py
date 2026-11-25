@@ -49,7 +49,8 @@ class _Ex:
         return {"qty": self.held, "side": "long" if self.held else "",
                 "entry": 70000.0 if self.held else None}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         class F:
             ok = True
             price = 70000.0

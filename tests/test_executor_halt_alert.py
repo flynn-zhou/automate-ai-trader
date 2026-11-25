@@ -64,7 +64,8 @@ class Ex:
     async def position(self):
         return {"qty": 0.0, "entry": 0.0}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         raise AssertionError("这个测试不该下单")
 
 

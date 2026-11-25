@@ -44,7 +44,8 @@ class Ex:
     def __init__(self):
         self.orders = []
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.orders.append((side, qty))
         return Fill(qty, 77815.0)
 

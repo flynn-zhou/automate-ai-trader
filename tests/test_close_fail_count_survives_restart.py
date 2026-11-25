@@ -79,7 +79,8 @@ class _Spot:
     def __init__(self):
         self.orders = []
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.orders.append((side, qty, reason))
         return FillResult(ok=True, price=PX, qty=qty, fee=qty * PX * 0.001,
                           order_id="1", status="filled", reason="")

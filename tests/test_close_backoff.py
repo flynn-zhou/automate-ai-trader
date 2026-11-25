@@ -49,7 +49,8 @@ class _FailingEx:
     def __init__(self):
         self.attempts = 0
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.attempts += 1
         return FillResult(ok=False, reason="Account has insufficient balance")
 
@@ -121,7 +122,8 @@ def test_close_success_resets_backoff():
     tdb.start()
     try:
         class _OkEx(_FailingEx):
-            async def market_order(self, side, qty, reason="", reduce_only=False):
+            async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
                 self.attempts += 1
                 return FillResult(ok=True, price=59000.0, qty=qty, fee=0.1,
                                   order_id="1", status="filled", reason="")

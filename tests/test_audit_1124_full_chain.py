@@ -72,7 +72,8 @@ class _Ex(object):
         # 部分成交模拟：None = 完全按请求量成交
         self._fill_qty = fill_qty
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.calls.append((side, qty, reduce_only))
         filled = qty if self._fill_qty is None else min(self._fill_qty, qty)
         return _Fill(price=self._price, qty=filled)

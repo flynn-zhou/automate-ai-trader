@@ -124,7 +124,8 @@ class _Ex:
     async def position(self):
         return {"qty": 0.00068, "entry": PX, "side": "long"}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         if self.fail:
             return FillResult(ok=False, reason="HTTP 500 /api/v3/order: Internal Server Error")
         return FillResult(ok=True, price=PX, qty=qty, fee=0.08, status="filled")

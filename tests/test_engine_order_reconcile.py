@@ -88,7 +88,8 @@ class _Live(object):
     async def equity(self):
         return {"balance": 100.0, "equity": 100.0, "position_qty": 0.0}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         return FillResult(ok=True, price=PX, qty=qty, fee=0.0, order_id="1",
                           status="filled", reason="")
 

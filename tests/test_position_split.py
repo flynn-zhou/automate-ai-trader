@@ -71,7 +71,8 @@ class FakeEx(object):
         return {"qty": self._qty, "entry": 61000.0,
                 "side": "buy" if self._qty > 0 else "sell"}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.market_calls.append((side, qty, reduce_only))
         return SimpleNamespace(ok=True, price=61000.0, fee=1.0)
 

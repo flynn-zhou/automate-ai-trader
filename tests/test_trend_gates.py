@@ -76,7 +76,8 @@ class Ex:
     async def mark_price(self):
         return self.mark
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         from ai_trader.exchange.base import FillResult
         self.sold.append((side, qty))
         return FillResult(ok=True, price=self.mark, qty=qty, fee=0.08, status="filled")

@@ -165,3 +165,61 @@ def test_ours_wins_over_unknown_when_mixed():
     mixed = [{"side": "BUY", "qty": 0.01, "client_id": "AI-pend-x"},
              {"side": "BUY", "qty": 0.02, "client_id": None}]
     assert E.classify_delta(mixed, 0.03)[0] == E.PROV_OURS
+
+
+# --------------------------------------------- 市价单也必须能认领
+#
+# 2026-11-25 生产实测：手工平仓那笔成交的 client_id 是交易所自己生成的
+# `8sgedyZgQSvDXiO9Sn1luN` —— 因为 `market_order()` 当时不下发
+# `newClientOrderId`。而市价单正是**平仓和止损**：
+# 一笔止损成交被判成人工仓接管之后，§13.2 规定接管仓不判策略出场，
+# 等于止损失效。「我们不知道自己平了仓」必须硬停，不能静默接管。
+
+@pytest.mark.asyncio
+async def test_market_order_can_carry_client_id(fake):
+    """市价单带上 AI- 前缀 → 成交能被认领成 ours。"""
+    ex = _ex(fake)
+    try:
+        fill = await ex.market_order("buy", 0.01, reason="测试开仓",
+                                     client_id="AI-123-1")
+        assert fill.ok, fill.reason
+        fills = await ex.recent_fills(hours=24)
+        assert fills and fills[0]["client_id"] == "AI-123-1", (
+            "市价单的归属没补上：%r —— 平仓/止损成交会被当人工仓接管"
+            % (fills[0]["client_id"] if fills else None,))
+        prov, _used = E.classify_delta(fills, 0.01)
+        assert prov == E.PROV_OURS
+    finally:
+        await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_market_order_without_client_id_is_not_ours(fake):
+    """不下发 id 时交易所会给个随机串 → 不是 ours（钉住现状，说明为什么要传）。"""
+    ex = _ex(fake)
+    try:
+        fill = await ex.market_order("buy", 0.01, reason="测试")
+        assert fill.ok, fill.reason
+        fills = await ex.recent_fills(hours=24)
+        cid = fills[0]["client_id"]
+        assert cid and not str(cid).startswith(E.AI_CLIENT_PREFIX), (
+            "不传 newClientOrderId 时应当拿到交易所生成的随机 id，实际 %r"
+            % (cid,))
+        assert E.classify_delta(fills, 0.01)[0] == E.PROV_MANUAL
+    finally:
+        await ex.close()
+
+
+def test_close_client_id_is_short_enough_and_prefixed():
+    """平仓专用的 id：够短、纯 ASCII、带 AI- 前缀（币安硬约束 + 归因判据）。"""
+    cid = E._close_client_id("pend", "下跌三引线假突破限价单|up|17|58930.0")
+    assert cid.startswith("AI-"), cid
+    assert len(cid) <= 35, "币安要求 clientOrderId < 36 字符：%r(%d)" % (
+        cid, len(cid))
+    assert cid.isascii(), "中文/竖线不能进 clientOrderId：%r" % (cid,)
+    # 同一个预期必须算出逐字相同的 id（幂等重放与撤单都靠这一点）
+    assert cid == E._close_client_id(
+        "pend", "下跌三引线假突破限价单|up|17|58930.0")
+    # 不同预期不能撞
+    assert cid != E._close_client_id(
+        "pend", "下跌三引线假突破限价单|up|18|58930.0")

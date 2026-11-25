@@ -85,7 +85,8 @@ class _LiveEx(object):
     async def last_trade_price(self):
         return self._price
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         # 与真实 `FillResult` 对齐：`_adopted_close` 先看 `ok`，再看 `qty`/`fee`。
         return types.SimpleNamespace(ok=True, price=self._price, fee=0.1,
                                      qty=qty)

@@ -66,7 +66,8 @@ class _Ex:
     def __init__(self, halted=HALT):
         self.halted = halted
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         if self.halted:
             return type("F", (), {"ok": False, "reason": "已熔断：" + self.halted,
                                   "price": 78000.0, "qty": 0.0, "fee": 0.0,

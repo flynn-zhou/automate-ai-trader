@@ -55,7 +55,8 @@ class Ex:
         self.orders = []
         self.held = 0.0
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.orders.append((side, qty))
         if side == "buy":
             self.held += qty

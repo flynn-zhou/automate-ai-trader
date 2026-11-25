@@ -46,7 +46,8 @@ class BrokenExecutor:
     def __init__(self):
         self.calls = []
 
-    async def market_order(self, side, qty, reason=""):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.calls.append((side, qty))
         return Fill(ok=False)
 

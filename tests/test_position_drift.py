@@ -39,7 +39,8 @@ class SpotEx:
         self.real_qty = real_qty
         self.orders = []
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         class F:
             def __init__(self, q):
                 self.ok = True

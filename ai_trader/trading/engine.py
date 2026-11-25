@@ -126,6 +126,31 @@ def pending_client_id(thesis_id) -> str:
                          % (cid, len(cid)))
     return cid
 
+
+def _close_client_id(kind: str, key: str) -> str:
+    """平仓/止损市价单的 clientOrderId：`AI-<kind>-<12 位哈希>`。
+
+    ★ 2026-11-25 为什么必须给市价单也带上（真钱自检单查出来）：
+      币安 `/fapi/v1/userTrades` 不返回 clientOrderId，成交归属只能靠
+      `orderId → clientOrderId` 反查；而下单时若不下发
+      `newClientOrderId`，交易所会自己生成一个随机串（实测
+      `8sgedyZgQSvDXiO9Sn1luN`），反查回来也不带 `AI-` 前缀
+      → 我们自己砸出去的市价单成交被判成**用户手工仓**。
+
+      方向比"认不出"更糟：市价单正是平仓和止损。一笔止损成交被当人工仓
+      接管之后，§13.2 规定接管仓不判策略出场 —— 等于止损失效。
+
+    ★ 长度：`AI-` + kind + `-` + 12 = 至多 20 字符，远低于币安 36 上限。
+      key 用哈希而不是原文：thesis_id 里有中文和竖线，原文必然超长
+      （见 `pending_client_id` 那段 11-24 事故说明）。
+    """
+    key_h = hashlib.sha1(str(key).encode("utf-8")).hexdigest()[:12]
+    cid = "AI-%s-%s" % (kind, key_h)
+    if len(cid) > 35 or not cid.isascii():
+        raise ValueError("clientOrderId 不合法（%r，%d 字符）"
+                         % (cid, len(cid)))
+    return cid
+
 #: 归类结论：用户在手机 App 上手工开的仓（§13.2：接管、不许硬停）。
 PROV_MANUAL = "manual"
 #: 归类结论：我们自己的单，成交回报丢了（真故障，必须硬停）。
@@ -3203,7 +3228,9 @@ class DecisionEngine:
                 close_side, want, reason=("接管仓%s %s"
                                           % ("减仓" if remain > 0 else "出场",
                                              reason)),
-                reduce_only=True)
+                reduce_only=True,
+                client_id=_close_client_id(
+                    "adopt", "%s|%s" % (reason, pos.get("entry_ts"))))
         except Exception as e:
             logger.error("[接管] 平仓失败（人工仓，%s）：%s", reason, e)
             self.db.log_risk("adopted_close_failed", "%s: %s" % (reason, str(e)[:200]))
@@ -4865,7 +4892,8 @@ class DecisionEngine:
         #   平仓的专用入口一直是 `market_order(reduce_only=True)`（_open/_close 都走它，
         #   而且它会对 reduce_only 放行熔断）。
         fill = await self.ex.market_order(
-            side, qty, reason=("挂单平仓 %s" % tid), reduce_only=True)
+            side, qty, reason=("挂单平仓 %s" % tid), reduce_only=True,
+            client_id=_close_client_id("pend", tid))
         if not getattr(fill, "ok", False):
             err = str(getattr(fill, "reason", "") or "未知原因")
             logger.error("[挂单] %s 平仓失败：%s", tid, err)
@@ -5219,10 +5247,16 @@ class DecisionEngine:
         # 永续按名义合约交易，不存在这个残留，而且它会多查一次权益
         # （实盘里是一次 HTTP）、在行情最激烈的时候。
         pre_dust = 0.0
-        fill = await self.ex.market_order(order_side, plan.qty,
-                                          reason="%s 开仓 %s" % (sig["name"], side_txt))
+        # ★ 2026-11-25：id 必须**在下单前**定好并下发给交易所。
+        #   原来这里先下单、后算 `client_id`，于是交易所那张单上是它自己
+        #   生成的随机 id，本地这条 `client_id` 永远对不上任何成交 ——
+        #   成交归因（靠 `AI-` 前缀认领）对此完全失明。
         self._seq += 1
         client_id = "AI-%d-%d" % (now_ms, self._seq)
+        fill = await self.ex.market_order(
+            order_side, plan.qty,
+            reason="%s 开仓 %s" % (sig["name"], side_txt),
+            client_id=client_id)
         self.db.log_order({"ts": now_ms, "client_id": client_id, "symbol": self.tcfg.symbol,
                            "side": order_side, "type": "MARKET", "qty": plan.qty,
                            "price": fill.price if fill.ok else None,
@@ -5923,9 +5957,11 @@ class DecisionEngine:
         # 真实事故形态：行情暴动 -> equity() 超时 -> 平仓抛异常 ->
         # 计数器不动 -> 闸不触发 -> 系统一边报 engine_error 一边继续开新仓。
         try:
-            fill = await self.ex.market_order(order_side, sell_qty,
-                                              reason="平仓 " + reason,
-                                              reduce_only=True)
+            fill = await self.ex.market_order(
+                order_side, sell_qty, reason="平仓 " + reason,
+                reduce_only=True,
+                client_id=_close_client_id(
+                    "close", "%s|%d" % (reason, int(time.time() * 1000))))
         except Exception as e:
             # 兜住它而不是让它冒泡：冒泡的后果是"整个决策步骤中断"，
             # 而止损是急事——这一轮卖不出去，下一轮必须接着试。

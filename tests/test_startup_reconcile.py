@@ -63,7 +63,8 @@ class _Spot:
         self.pos_qty = qty
         self.entry = PX
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.orders.append((side, qty))
         self.pos_qty = 0.0 if side == "sell" else qty
         return FillResult(ok=True, price=PX, qty=qty, fee=qty * PX * 0.001,

@@ -130,7 +130,8 @@ class _LiveEx:
             raise self.boom
         return list(self.fills)
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         from ai_trader.exchange.base import FillResult
         return FillResult(ok=True, price=self.mark, qty=qty, fee=0.0,
                           status="filled")

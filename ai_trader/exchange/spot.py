@@ -372,7 +372,16 @@ class SpotExecutor(Executor):
             self.halted_ts = 0.0
 
     async def market_order(self, side: str, qty: float, reason: str = "",
-                           reduce_only: bool = False) -> FillResult:
+                           reduce_only: bool = False,
+                           client_id: str = "") -> FillResult:
+        """市价单。`client_id` 现货侧不用，但**签名必须与永续实盘一致**。
+
+        ★ 2026-11-25：实盘 `market_order` 新增 `client_id`（成交归属要靠
+          它认领，见 live.py 那段）。三个执行器（live/paper/spot）签名一漂，
+          凡是用真执行器的测试全在开仓/平仓处 TypeError，而报错行看起来
+          像产品 bug。统一在这里显式接住并说明为什么不用 —— 比给产品代码
+          加 `**kw` 兜底干净：签名对齐本身就是契约。
+        """
         self._maybe_clear_halt()
         if self.halted and not reduce_only:
             return FillResult(ok=False, reason="已熔断：" + self.halted)

@@ -389,8 +389,18 @@ def test_market_order_still_fills_immediately():
                 assert body["status"] == "FILLED"
                 assert srv.positions["BTCUSDT"]["amt"] == pytest.approx(0.010)
                 assert srv.positions["BTCUSDT"]["entry"] == pytest.approx(75000.0)
-                # 市价单不该出现在挂单账本里
-                assert srv.order_book == {}
+                # 市价单不该留下**未成交的挂单**（这条是原始意图）。
+                #
+                # ★ 2026-11-25 改：断言从「order_book 为空」改成「没有 working 单」。
+                #   市价单现在会进 order_book（状态 FILLED），因为成交归属要靠
+                #   `/fapi/v1/allOrders` 的 orderId→clientOrderId 反查 ——
+                #   而市价单正是平仓和止损，不让它进账本就等于让
+                #   「市价单没带 client_id」这个真缺陷在测试里永远看不见。
+                assert [o for o in srv.order_book.values()
+                        if o["status"] in ("NEW", "PARTIALLY_FILLED")] == [], (
+                    "市价单不该在账本里留下可成交的挂单")
+                # 但它必须能按 orderId 查到（归属反查的前提）
+                assert srv.order_book[int(body["orderId"])]["status"] == "FILLED"
         finally:
             await srv.stop()
 

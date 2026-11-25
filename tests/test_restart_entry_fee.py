@@ -65,7 +65,8 @@ class _Ex:
     async def equity(self):
         return {"equity": 100.0}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         filled = qty           # 类体里不能写 qty = qty，先落到局部变量
 
         class R:

@@ -54,7 +54,8 @@ class _Ex:
         self.boom = boom
         self.calls = 0
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         self.calls += 1
         raise RuntimeError(self.boom)
 

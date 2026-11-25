@@ -118,7 +118,8 @@ class _Ex:
                 "position_qty": self.qty,
                 "position_side": "long" if self.qty else ""}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         raise AssertionError("对账路径不该下单")
 
 

@@ -60,6 +60,24 @@ CASES = [
      "        if \"armed_at_sub_ts\" not in have:",
      "        if False:",
      "tests/test_pending_anchor_persist.py"),
+
+    # ---------------- E：市价单不带 client_id ----------------
+    ("E1 市价单不下发 id", "ai_trader/exchange/live.py",
+     "        if client_id:\n            params[\"newClientOrderId\"] = client_id",
+     "        if False:\n            params[\"newClientOrderId\"] = client_id",
+     "tests/test_fill_attribution.py"),
+
+    ("E2 开仓 id 仍在下单后生成", "ai_trader/trading/engine.py",
+     "        self._seq += 1\n        client_id = \"AI-%d-%d\" % (now_ms, self._seq)\n"
+     "        fill = await self.ex.market_order(\n"
+     "            order_side, plan.qty,\n"
+     "            reason=\"%s 开仓 %s\" % (sig[\"name\"], side_txt),\n"
+     "            client_id=client_id)",
+     "        fill = await self.ex.market_order(\n"
+     "            order_side, plan.qty,\n"
+     "            reason=\"%s 开仓 %s\" % (sig[\"name\"], side_txt))\n"
+     "        self._seq += 1\n        client_id = \"AI-%d-%d\" % (now_ms, self._seq)",
+     "tests/test_open_fill_qty.py"),
 ]
 
 

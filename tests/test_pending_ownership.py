@@ -329,7 +329,8 @@ def test_place_success_is_marked_applied():
 
 def _close_stub(open_reason, qty=0.032):
     class Ex(object):
-        async def market_order(self, side, q, reason="", reduce_only=False):
+        async def market_order(self, side, q, reason="", reduce_only=False,
+                           client_id=""):
             # ★ 返回**单个** fill 对象（不是 (fill, err) 元组）：
             #   `_pending_close` 读的是 `fill.ok` / `fill.price`。
             return SimpleNamespace(ok=True, price=61289.4)
@@ -656,7 +657,8 @@ def _adopted_st(price=61000.0, qty=0.032, entry=60880.0, stop=_ADOPT_STOP,
     calls = []
 
     class Ex(object):
-        async def market_order(self, side, q, reason="", reduce_only=False):
+        async def market_order(self, side, q, reason="", reduce_only=False,
+                           client_id=""):
             calls.append((side, q, reduce_only))
             # 手续费给个非零值：平仓成本必须真的记账（这个项目历史上
             # 「手续费漏记」出过事，见 _pending_close 的 fee=0.0 既存缺陷）。

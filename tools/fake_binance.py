@@ -557,6 +557,29 @@ class FakeBinance:
 
         oid = self._new_order_id()
         self._apply_fill(side, qty, px)
+        # ★ 市价单也要进 order_book：归属反查走的是 `orderId → clientOrderId`，
+        #   不进来的话 `allOrders` 查不到市价单，而归因里**市价单正是平仓
+        #   和止损** —— 桩漏掉它，就等于让「市价单没带 client_id」这个
+        #   真缺陷在测试里永远看不见。
+        _cid = p.get("newClientOrderId") or ("fake-%d" % self._seq)
+        self.order_book[oid] = {
+            "orderId": oid, "clientOrderId": _cid, "symbol": "BTCUSDT",
+            "side": side, "type": "MARKET", "origQty": qty,
+            "executedQty": qty, "price": 0.0, "stopPrice": 0.0,
+            "avgPrice": px, "cumQuote": qty * px, "status": "FILLED",
+            "timeInForce": "GTC",
+            "reduceOnly": str(p.get("reduceOnly", "")).lower() == "true",
+            "workingType": "CONTRACT_PRICE", "updateTime": self._now_ms(),
+        }
+        self.perp_trades.append({
+            "id": 7000 + len(self.perp_trades), "orderId": oid,
+            "symbol": "BTCUSDT", "side": side,
+            "qty": "%.8f" % qty, "price": "%.2f" % px,
+            "quoteQty": "%.8f" % (qty * px),
+            "commission": "%.8f" % (qty * px * 0.0005),
+            "commissionAsset": "USDT", "realizedPnl": "0", "maker": False,
+            "time": self._now_ms(),
+        })
         return web.json_response({
             "orderId": oid, "symbol": "BTCUSDT",
             "status": "FILLED", "side": side, "type": "MARKET",

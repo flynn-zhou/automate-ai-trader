@@ -681,7 +681,19 @@ class LiveExecutor(Executor):
         return [[int(r[0]), float(r[2]), float(r[3])] for r in out]
 
     async def market_order(self, side: str, qty: float, reason: str = "",
-                           reduce_only: bool = False) -> FillResult:
+                           reduce_only: bool = False,
+                           client_id: str = "") -> FillResult:
+        """市价单（平仓/止损）。`client_id` 是**成交归属的唯一凭证**。
+
+        ★ 2026-11-25 为什么必须能传（真钱自检单查出来）：
+          这里原来不下发 `newClientOrderId`，于是币安给这张单自己生成一个
+          随机 id（实测 `8sgedyZgQSvDXiO9Sn1luN`）。成交归因按 `AI-`
+          前缀认领，认不到 → 我们自己砸出去的市价单成交被判成
+          **用户手工仓**。而市价单正是平仓和止损 —— 认错方向比认不出更糟：
+          一笔止损成交会被当成人手单接管，然后 §13.2 的规矩接管仓不判策略
+          出场，等于止损失效。
+          「我们不知道自己平了仓」是必须硬停的故障，绝不能静默接管。
+        """
         self._maybe_clear_halt()
         if self.halted and not reduce_only:
             return FillResult(ok=False, reason="已熔断：" + self.halted)
@@ -708,6 +720,8 @@ class LiveExecutor(Executor):
                   "newOrderRespType": "RESULT"}
         if reduce_only:
             params["reduceOnly"] = "true"
+        if client_id:
+            params["newClientOrderId"] = client_id
         try:
             r = await self._req("POST", "/fapi/v1/order", params)
         except LiveError as e:

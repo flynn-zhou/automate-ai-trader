@@ -80,7 +80,8 @@ class FakeEx(object):
         return {"qty": self.qty, "entry": self.entry,
                 "side": "long" if self.qty > 0 else "short"}
 
-    async def market_order(self, side, qty, reason="", reduce_only=False):
+    async def market_order(self, side, qty, reason="", reduce_only=False,
+                           client_id=""):
         if getattr(self, "fail_market", False):
             raise AssertionError("平仓不该走 place_order")
         self.market_calls.append((side, qty, reduce_only))

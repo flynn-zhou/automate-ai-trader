@@ -87,7 +87,17 @@ class PaperExecutor(Executor):
                 "position_side": "long" if self.pos_qty > 0 else ("short" if self.pos_qty < 0 else "")}
 
     async def market_order(self, side: str, qty: float, reason: str = "",
-                           reduce_only: bool = False) -> FillResult:
+                           reduce_only: bool = False,
+                           client_id: str = "") -> FillResult:
+        """市价单。`client_id` 纸面不用，但**签名必须与实盘一致**。
+
+        ★ 2026-11-25：实盘 `market_order` 新增了 `client_id`（成交归属
+          必须靠它认领，见 live.py 那段）。纸面执行器签名不跟上，
+          `_open`/`_close`/挂单平仓 三条路径在纸面上全部 TypeError ——
+          而纸面样本是这个项目唯一的策略证据来源，全红等于没证据。
+          这类「两个执行器签名漂移」的坑本项目踩过：修实盘忘纸面，
+          测试替身照样绿，直到有个测试用了真 PaperExecutor 才暴露。
+        """
         px = self._price()
         if not px:
             return FillResult(ok=False, reason="无价格")

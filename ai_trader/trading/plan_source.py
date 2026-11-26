@@ -222,10 +222,15 @@ class PlanSource:
     def plans(self, params: Optional[P.PendingParams] = None,
               ctx: Optional[P.PlanContext] = None
               ) -> Tuple[List[P.Plan], Dict[str, int]]:
-        """产出计划。`require_window=True` 是**硬要求**，见 `detect_all`。"""
+        """产出计划。`require_window=True` 是**硬要求**，见 `detect_all`。
+
+        ★ `kinds` 必须走 `P.ENABLED_KINDS`（唯一来源）。用 `detect_all` 的
+          默认值 `KINDS` 等于把已停用的三引线又放回生产 —— 而三引线
+          在 758 笔真实样本上均 R 为 -0.515（见 `ENABLED_KINDS` 的注释）。
+        """
         ctx = ctx if ctx is not None else self.context()
-        return P.detect_all(ctx, params, require_window=True,
-                            include_mirror=True)
+        return P.detect_all(ctx, params, kinds=P.ENABLED_KINDS,
+                            require_window=True, include_mirror=True)
 
     @staticmethod
     def plan_key(plan: P.Plan) -> str:

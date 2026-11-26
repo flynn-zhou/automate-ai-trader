@@ -711,9 +711,73 @@ _RANGE_DIR = {DOWN: "DOWN", UP: "UP"}
 #: 1h 周期下 15m 可用根数从 8 根涨到 20 根。
 WINDOW_EXTRA_BARS = 3
 
+#: 量能门槛：该小时量 / 前 `WINDOW_VOL_WIN` 小时量**均值** >= 这个倍数。
+#:
+#: ★ 2026-11-26 用户重新定口径（原话）：
+#:   「量能门槛要跟最近相比大于 3 就行，不是固定，只要最近 K 线出现了
+#:     大于最近均量的 3 倍或者 4 倍或者 5 都算，具体多少回测一下，
+#:     不一定是突破的这一根，我们看的是附近的放量行为，
+#:     附近放量行为出现了，那就是满足了」
+#:
+#: 三条变化，都是用户明确要的：
+#:   1. **参考基准从「中位量」改成「均值」** —— 用户说的是"均量"。
+#:   2. **门槛从 1.5 抬到 3** —— 1.5 倍在真实数据上属于噪声级，
+#:      量比 0.53/0.83/0.91 的事件都被它挡在门外，等于策略常年不开张。
+#:   3. **不再要求「突破那一根」自己放量** —— 看「附近的放量行为」，
+#:      突破根前后各 `WINDOW_VOL_NEAR` 小时内出现过合格放量即可。
+#:      这一条最贴近用户说的"扫流动性"：放量是清算/扫单的结果，
+#:      它可能落在突破根前一根（先扫后破）或后一根（破了才扫）。
+#:
+#: 取 3.0 而不是 4/5：具体值由 `tools/calibrate_vol_gate.py` 在真实数据上
+#: 夹出来（见该脚本的 `--sweep`），常数在这里是**唯一来源**。
+WINDOW_VOL_MULT = 3.0
+
+#: 量比参考窗口：本根之前多少根 1h（用户口径"最近"）。
+WINDOW_VOL_WIN = 24
+
+#: 「附近放量」的半径：突破根前后各几根 1h 内出现过合格放量，即算满足。
+#: 0 = 只看突破根自己（等价于老行为，但门槛用的是新值）。
+#:
+#: ★ 取 2 的依据（`tools/calibrate_vol_gate2.py`，2026-08-01~11-26 真实数据）：
+#:    近邻=1、N=3.0 → 窗口 21、受闸形态 8 笔、均 R +1.561
+#:    近邻=2、N=3.0 → 窗口 26、受闸形态 9 笔、均 R +1.862（最好）
+#:   近邻=1、N=2.0 → 窗口 30、受闸形态 11 笔、均 R +1.518（窗口最多但均 R 最低）
+#:   近邻=2、N=2.0 → 窗口 37、受闸形态 12 笔、均 R +1.747
+#:  用户原话「不一定是突破的这一根，我们看的是附近的放量行为」，
+#:  近邻=2（前后各 2 小时）既保留了"附近"语义，均 R 也最高。
+WINDOW_VOL_NEAR = 2
+
+#: 哪些 tag 可以当窗口起点。用户 2026-11-26 追加「反转」：
+#: 22:45 那根 +852 点的 V 型反转就是典型起点，老口径只认「突破」，
+#: 于是整夜一个窗口都长不出来。
+WINDOW_START_TAGS = (TAG_BREAKOUT, TAG_REVERSAL)
+
+#: ★★ 生产**启用**哪些形态。默认是 `KINDS` 的一个子集：
+#:   三引线假突破**停用**（`KIND_WICKS` 不在里面）。
+#:
+#: 依据（`tools/calibrate_wicks_gate.py`，2026-08-01~11-26，真实生产库，
+#: 口径 N=3.0 / 近邻=2，每个计划都用完整状态机跑结算）：
+#:
+#:   V0 三条全开（现状）     n=767  胜率 15%  总 R **-373.69**  均 R -0.487
+#:   V1 三引线也进窗口闸     n= 11  胜率 18%  总 R   **-6.44**  均 R -0.586
+#:   V2 停用三引线           n= 16  胜率 62%  总 R  **+17.72**  均 R +1.107
+#:
+#: 三引线在两个口径下都是负的（窗口外 758 笔 -0.515R/笔、窗口内 11 笔
+#: -0.586R/笔），样本量比其它两条大两个数量级 —— 也就是说这个结论
+#: **不是小样本噪声**，而是它本身的期望为负。
+#:
+#: ★ 为什么单独做成一个常量而不是删掉探测器：
+#:   探测器/状态机/测试全部保留（它们是已验收的资产），只是生产路径
+#:   不启用。要试回来，改这一个元组即可，不需要动任何逻辑。
+#:   这与「同一件事两个来源」纪律一致：**启用集合只有一个来源**。
+ENABLED_KINDS = (KIND_INVERSE_V, KIND_EMA_REJECT)
+
 
 def build_open_windows(h1, tag_of, line_of, *,
-                       vol_mult: float = 1.5, vol_win: int = 24,
+                       vol_mult: float = WINDOW_VOL_MULT,
+                       vol_win: int = WINDOW_VOL_WIN,
+                       vol_near: int = WINDOW_VOL_NEAR,
+                       start_tags=WINDOW_START_TAGS,
                        directions=(DOWN, UP),
                        extra_bars: int = 0,
                        period_ms: int = 3_600_000):
@@ -725,8 +789,11 @@ def build_open_windows(h1, tag_of, line_of, *,
             **direction 是大写**（`'DOWN'`/`'UP'`），本函数内部转好。
         line_of: ``(ts, line_key) -> price``，只在该 1h **收盘时已就绪**才返回，
             否则 ``None``。用 `LineBook.at(key, ts + HOUR)` 就行。
-        vol_mult: 带量门槛（该小时量 / 前 `vol_win` 小时量中位数）。
+        vol_mult: 放量门槛（该小时量 / 前 `vol_win` 小时量**均值**）。
         vol_win: 量比参考窗口（小时数）。
+        vol_near: 「附近放量」半径（小时）。突破根前后各这么多根内出现过
+            合格放量即算满足；0 = 只看突破根自己。
+        start_tags: 哪些 tag 可以当窗口起点（默认突破 + 反转）。
         directions: 要算哪些方向，用本模块的 `DOWN`/`UP`；默认两个都算
             （用户要求镜像一起做）。
         extra_bars: forming 段结束后**再追加几根**（默认 0 = 老行为）。
@@ -756,17 +823,20 @@ def build_open_windows(h1, tag_of, line_of, *,
     if not hours:
         return []
     out = []
+    # ★ 量能序列**预先取全**：附近放量要看突破根**后面**的根，
+    #   而下面 `vols.append` 是随循环长的，到 i 为止只有 i+1 个 ——
+    #   拿它做 `i+1` 会 IndexError，做 `max(...)` 会静默少一根。
+    all_vols = [float(getattr(b, "v", 0.0) or 0.0) for b in hours]
     for direction in directions:
         key = FORWARD_BOUNDARY[direction]
         rng_dir = _RANGE_DIR[direction]       # 大写，和库里一致
         down = direction == DOWN
-        vols = []
+        start_set = tuple(start_tags or ())
         for i, bar in enumerate(hours):
             ts = int(bar.ts)
-            vols.append(float(getattr(bar, "v", 0.0) or 0.0))
             st = tag_of(ts)
             tag, tdir = (st if st else ("", ""))
-            if tag != TAG_BREAKOUT or tdir != rng_dir:
+            if tag not in start_set or tdir != rng_dir:
                 continue
             if i == 0:
                 continue
@@ -779,10 +849,18 @@ def build_open_windows(h1, tag_of, line_of, *,
                       (prev_close <= float(px) < close)
             if not crossed:
                 continue
-            ref = _median(vols[max(0, i - vol_win):i])
+            # ★ 量能：「附近的放量行为」—— 突破根前后各 vol_near 小时内的
+            #   **最大**量，对比之前 vol_win 小时的**均值**。
+            #   用户 2026-11-26 口径：不要求突破根自己放量（扫流动性可能
+            #   落在突破前一根：先扫后破），附近出现过合格放量即算满足。
+            ref_slice = all_vols[max(0, i - vol_win):i]
+            ref = _mean(ref_slice)
             if ref <= 0:
                 continue
-            if float(getattr(bar, "v", 0.0) or 0.0) / ref < float(vol_mult):
+            near_lo = max(0, i - int(vol_near))
+            near_hi = min(len(all_vols), i + int(vol_near) + 1)
+            peak = max(all_vols[near_lo:near_hi]) if near_hi > near_lo else 0.0
+            if peak / ref < float(vol_mult):
                 continue
             # 往后找紧跟的 forming 段（同方向），再按 extra_bars 追加尾巴
             end = None
@@ -817,6 +895,14 @@ def _median(xs) -> float:
     if not n:
         return 0.0
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _mean(xs) -> float:
+    """算术平均。用户 2026-11-26 把量能基准从「中位数」改成「均量」。"""
+    vals = [float(x) for x in (xs or ()) if x is not None]
+    if not vals:
+        return 0.0
+    return sum(vals) / float(len(vals))
 
 
 class PlanContext:

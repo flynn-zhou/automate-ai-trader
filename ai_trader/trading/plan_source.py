@@ -229,8 +229,28 @@ class PlanSource:
           在 758 笔真实样本上均 R 为 -0.515（见 `ENABLED_KINDS` 的注释）。
         """
         ctx = ctx if ctx is not None else self.context()
-        return P.detect_all(ctx, params, kinds=P.ENABLED_KINDS,
-                            require_window=True, include_mirror=True)
+        plans, stats = P.detect_all(ctx, params, kinds=P.ENABLED_KINDS,
+                                    require_window=True, include_mirror=True)
+        # ---- 实体反包三档（15m，**不进窗口闸**）----
+        #
+        # ★ 为什么是「追加」而不是「加进 detect_all」：
+        #   `detect_all` 里三条形态都强制过开仓窗口闸，而反包是**无背景**的
+        #   价格形态。塞进去要么放开窗口闸（会让原有三条形态的计划数暴涨，
+        #   正是历史上踩过的坑），要么到处写 `if kind == ...` 分支。
+        #   独立实现 + 在这里追加，对已上线的 VOL-1 三条形态**零改动**。
+        #
+        # ★ 一条信号出**三档**（8 0%/50%/30%），靠 `order_price` 不同被
+        #   `plan_key` 区分，不会互相去重。
+        #
+        # ★ 为什么必须传 params：档位定价要用 `tick_size` 算「最低点 - 1tick」，
+        #   缺省会落回 0.1 的兜底值 —— 对 BTC 恰好对，对别的品种就错。
+        #   兜底值存在只是为了不抛异常，不是可以省略的理由。
+        from . import engulf as E
+        eplans, estats = E.detect(ctx, params)
+        plans.extend(eplans)
+        for k, v in estats.items():
+            stats[k] = stats.get(k, 0) + v
+        return plans, stats
 
     @staticmethod
     def plan_key(plan: P.Plan) -> str:

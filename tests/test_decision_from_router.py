@@ -162,7 +162,7 @@ def _place_engine_stub(can_open=True, place_err=""):
     st.db = _Db()
     st.guard = _Guard()
     st.tcfg = types.SimpleNamespace(symbol="BTCUSDT", strategy="pending")
-    st._pending_size = lambda price, stop, otype: (0.01, "")
+    st._pending_size = lambda price, stop, otype, risk_scale=1.0: (0.01, "")
     st._last_route = None
 
     for name in ("_pending_place", "_pending_router",

@@ -2422,7 +2422,19 @@ def to_thesis(plan: Plan, thesis_id: str = "",
       预期与现实管理」，时间闸会把「目标不合理」藏起来（见 `thesis.run`）。
     """
     params = params or PendingParams()
-    tid = thesis_id or "%s-%s-%s" % (plan.direction, plan.kind, plan.bar_ts)
+    # ★ 默认 id 必须带 `order_price`。
+    #
+    #   反包是「一根 K 出三档」—— 三档的 direction/kind/bar_ts **完全相同**，
+    #   只有挂单价不同。原来只拼前三个字段，三条腿会拿到同一个 thesis_id，
+    #   落库时后写的覆盖先写的（`pending_theses` 按 thesis_id 做主键），
+    #   表现为「明明下了三档，库里/持仓里只有一条」。
+    #
+    #   生产路径（`engine._pending_place`）传的是 `plan_key()`，本来就有
+    #   order_price，所以线上没出过事；但 `run_plan()` 走的是默认值 ——
+    #   同一个函数两种行为，正是这个项目反复吃亏的「同一事实两个来源」。
+    #   现在默认值也唯一，两条路一致。
+    tid = thesis_id or "%s-%s-%s-%.4f" % (
+        plan.direction, plan.kind, plan.bar_ts, float(plan.order_price or 0.0))
     stale = 0.0
     if plan.family == T.FAMILY_REVERSAL:
         sd = float(plan.evidence.get("stop_distance") or 0.0)

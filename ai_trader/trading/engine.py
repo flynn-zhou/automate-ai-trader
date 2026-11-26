@@ -13,7 +13,7 @@ import hashlib
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from ..trade_db import TradeDB, ADOPT_REASON, reconcile_orders
 from . import features as feat_mod
@@ -69,6 +69,22 @@ PENDING_FILL_REASON = "挂单成交"
 #: 与 `PendingOrder.status` 的原生值对齐，不做归一化 —— 归一化会把
 #: 「部分成交」压成「成交」，`_pending_book_fill` 就会按全额落账。
 _FILLED_STATES = ("FILLED", "PARTIALLY_FILLED")
+
+
+def _risk_scale_for(kind: Any) -> float:
+    """按计划形态取**风险分摊系数**。唯一来源是 `engulf.risk_scale_for`。
+
+    ★ 为什么要有这个薄包装而不是在 `_pending_place` 里直接 import：
+
+      反包一次挂三档，三档若各吃满额风险，合计敞口是 `sizing.risk_pct`
+      的 3 倍（生产 10.10% → 30.30%）。判据本身住在 `engulf` 里，
+      这里只把「按 kind 取系数」这件事集中成一处，别让调用点各写一遍。
+
+    ★ 懒 import：`engine` 在包内被多个模块 import，顶层 import `engulf`
+      会把 `pending_plan` → `thesis` 的初始化顺序卷进来，制造循环依赖。
+    """
+    from . import engulf as _E
+    return _E.risk_scale_for(kind)
 
 #: 人工仓在交易所侧那张保护性止损单的 clientOrderId 前缀。
 #:
@@ -4916,8 +4932,16 @@ class DecisionEngine:
     # ---------------- 挂单策略：仓位与执行 ----------------
 
     def _pending_size(self, entry: float, stop: float,
-                      order_type: str = "") -> Tuple[float, str]:
+                      order_type: str = "",
+                      risk_scale: float = 1.0) -> Tuple[float, str]:
         """按**项目已定的仓位口径**算一笔挂单的手数。返回 ``(qty, 拒绝理由)``。
+
+        Args:
+            risk_scale: 这笔单占**全额风险**的几成。默认 1.0（= 全额）。
+                ★ 反包三档必须传 1/3：三档同时挂出时，若各吃满额风险，
+                  合计敞口是 `sizing.risk_pct` 的 3 倍（生产 10.10% → 30.30%）。
+                  系数由 `engulf.risk_scale_for(kind)` 唯一决定，
+                  这里**不许**自己再写一遍判据。
 
         ★★ 唯一口径是 `sizing.plan_position()` —— 我不是"参考"它，是把
           判定权完全交给它。这里只额外做**交易所规格**那一层（步长取整、
@@ -4950,6 +4974,11 @@ class DecisionEngine:
         """
         entry = float(entry or 0.0)
         stop = float(stop or 0.0)
+        # ★ 风险系数**先校验**：0 或负数会让 `R / (风险距离 x scale)` 变成
+        #   inf 或负数，而那是"下了一张天上掉下来的单"。宁可当场拒。
+        _scale = float(risk_scale)
+        if not (_scale > 0):
+            return 0.0, "风险系数非法：%r（必须 > 0）" % (risk_scale,)
         if entry <= 0 or stop <= 0:
             return 0.0, "计划缺少入场价或止损价（entry=%r stop=%r）" % (entry, stop)
         stop_frac = abs(entry - stop) / entry
@@ -4988,9 +5017,25 @@ class DecisionEngine:
 
         try:
             from .sizing import SizingConfig, plan_position
+            # ★★ `risk_scale` 必须缩**风险预算**（`risk_pct`），
+            #    绝不能去改传给 `plan_position()` 的止损距离。
+            #
+            #    为什么：`plan_position(cfg, stop_distance_pct)` 里那个
+            #    止损距离是**两个用途共用**的 —— 定仓（`notional = R / 止损%`）
+            #    和爆仓安全检查（「止损% 不得超过 d_max」「爆仓缓冲 >= 倍数」）。
+            #    拿它当缩仓旋钮，就等于告诉风控「这笔单的止损是 3 倍远」，
+            #    于是安全检查按 3.215% 判、超过 1.800% 上限 → 直接拒单。
+            #
+            #    ★ 这条踩过两次，两个方向都错了一遍：
+            #      · 写成 `risk_frac * _scale`（乘）：scale=1/3 时止损距离被
+            #        **压小**，手数反而**放大 3 倍**（保证金 465U → 1399.69U）。
+            #      · 写成 `risk_frac / _scale`（除）：手数对了，但误触爆仓闸。
+            #      正解是「风险小 3 倍，止损还是那个止损」—— 改 `risk_pct`。
+            #
+            #    系数 1.0 时 `risk_pct` 原样不变，行为与改前逐字一致。
             cfg = SizingConfig(
                 capital=float(params["sizing.capital"]),
-                risk_pct=float(params["sizing.risk_pct"]),
+                risk_pct=float(params["sizing.risk_pct"]) * _scale,
                 leverage=float(params["sizing.leverage"]),
                 # 保证金上限：与守卫同一份（默认 100% = 不额外截断）。
                 # 注意这不是“放宽”—— 它只在**风险定仓**路径上生效，
@@ -4999,6 +5044,8 @@ class DecisionEngine:
             # ★ 传入的是**含成本**的风险距离 —— 这才是真正会亏的那个量。
             #   计划层已把止损往里让出成本（d_max - cost），
             #   所以 risk_frac ≈ d_max，正好贴着爆仓安全上限，不会超。
+            #   ★ 这里必须传**真实**止损距离，不许再乘除任何系数 ——
+            #     缩仓已经由上面的 `risk_pct` 完成。
             pp = plan_position(cfg, risk_frac * 100.0)
         except Exception as e:
             return 0.0, "仓位参数不可用：%s" % str(e)[:120]
@@ -5077,6 +5124,12 @@ class DecisionEngine:
             reason=str(getattr(act, "reason", "") or ""),
             thesis_id=tid,
             bar_ts=int(getattr(act, "bar_ts", 0) or 0),
+            # ★ 风险系数按 **kind** 定（反包三档各 1/3）。
+            #   必须走 `engulf.risk_scale_for` 这个唯一来源，不许在这里
+            #   再写一遍 `1/3 if kind == ...` —— 那正是「同一事实两个来源」，
+            #   改一处忘一处时敞口会静默翻三倍。
+            meta={"risk_scale": _risk_scale_for(
+                getattr(thesis_obj, "kind", ""))},
         )
         # ctx 只承载"闸门之间要传递的数据"（手数），不放任何交易状态。
         ctx = {"qty": 0.0, "size_why": ""}
@@ -5146,9 +5199,12 @@ class DecisionEngine:
 
     async def _gate_pending_size(self, intent, ctx) -> Optional[GateResult]:
         """仓位闸：手数由 `_pending_size()` 唯一决定，这里只搬运结论。"""
+        # ★ 风险系数从 intent.meta 取（由 `_pending_place` 按 kind 写入）。
+        #   缺省 1.0 = 全额风险，与改前行为一致。
         qty, why = self._pending_size(
             intent.entry, intent.stop,
-            str(intent.order_type or "").upper())
+            str(intent.order_type or "").upper(),
+            risk_scale=float((intent.meta or {}).get("risk_scale", 1.0)))
         if qty <= 0:
             logger.warning("[挂单] %s 计划不可行，本次不挂单：%s",
                            intent.thesis_id, why)

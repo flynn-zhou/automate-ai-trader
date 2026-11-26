@@ -299,8 +299,10 @@ def _place_stub(place_ok):
     st._liq_src = ""
     st._sizing_params = lambda: None
     # 仓位计算绕开：本测试只关心「下单成败如何影响状态推进」
-    # 真实签名是 `_pending_size(price, stop, order_type, risk_scale=1.0) -> (qty, why)`
-    st._pending_size = lambda price, stop, otype, risk_scale=1.0: (0.01, "")
+    # 真实签名是
+    # `_pending_size(price, stop, order_type, risk_scale=1.0, min_qty=0.0) -> (qty, why)`
+    st._pending_size = lambda price, stop, otype, risk_scale=1.0, min_qty=0.0: (
+        0.01, "")
     return st
 
 

@@ -86,6 +86,72 @@ def _risk_scale_for(kind: Any) -> float:
     from . import engulf as _E
     return _E.risk_scale_for(kind)
 
+
+def _min_qty_for(kind: Any, capital: float) -> float:
+    """这笔计划的手数兜底（BTC）。唯一口径是 `sizing.min_order_qty()`。
+
+    ★ 档数从**风险系数反推**（`tranches = 1 / risk_scale`），不新增一个来源：
+
+      `engulf.RISK_SCALE` 的定义就是 `1 / len(TRANCHE_LEVELS)`，三档 → 1/3。
+      所以「分几档」这件事已经完整地编码在 `risk_scale` 里了。
+      再单独传一个 `tranches` 参数，就会出现「系数说 3 档、参数说 1 档」
+      这种自相矛盾的组合，而它不会报错，只会让兜底取错档位
+      （单笔 0.03 vs 三分档 0.015，差一倍）。
+
+    ★ 本金取**配置里的**本金（`sizing.capital`），不是实时权益。
+      兜底是「按本金比例跟随」的口径（用户原话），用权益会让同一笔单
+      在浮盈浮亏之间手数抖动。权益不足由保证金闸负责拦。
+    """
+    rs = _risk_scale_for(kind)
+    tranches = int(round(1.0 / rs)) if rs > 0 else 1
+    from .sizing import min_order_qty
+    return min_order_qty(float(capital or 0.0), max(1, tranches))
+
+
+def _max_risk_share(capital: float, risk_scale: float = 1.0) -> float:
+    """**这一档**分到的风险红线（U）。全额红线 × 风险系数。
+
+    ★ 为什么必须乘系数：红线是「一次开仓信号最多亏多少」的口径，
+      而反包一个信号挂三档。如果三档各按全额红线，
+      单次信号的风险上限就变成 3 × 20 = 60U，把用户的红线放大三倍。
+
+      三档时系数 1/3 → 每档 6.67U，合计 20U，与单笔口径一致。
+
+    ★ 为什么抽成独立函数：它原来是 `_pending_size()` 里的一行内联除法
+      `_max_risk_for(capital / _scale)`。内联写法在变异测试里没法定位 ——
+      改坏了要跑整个引擎才发现，而这条路径需要真实 DB 参数才跑得起来。
+      抽出来之后是一个纯函数，可以直接断言。
+    """
+    from .sizing import max_risk_usd
+    return max_risk_usd(float(capital or 0.0)) * float(risk_scale or 1.0)
+
+
+def _capital_or_zero(engine: Any) -> float:
+    """安全读配置本金；读不到返回 0（= 不兜底、不设红线）。
+
+    ★ 为什么不用 `engine._sizing_params()` 直接取：
+
+      这是 `_pending_place()` —— **真正下单那条路**。它不该因为「读配置失败」
+      而抛异常。抛了会变成 `pending_action_error`，动作不算已执行，
+      下一次又重试，每轮刷一条 ERROR 却永远恢复不了。
+
+      退化成 0 是**安全**的：兜底消失 → 手数回到纯风险定仓，
+      而风险定仓自己会因为读不到参数而拒绝开仓（`_pending_size` 里
+      有 `params is None` 那条分支）。也就是说「读不到配置」最终仍然是
+      「不开仓」，只是从「抛异常」变成「干净地拒」。
+
+    ★ 也不能写 `getattr(engine, "_sizing_params", None)` 然后假定返回值是
+      dict —— 它返回 None 表示读不到，`.get()` 会再抛一次。
+    """
+    try:
+        fn = getattr(engine, "_sizing_params", None)
+        if not callable(fn):
+            return 0.0
+        p = fn() or {}
+        return float(p.get("sizing.capital", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
 #: 人工仓在交易所侧那张保护性止损单的 clientOrderId 前缀。
 #:
 #: ★ A1（2026-11-25 交易域审查）：这张单是**进程外的第二道保护**。
@@ -4933,7 +4999,8 @@ class DecisionEngine:
 
     def _pending_size(self, entry: float, stop: float,
                       order_type: str = "",
-                      risk_scale: float = 1.0) -> Tuple[float, str]:
+                      risk_scale: float = 1.0,
+                      min_qty: float = 0.0) -> Tuple[float, str]:
         """按**项目已定的仓位口径**算一笔挂单的手数。返回 ``(qty, 拒绝理由)``。
 
         Args:
@@ -4942,6 +5009,10 @@ class DecisionEngine:
                   合计敞口是 `sizing.risk_pct` 的 3 倍（生产 10.10% → 30.30%）。
                   系数由 `engulf.risk_scale_for(kind)` 唯一决定，
                   这里**不许**自己再写一遍判据。
+            min_qty: 手数兜底（BTC）。0 = 不兜底。
+                ★ 由 `sizing.min_order_qty(capital, tranches)` 唯一决定，
+                  按本金比例跟随（100U → 单笔 0.03 / 三档各 0.015）。
+                  **不在这里算** —— 兜底是仓位口径的一部分，必须和定仓同源。
 
         ★★ 唯一口径是 `sizing.plan_position()` —— 我不是"参考"它，是把
           判定权完全交给它。这里只额外做**交易所规格**那一层（步长取整、
@@ -5046,9 +5117,34 @@ class DecisionEngine:
             #   所以 risk_frac ≈ d_max，正好贴着爆仓安全上限，不会超。
             #   ★ 这里必须传**真实**止损距离，不许再乘除任何系数 ——
             #     缩仓已经由上面的 `risk_pct` 完成。
-            pp = plan_position(cfg, risk_frac * 100.0)
+            #
+            # ★★ 手数兜底也在这里一次性算完（`plan_position` 内部完成取整与
+            #    保证金复查），因为兜底会**改变实际风险**，必须和定仓同源。
+            #    以前这里是 `int(notional/entry/step)*step` 自己取整的，
+            #    那样兜底就得多写一份取整逻辑 —— 两份逻辑迟早漂移。
+            step_now = float(self._qty_step() or 0.0)
+            pp = plan_position(cfg, risk_frac * 100.0,
+                               price=entry, qty_step=step_now,
+                               min_qty=float(min_qty or 0.0),
+                               max_risk=_max_risk_share(
+                                   float(cfg.capital), _scale))
         except Exception as e:
             return 0.0, "仓位参数不可用：%s" % str(e)[:120]
+
+        # ★★ 兜底使实际风险超过设定 R 时，必须**留下痕迹**。
+        #
+        #   用户 2026-11-26 明确要求「小于则取兜底」，所以这里不拒绝 ——
+        #   但兜底是**体验**要求（0.01 手没感觉），R 是**风险**要求。
+        #   两者冲突时选择兜底，就必须让看日志的人知道这一笔真亏的比配置多，
+        #   否则「单笔风险 20U」会变成一句假的承诺（实测三引线会到 28.2U）。
+        _risk_cfg = float(cfg.capital) * float(cfg.risk_pct) / 100.0
+        if pp.floor_applied and pp.risk_at_floor > _risk_cfg + 1e-9:
+            logger.warning(
+                "[仓位] 兜底使实际风险 %.1fU > 设定 R %.1fU（手数 %.4f 来自兜底）："
+                "止损 %.3f%% 太窄，风险定仓只给出 %.4f",
+                pp.risk_at_floor, _risk_cfg, pp.qty,
+                float(pp.stop_distance_pct),
+                (float(pp.notional) / entry) if entry else 0.0)
 
         # ★ 判定权在 plan_position：它说不行就是不行，这里不许"夹一下再说"。
         if not pp.ok:
@@ -5061,8 +5157,12 @@ class DecisionEngine:
         step = float(self._qty_step() or 0.0)
         if step <= 0:
             return 0.0, "步长为 0，无法取整"
-        lots = int(notional / entry / step)
-        qty = round(lots * step, 10)
+        # ★ 手数**直接用 plan_position 的结论**，这里不再自己取整。
+        #   以前这一段是 `int(notional/entry/step)*step` —— 那是「同一件事
+        #   两个来源」：兜底在 plan_position 里做、取整在这里做，
+        #   两份逻辑一漂移，就会出现「算出来的手数」和「挂出去的手数」不一致，
+        #   而且不报错。
+        qty = round(float(pp.qty), 10)
         if qty <= 0:
             return 0.0, ("取整后为 0（名义 %.2fU / 价 %.1f / 步长 %r）"
                          % (notional, entry, step))
@@ -5070,11 +5170,9 @@ class DecisionEngine:
         if real_notional < self._min_notional():
             return 0.0, ("取整后名义 %.2fU 低于最小下单 %.2fU"
                          % (real_notional, self._min_notional()))
-        # 取整只会变小，所以保证金不会反而超限；这里只是把数字带出去记账。
+        # ★ 名义与保证金一律按**实际手数**重算并回报，不用 pp 里按风险倒推的
+        #   那个数 —— 兜底生效时两者不再相等，用旧数会把账记错。
         margin = real_notional / max(float(cfg.leverage), 1e-9)
-        if margin > pp.margin + 1e-9:      # pragma: no cover - 防御性
-            return 0.0, "取整后保证金 %.2fU 反而超过 %.2fU（取整方向错了）" % (
-                margin, pp.margin)
         return qty, ""
 
     async def _pending_place(self, act, thesis_obj) -> bool:
@@ -5128,8 +5226,16 @@ class DecisionEngine:
             #   必须走 `engulf.risk_scale_for` 这个唯一来源，不许在这里
             #   再写一遍 `1/3 if kind == ...` —— 那正是「同一事实两个来源」，
             #   改一处忘一处时敞口会静默翻三倍。
+            #
+            # ★ 手数兜底按 **kind + 配置本金** 定（100U 时单笔 0.03 /
+            #   三分档各 0.01，按本金等比缩放）。档数由风险系数反推。
+            #   ★ `_capital_or_zero` 而不是直接 `_sizing_params()`：这是
+            #     下单路径，读配置失败要退化成「不兜底」，不能抛异常。
             meta={"risk_scale": _risk_scale_for(
-                getattr(thesis_obj, "kind", ""))},
+                getattr(thesis_obj, "kind", "")),
+                "min_qty": _min_qty_for(
+                    getattr(thesis_obj, "kind", ""),
+                    _capital_or_zero(self))},
         )
         # ctx 只承载"闸门之间要传递的数据"（手数），不放任何交易状态。
         ctx = {"qty": 0.0, "size_why": ""}
@@ -5199,12 +5305,14 @@ class DecisionEngine:
 
     async def _gate_pending_size(self, intent, ctx) -> Optional[GateResult]:
         """仓位闸：手数由 `_pending_size()` 唯一决定，这里只搬运结论。"""
-        # ★ 风险系数从 intent.meta 取（由 `_pending_place` 按 kind 写入）。
-        #   缺省 1.0 = 全额风险，与改前行为一致。
+        # ★ 风险系数与手数兜底都从 intent.meta 取（由 `_pending_place` 按
+        #   kind 与本金写入）。缺省 1.0 / 0.0 = 与改前行为一致。
+        _meta = intent.meta or {}
         qty, why = self._pending_size(
             intent.entry, intent.stop,
             str(intent.order_type or "").upper(),
-            risk_scale=float((intent.meta or {}).get("risk_scale", 1.0)))
+            risk_scale=float(_meta.get("risk_scale", 1.0)),
+            min_qty=float(_meta.get("min_qty", 0.0) or 0.0))
         if qty <= 0:
             logger.warning("[挂单] %s 计划不可行，本次不挂单：%s",
                            intent.thesis_id, why)

@@ -38,6 +38,12 @@ TARGET = os.path.join(ROOT, "ai_trader", "trading", "engulf.py")
 ENGINE = os.path.join(ROOT, "ai_trader", "trading", "engine.py")
 PENDING = os.path.join(ROOT, "ai_trader", "trading", "pending_plan.py")
 TESTS = os.path.join(ROOT, "tests", "test_engulf.py")
+#: 手数兜底相关的测试在另一个文件里 —— 变异体改的是 `sizing.py` / 兜底常量，
+#: 那一侧的断言在 `test_sizing_migrated.py`。两个文件**都要跑**：
+#: 只跑 test_engulf 的话，兜底的变异体会全部「存活」，而那不是测试盲区，
+#: 是跑错了文件。
+TESTS_EXTRA = os.path.join(ROOT, "tests", "test_sizing_migrated.py")
+SIZING = os.path.join(ROOT, "ai_trader", "trading", "sizing.py")
 
 #: (名字, 目标文件, 原文, 替换, 说明, 是否等价变异体)
 #:
@@ -120,8 +126,8 @@ MUTANTS = [
      '        plan.direction, plan.kind, plan.bar_ts)',
      "三档撞成同一个 thesis_id → 落库互相覆盖，下三档只剩一条"),
     ("仓位闸忽略risk_scale", ENGINE,
-     'risk_scale=float((intent.meta or {}).get("risk_scale", 1.0)))',
-     "risk_scale=1.0)",
+     'risk_scale=float(_meta.get("risk_scale", 1.0)),',
+     "risk_scale=1.0,",
      "闸门不透传系数 → 三档各吃满额风险"),
     ("风险系数非法不拒绝", ENGINE,
      '        if not (_scale > 0):\n            return 0.0, "风险系数非法：%r（必须 > 0）" % (risk_scale,)',
@@ -132,13 +138,92 @@ MUTANTS = [
      'risk_pct=float(params["sizing.risk_pct"]),',
      "系数传进来了但没用 → 分摊形同虚设"),
     ("缩仓改成放大止损距离", ENGINE,
-     "pp = plan_position(cfg, risk_frac * 100.0)",
-     "pp = plan_position(cfg, risk_frac * 100.0 / _scale)",
+     "pp = plan_position(cfg, risk_frac * 100.0,",
+     "pp = plan_position(cfg, risk_frac * 100.0 / _scale,",
      "拿爆仓检查共用的止损距离当缩仓旋钮 → 误触「止损超上限」拒单"),
     ("缩仓方向写反", ENGINE,
-     "pp = plan_position(cfg, risk_frac * 100.0)",
-     "pp = plan_position(cfg, risk_frac * 100.0 * _scale)",
+     "pp = plan_position(cfg, risk_frac * 100.0,",
+     "pp = plan_position(cfg, risk_frac * 100.0 * _scale,",
      "乘而不是除 → scale=1/3 时手数反而放大 3 倍（实测踩过）"),
+
+    # ---------------- 手数兜底（2026-11-26） ----------------
+    # ★ 这一组的共同点是：**不报错，只是手数不对**。
+    #   兜底写错不会崩、不会拒单，只会让用户看到的手数回到 0.007 那种
+    #   「完全没感觉」的量级，或者反过来把亏损放大到超过红线。
+    ("兜底_单笔档取成三档值", SIZING,
+     "per = (MIN_QTY_PER_100U if int(tranches) > 1 else MIN_QTY_SINGLE_PER_100U)",
+     "per = MIN_QTY_PER_100U",
+     "单笔也按 0.01 兜底 → 单笔仓位比用户要求的 0.03 小三分之二"),
+    ("兜底_三档取成单笔值", SIZING,
+     "per = (MIN_QTY_PER_100U if int(tranches) > 1 else MIN_QTY_SINGLE_PER_100U)",
+     "per = MIN_QTY_SINGLE_PER_100U",
+     "三档各按 0.03 → 单次信号合计 0.09 手，是用户口径的 3 倍"),
+    ("兜底_不按本金缩放", SIZING,
+     "return float(per) * cap / 100.0",
+     "return float(per)",
+     "200U 本金仍给 0.01 → 「跟随倍数变化」失效，仓位相对缩水一半"),
+    ("兜底_本金为零也返回正值", SIZING,
+     "    if cap <= 0:\n        return 0.0\n    per =",
+     "    if cap < 0:\n        return 0.0\n    per =",
+     "本金为 0 时算出正手数 → 空账户也能下单", True),
+    # ↑ 等价变异体：cap=0 时 `float(per) * 0 / 100.0` 本身就是 0.0，
+    #   和提前 return 0.0 完全一样，任何测试都抓不到。留着是为了说明
+    #   「这道闸真正防的是负数」，而不是假装它是个被覆盖的分支。
+    ("风险红线_不按本金缩放", SIZING,
+     "return float(MAX_RISK_PER_SIGNAL_PER_100U) * cap / 100.0",
+     "return float(MAX_RISK_PER_SIGNAL_PER_100U)",
+     "200U 本金仍只允许亏 20U → 红线相对收紧一半，大仓永远挂不出"),
+    ("风险红线_完全不生效", SIZING,
+     "        if max_risk and max_risk > 0 and risk_per_unit > 0:",
+     "        if False:",
+     "兜底不受红线约束 → 三引线 0.03 手实亏 28.3U，顶穿用户 20U 上限"
+     "（实测就是这个数）"),
+    ("兜底_向下取整到步长", SIZING,
+     "qty_floor = math.ceil(float(min_qty) / step - 1e-9) * step",
+     "qty_floor = math.floor(float(min_qty) / step + 1e-9) * step",
+     "兜底往下取整 → 0.01 兜底变成 0.008，失去兜底意义"),
+    ("兜底_算出来但不采用", SIZING,
+     "            if qty_floor > qty_risk:\n                qty = qty_floor",
+     "            if qty_floor > qty_risk:\n                qty = qty_risk",
+     "兜底算完又丢回风险定仓 → 手数纹丝不动，兜底形同虚设"),
+    ("风险红线_只管兜底不管风险定仓", SIZING,
+     "        if qty_cap is not None and qty_risk > qty_cap:\n"
+     "            qty_risk = qty_cap",
+     "        if False:\n            qty_risk = qty_cap",
+     "红线只压兜底、不压风险定仓 → 把 risk_pct 调到 30 就能亏 30U，"
+     "「最多损失 20U」成空话"),
+    ("兜底_不复查保证金", SIZING,
+     "    if margin_checked > d.margin_cap_amount:",
+     "    if False:",
+     "兜底顶穿保证金上限也不拒单 → 下单必然 -2019，且每轮重试刷 ERROR"),
+    ("兜底_风险按名义而不是按止损距离算", SIZING,
+     "risk_at_floor = qty * price * (stop_distance_pct / 100.0)",
+     "risk_at_floor = qty * price",
+     "把名义当成风险 → 账面上永远是天文数字，日志失去意义"),
+    ("引擎_红线不按档摊", ENGINE,
+     "return max_risk_usd(float(capital or 0.0)) * float(risk_scale or 1.0)",
+     "return max_risk_usd(float(capital or 0.0))",
+     "三档各吃全额 20U 红线 → 单次信号上限被放大成 60U"),
+    ("引擎_兜底不按kind分档", ENGINE,
+     "tranches = int(round(1.0 / rs)) if rs > 0 else 1",
+     "tranches = 1",
+     "永远按单笔兜底 → 反包三档各 0.03 手，合计 0.09，是口径的 3 倍"),
+    ("引擎_兜底不传下去", ENGINE,
+     "                \"min_qty\": _min_qty_for(\n"
+     "                    getattr(thesis_obj, \"kind\", \"\"),\n"
+     "                    _capital_or_zero(self))},",
+     "                \"min_qty\": 0.0},",
+     "兜底算出来了但没传进仓位闸 → 手数回到 0.007 量级，改了个寂寞"),
+    ("引擎_读配置失败就炸", ENGINE,
+     "        p = fn() or {}\n        return float(p.get(\"sizing.capital\", 0.0) or 0.0)\n"
+     "    except Exception:\n        return 0.0",
+     "        p = fn() or {}\n        return float(p.get(\"sizing.capital\", 0.0) or 0.0)\n"
+     "    except Exception:\n        raise",
+     "下单路径读配置失败抛异常 → 每轮 ERROR 且永远不恢复（实测踩过）"),
+    ("引擎_取整又用回自己那份", ENGINE,
+     "qty = round(float(pp.qty), 10)",
+     "qty = round(int(notional / entry / step) * step, 10)",
+     "绕开 plan_position 的兜底自己取整 → 两份逻辑漂移，兜底静默失效"),
 ]
 
 
@@ -159,7 +244,8 @@ def _run_tests():
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     p = subprocess.run(
-        [sys.executable, "-m", "pytest", TESTS, "-q", "--no-header", "-x"],
+        [sys.executable, "-m", "pytest", TESTS, TESTS_EXTRA,
+         "-q", "--no-header", "-x"],
         cwd=ROOT, env=env, capture_output=True,
         encoding="utf-8", errors="replace")
     return p.returncode, (p.stdout or "") + (p.stderr or "")

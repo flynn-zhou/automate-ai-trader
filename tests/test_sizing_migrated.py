@@ -9,9 +9,14 @@ import pytest
 from ai_trader.trading.sizing import (
     SessionConfig,
     SizingConfig,
+    MAX_RISK_PER_SIGNAL_PER_100U,
+    MIN_QTY_PER_100U,
+    MIN_QTY_SINGLE_PER_100U,
     default_session_windows,
     derive,
     in_trade_window,
+    max_risk_usd,
+    min_order_qty,
     plan_position,
     session_label,
 )
@@ -186,3 +191,171 @@ def test_session_label_mentions_sunday_noon():
     label = session_label(SessionConfig())
     assert "周日 12:00-24:00" in label
     assert "周五 关闭" in label
+
+
+# ================================================================ 手数兜底
+# 用户 2026-11-26 口径：「每次挂单至少 0.01(改后)，也就是一次开单分三次至少
+# 0.03，不分三次至少 0.03，这是 100U 总保证金的情况下，后面变成 200U 的时候
+# 跟随倍数变化」+ 「我是能接受一次开仓信号最多损失 20U 的」。
+#
+# 这一组测试守两件事：
+#   1. 兜底确实按本金比例缩放（改本金就跟着改，不用改代码）
+#   2. 兜底**不能顶穿红线** —— 风险上限优先于兜底
+# 第 2 条是这次改动里最容易做错的地方：兜底让手数变大 = 真亏更多，
+# 如果不设上限，三引线 0.03 手会亏 28.3U，超过用户说的 20U。
+
+
+def test_兜底按本金比例缩放():
+    """100U -> 0.01/0.03；200U -> 0.02/0.06。『跟随倍数变化』就是这个。"""
+    assert min_order_qty(100.0, 3) == pytest.approx(MIN_QTY_PER_100U)
+    assert min_order_qty(100.0, 1) == pytest.approx(MIN_QTY_SINGLE_PER_100U)
+    assert min_order_qty(200.0, 3) == pytest.approx(MIN_QTY_PER_100U * 2)
+    assert min_order_qty(200.0, 1) == pytest.approx(MIN_QTY_SINGLE_PER_100U * 2)
+    assert min_order_qty(50.0, 3) == pytest.approx(MIN_QTY_PER_100U * 0.5)
+
+
+def test_兜底_三档合计等于单笔():
+    """用户最终口径：分三次 0.03 = 不分三次 0.03。
+
+    ★ 这两个数是**两条独立规则**碰到一起的巧合，不是 `3 * 0.01` 推出来的。
+      所以这里断言的是「碰巧相等」这个事实；一旦有人把单笔兜底调成 0.02，
+      这个断言会红，提醒他「用户口径变了，去确认」。
+    """
+    assert 3 * min_order_qty(100.0, 3) == pytest.approx(min_order_qty(100.0, 1))
+
+
+def test_本金非正时兜底为零():
+    assert min_order_qty(0.0, 3) == 0.0
+    assert min_order_qty(-5.0, 3) == 0.0
+    assert max_risk_usd(0.0) == 0.0
+
+
+def test_风险红线按本金比例缩放():
+    assert max_risk_usd(100.0) == pytest.approx(MAX_RISK_PER_SIGNAL_PER_100U)
+    assert max_risk_usd(200.0) == pytest.approx(MAX_RISK_PER_SIGNAL_PER_100U * 2)
+
+
+def test_不给价格时手数为零且行为与改前一致():
+    """老调用方（只传止损距离）必须拿不到 qty，但 ok 判定不变。"""
+    cfg = SizingConfig(capital=100.0, risk_pct=5.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pp = plan_position(cfg, 1.0)
+    assert pp.qty == 0.0
+    assert pp.floor_applied is False
+    assert pp.ok is True
+
+
+def test_兜底会把小手数顶上来():
+    """三引线实况：风险定仓给 0.0084，兜底 0.03，但被红线压到 0.021。"""
+    cfg = SizingConfig(capital=100.0, risk_pct=8.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    # 不给红线：兜底原样生效
+    raw = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001,
+                        min_qty=min_order_qty(100.0, 1))
+    assert raw.qty == pytest.approx(0.030)
+    assert raw.floor_applied is True
+    assert raw.floor_capped is False
+    # 给了红线：兜底被压下来，实际风险不超 20U
+    capped = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001,
+                           min_qty=min_order_qty(100.0, 1),
+                           max_risk=max_risk_usd(100.0))
+    assert capped.qty == pytest.approx(0.021)
+    assert capped.floor_capped is True
+    assert capped.risk_at_floor <= max_risk_usd(100.0)
+
+
+def test_兜底被红线压住时手数仍然大于纯风险定仓():
+    """压下来的兜底不能压到比风险定仓还小 —— 那就成了「反向兜底」。"""
+    cfg = SizingConfig(capital=100.0, risk_pct=8.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pure = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001)
+    capped = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001,
+                           min_qty=min_order_qty(100.0, 1),
+                           max_risk=max_risk_usd(100.0))
+    assert capped.qty >= pure.qty
+
+
+def test_风险定仓已够大时兜底不生效():
+    """反包第 3 档实况：风险定仓 0.014 > 兜底 0.01，不该被兜底改小。"""
+    cfg = SizingConfig(capital=100.0, risk_pct=8.0 / 3.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pp = plan_position(cfg, 0.2263, price=60577.0, qty_step=0.001,
+                       min_qty=min_order_qty(100.0, 3),
+                       max_risk=max_risk_usd(100.0) / 3.0)
+    assert pp.floor_applied is False
+    assert pp.qty == pytest.approx(0.014)
+
+
+def test_兜底不会把保证金上限顶掉():
+    """兜底是体验要求，保证金是物理约束 —— 物理约束必须赢。
+
+    ★ 构造要点：兜底**本身随本金缩放**，所以在 22x / 60000 下它只占本金
+      约 82%（`0.0003 x 60000 / 22`），怎么调都顶不穿上限 100%。
+      要真正压出冲突，必须让「同样的手数」需要更多保证金 —— 抬高价格。
+
+    构造：本金 50U、价格 100000、止损 1%（风险定仓只给 0.002 手）、
+    兜底 0.015 手 -> 保证金 0.015 x 100000 / 22 = 68.2U > 上限 50U。
+    预期：拒单并写明「保证金」，而不是让兜底把上限顶掉。
+    """
+    cfg = SizingConfig(capital=50.0, risk_pct=5.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pp = plan_position(cfg, 1.0, price=100000.0, qty_step=0.001,
+                       min_qty=min_order_qty(50.0, 1))
+    assert pp.floor_applied is True
+    assert pp.margin > derive(cfg).margin_cap_amount
+    assert pp.ok is False
+    assert any("保证金" in r for r in pp.reasons)
+
+
+def test_兜底的risk_at_floor是真亏的钱():
+    """`risk_at_floor` 必须等于 手数 x 价 x 止损%，不是预算里的那个 R。"""
+    cfg = SizingConfig(capital=100.0, risk_pct=8.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pp = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001,
+                       min_qty=min_order_qty(100.0, 1),
+                       max_risk=max_risk_usd(100.0))
+    expect = pp.qty * 60880.8 * 0.01547
+    assert pp.risk_at_floor == pytest.approx(expect, rel=1e-9)
+    # 而且它确实比风险预算(8U)大 —— 这正是需要打 WARNING 的那个差
+    assert pp.risk_at_floor > derive(cfg).risk_per_trade
+
+
+def test_兜底向上取整到步长():
+    """兜底落不到网格上时必须**向上**取 —— 往下取就失去兜底意义。"""
+    cfg = SizingConfig(capital=100.0, risk_pct=8.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    # 兜底 0.01，步长 0.004 -> 向上到 0.012（不是 0.008）
+    pp = plan_position(cfg, 1.547, price=60880.8, qty_step=0.004,
+                       min_qty=0.01)
+    assert pp.qty == pytest.approx(0.012)
+    assert pp.floor_applied is True
+
+
+def test_三档各十分之一本金时的红线也不超():
+    """三档必须把红线按档摊，否则三档各 20U 就是 60U。"""
+    per = max_risk_usd(100.0) / 3.0
+    assert per == pytest.approx(20.0 / 3.0)
+    cfg = SizingConfig(capital=100.0, risk_pct=8.0 / 3.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pp = plan_position(cfg, 0.2263, price=60577.0, qty_step=0.001,
+                       min_qty=min_order_qty(100.0, 3), max_risk=per)
+    assert pp.risk_at_floor <= per + 1e-9
+
+
+def test_红线是绝对上限_风险定仓也不许越():
+    """红线不能只压兜底。risk_pct 调到 30U 时，红线必须赢。
+
+    ★ 为什么必须有这条：如果红线只管兜底，那它就是「只在兜底时生效的
+      装饰品」—— 用户把 risk_pct 写成 30，照样亏 30U，而
+      「一次开仓信号最多损失 20U」变成了假承诺。
+    """
+    cfg = SizingConfig(capital=100.0, risk_pct=30.0, leverage=22.0,
+                       margin_cap_pct=100.0)
+    pp = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001,
+                       min_qty=0.0, max_risk=max_risk_usd(100.0))
+    assert pp.risk_at_floor <= max_risk_usd(100.0)
+    # 30U 预算下风险定仓本来要 0.031 手，被红线压到 0.021
+    pure = plan_position(cfg, 1.547, price=60880.8, qty_step=0.001)
+    assert pure.qty > pp.qty
+
+

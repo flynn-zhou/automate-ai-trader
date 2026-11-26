@@ -288,8 +288,10 @@ def _pending_engine_stub(can_open=True, place_err=""):
     st.tcfg = types.SimpleNamespace(symbol="BTCUSDT", strategy="pending")
     # 手数计算绕开（它需要完整 sizing 配置）；本测试验的是路由，不是 sizing。
     # ★ 签名必须跟着 `_pending_size()` 走 —— 它多了 `risk_scale`（反包三档
-    #   风险分摊用），桩不跟就会 TypeError，而那是**测试**错、不是代码错。
-    st._pending_size = lambda price, stop, otype, risk_scale=1.0: (0.01, "")
+    #   风险分摊）和 `min_qty`（手数兜底），桩不跟就会 TypeError，
+    #   而那是**测试**错、不是代码错。
+    st._pending_size = lambda price, stop, otype, risk_scale=1.0, min_qty=0.0: (
+        0.01, "")
 
     for name in ("_pending_place", "_pending_router",
                  "_gate_pending_unattended", "_gate_pending_size",

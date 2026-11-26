@@ -434,7 +434,7 @@ class TestEngineWiring:
 
         seen = {}
 
-        def fake_size(entry, stop, order_type="", risk_scale=1.0):
+        def fake_size(entry, stop, order_type="", risk_scale=1.0, min_qty=0.0):
             seen["risk_scale"] = risk_scale
             return 0.01, ""
 
@@ -452,7 +452,7 @@ class TestEngineWiring:
 
         seen = {}
 
-        def fake_size(entry, stop, order_type="", risk_scale=1.0):
+        def fake_size(entry, stop, order_type="", risk_scale=1.0, min_qty=0.0):
             seen["risk_scale"] = risk_scale
             return 0.01, ""
 
@@ -499,3 +499,210 @@ class TestEngineWiring:
         assert third < full
         # 步长取整会带来微小偏差，1/3 落在 0.3~0.36 之间即算正确
         assert 0.30 <= third / full <= 0.36
+
+    # ---------------- 手数兜底（2026-11-26） ----------------
+    # ★ 这一组守的是「兜底有没有真的接进引擎」。
+    #   只测 `sizing.min_order_qty()` 是不够的：算得再对手数没传下去，
+    #   生产上看到的仍然是 0.0074 那种「完全没感觉」的仓位。
+    #   变异测试实测：`"min_qty": _min_qty_for(...)` 改成 `0.0` 时，
+    #   没有这一组测试就会**存活**。
+
+    def test_min_qty_for按kind分档(self):
+        """反包按三档摊（各 0.01），其他形态按单笔（0.03）。"""
+        from ai_trader.trading import engine as ENG
+        from ai_trader.trading import engulf as E
+
+        assert ENG._min_qty_for(E.KIND_ENGULF, 100.0) == pytest.approx(0.010)
+        assert ENG._min_qty_for("上涨三引线假突破限价单", 100.0) == pytest.approx(
+            0.030)
+
+    def test_min_qty_for按本金缩放(self):
+        """200U 本金时兜底翻倍 —— 用户「跟随倍数变化」。"""
+        from ai_trader.trading import engine as ENG
+        from ai_trader.trading import engulf as E
+
+        assert ENG._min_qty_for(E.KIND_ENGULF, 200.0) == pytest.approx(0.020)
+        assert ENG._min_qty_for("其他形态", 200.0) == pytest.approx(0.060)
+
+    def test_min_qty_for本金读不到时不兜底(self):
+        """本金未知 → 兜底 0（安全退化），而不是瞎给一个数。"""
+        from ai_trader.trading import engine as ENG
+        from ai_trader.trading import engulf as E
+
+        assert ENG._min_qty_for(E.KIND_ENGULF, 0.0) == 0.0
+
+    # ---------------- 下单路径读配置失败必须退化，不能抛 ----------------
+    # ★ 为什么单独测 `_capital_or_zero`：它是 `_pending_place()` —— **真正
+    #   下单那条路**上的调用。抛异常会变成 `pending_action_error`，
+    #   动作不算已执行 → 下一轮重试 → 又抛 → 每轮一行 ERROR 永不恢复。
+    #   2026-11-25 的 -2019 事故就是这个形态（不是抛，但同样是「每轮刷错、
+    #   永不恢复」）。变异测试实测：把 `return 0.0` 改成 `raise` 会存活。
+
+    def test_capital_or_zero_读不到返回零(self):
+        from ai_trader.trading import engine as ENG
+
+        assert ENG._capital_or_zero(types.SimpleNamespace()) == 0.0
+        assert ENG._capital_or_zero(
+            types.SimpleNamespace(_sizing_params=lambda: None)) == 0.0
+
+    def test_capital_or_zero_读配置抛异常也不炸(self):
+        from ai_trader.trading import engine as ENG
+
+        def boom():
+            raise RuntimeError("settings.db locked")
+
+        assert ENG._capital_or_zero(
+            types.SimpleNamespace(_sizing_params=boom)) == 0.0
+
+    def test_capital_or_zero_多余字段不影响(self):
+        from ai_trader.trading import engine as ENG
+
+        st = types.SimpleNamespace(
+            _sizing_params=lambda: {"sizing.capital": "150.5",
+                                    "sizing.risk_pct": 8.0})
+        assert ENG._capital_or_zero(st) == pytest.approx(150.5)
+
+    # ---------------- meta 真的写进了 intent ----------------
+    # ★ 这一条守的是「兜底算出来了有没有传下去」。只测 `_min_qty_for()` 和
+    #   `_gate_pending_size()` 两头都对，中间的 `_pending_place()` 若把
+    #   `"min_qty": ...` 写成 `0.0`，生产上手数就回到 0.007 量级而测试全绿。
+    #   变异测试实测存活过这一处。
+
+    def test_下单时把min_qty写进intent的meta(self):
+        """反包 kind、本金 100U → meta["min_qty"] 必须是 0.01。"""
+        import asyncio
+        from ai_trader.trading import engine as ENG
+        from ai_trader.trading import engulf as E
+
+        seen = {}
+
+        class _Router:
+            async def route(self, intent, ctx):
+                seen["meta"] = dict(intent.meta or {})
+                ctx["qty"] = 0.01
+                return types.SimpleNamespace(placed=True)
+
+        st = types.SimpleNamespace(
+            tcfg=types.SimpleNamespace(strategy="pending"),
+            _sizing_params=lambda: {"sizing.capital": 100.0},
+            _pending_router=lambda: _Router())
+        act = types.SimpleNamespace(
+            kind="place_order", thesis_id="t1", reason="thesis_armed",
+            price=60500.0, side="buy", order_type="LIMIT",
+            bar_ts=1795000000000)
+        thesis = types.SimpleNamespace(
+            order_price=60500.0, stop_price=60400.0, target_price=60800.0,
+            kind=E.KIND_ENGULF)
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            ENG.DecisionEngine._pending_place(st, act, thesis))
+        assert seen["meta"]["min_qty"] == pytest.approx(0.010)
+        assert seen["meta"]["risk_scale"] == pytest.approx(1.0 / 3.0)
+
+    def test_下单时其他形态用单笔兜底(self):
+        """非反包 kind、本金 100U → meta["min_qty"] 必须是 0.03。"""
+        import asyncio
+        from ai_trader.trading import engine as ENG
+
+        seen = {}
+
+        class _Router:
+            async def route(self, intent, ctx):
+                seen["meta"] = dict(intent.meta or {})
+                ctx["qty"] = 0.03
+                return types.SimpleNamespace(placed=True)
+
+        st = types.SimpleNamespace(
+            tcfg=types.SimpleNamespace(strategy="pending"),
+            _sizing_params=lambda: {"sizing.capital": 100.0},
+            _pending_router=lambda: _Router())
+        act = types.SimpleNamespace(
+            kind="place_order", thesis_id="t1", reason="thesis_armed",
+            price=60500.0, side="buy", order_type="LIMIT",
+            bar_ts=1795000000000)
+        thesis = types.SimpleNamespace(
+            order_price=60500.0, stop_price=60400.0, target_price=60800.0,
+            kind="上涨三引线假突破限价单")
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            ENG.DecisionEngine._pending_place(st, act, thesis))
+        assert seen["meta"]["min_qty"] == pytest.approx(0.030)
+        assert seen["meta"]["risk_scale"] == pytest.approx(1.0)
+
+    def test_风险红线按档摊(self):
+        """三档各 20/3，不是各 20 —— 否则单次信号上限被放大 3 倍。"""
+        from ai_trader.trading import engine as ENG
+
+        assert ENG._max_risk_share(100.0, 1.0) == pytest.approx(20.0)
+        assert ENG._max_risk_share(100.0, 1.0 / 3.0) == pytest.approx(20.0 / 3.0)
+        assert ENG._max_risk_share(200.0, 1.0) == pytest.approx(40.0)
+
+    def test_仓位闸把min_qty透传给_pending_size(self):
+        """`_pending_size` 必须收到 meta 里的 min_qty，否则兜底接不上。"""
+        import asyncio
+        from ai_trader.trading import engine as ENG
+
+        seen = {}
+
+        def fake_size(entry, stop, order_type="", risk_scale=1.0, min_qty=0.0):
+            seen["min_qty"] = min_qty
+            seen["risk_scale"] = risk_scale
+            return 0.02, ""
+
+        st = types.SimpleNamespace(_pending_size=fake_size)
+        intent = types.SimpleNamespace(
+            entry=60000.0, stop=59700.0, order_type="LIMIT",
+            meta={"risk_scale": 1.0 / 3.0, "min_qty": 0.01})
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            ENG.DecisionEngine._gate_pending_size(st, intent, {}))
+        assert seen["min_qty"] == pytest.approx(0.01)
+        assert seen["risk_scale"] == pytest.approx(1.0 / 3.0)
+
+    def test_没有min_qty时缺省不兜底(self):
+        """旧 meta（没有 min_qty）必须退化成「不兜底」，行为与改前一致。"""
+        import asyncio
+        from ai_trader.trading import engine as ENG
+
+        seen = {}
+
+        def fake_size(entry, stop, order_type="", risk_scale=1.0, min_qty=0.0):
+            seen["min_qty"] = min_qty
+            return 0.02, ""
+
+        st = types.SimpleNamespace(_pending_size=fake_size)
+        intent = types.SimpleNamespace(
+            entry=60000.0, stop=59700.0, order_type="LIMIT", meta={})
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            ENG.DecisionEngine._gate_pending_size(st, intent, {}))
+        assert seen["min_qty"] == 0.0
+
+    def test_兜底真的把生产手数顶上来(self):
+        """★ 端到端：三引线实况下，兜底必须把 0.008 顶到 0.02 以上。
+
+        用真实 `plan_position` 跑：本金 100U、风险 8U、22x、
+        止损 1.547%（三引线实测值）、步长 0.001。
+        无兜底时手数 ≈ 0.0084（用户「完全没感觉」的量级）；
+        有兜底 + 红线时必须是 0.02 左右且实际风险不超 20U。
+        """
+        from ai_trader.trading import engine as ENG
+
+        st = types.SimpleNamespace(
+            _sizing_params=lambda: {
+                "sizing.capital": 100.0, "sizing.risk_pct": 8.0,
+                "sizing.leverage": 22.0,
+                "sizing.margin_cap_pct": 100.0},
+            _qty_step=lambda: 0.001,
+            _min_notional=lambda: 5.0)
+
+        bare, why = ENG.DecisionEngine._pending_size(
+            st, 60880.8, 61822.35, "LIMIT", risk_scale=1.0, min_qty=0.0)
+        assert bare > 0, why
+        assert bare < 0.01           # 纯风险定仓：用户嫌弃的那个量级
+
+        floored, why = ENG.DecisionEngine._pending_size(
+            st, 60880.8, 61822.35, "LIMIT", risk_scale=1.0,
+            min_qty=ENG._min_qty_for("三引线", 100.0))
+        assert floored > 0, why
+        assert floored > bare * 2     # 至少翻倍，否则兜底没意义
+        # 用真实手数复算风险，必须落在用户红线下
+        risk = floored * 60880.8 * 0.01547
+        assert risk <= ENG._max_risk_share(100.0, 1.0) + 1e-6
+

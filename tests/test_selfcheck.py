@@ -41,6 +41,9 @@ class FakePending(object):
     def __init__(self, rows=None):
         self.rows = list(rows or ())
         self.added = []
+        # ★ 2026-11-26：`_mark_cancelled` 走 `upsert_thesis`，
+        #   这里必须记录 —— 「落终态会不会抹掉锚点」正是要测的东西。
+        self.upserted = []
 
     def live(self, limit=200):
         return self.rows
@@ -49,6 +52,9 @@ class FakePending(object):
         self.added.append(row)
         self.rows.append(row)
         return True
+
+    def upsert_thesis(self, row):
+        self.upserted.append(dict(row))
 
 
 class FakeExecutor(object):
@@ -293,3 +299,40 @@ def test_fire_once_is_idempotent_across_two_calls(tmp_path):
     assert first["fired"] is True
     assert second["fired"] is False
     assert len(eng.placed) == 1
+
+
+def test_mark_cancelled_preserves_anchors():
+    """★★ 落终态是「改写状态」，**不是**「清空锚点」。
+
+    `upsert_thesis` 是 `ON CONFLICT DO UPDATE`，`row_of()` 没给的列会被
+    `excluded.<col>` 覆盖 —— **没传等于写成 0**。
+
+    `_mark_cancelled` 原来只传 next_index / armed_at_bar / armed_ref_close，
+    于是 `armed_at_sub_ts` / `armed_bar_ts` / `fill_bar_ts` 三个时间戳锚点
+    被静默抹成 0/None。
+
+    危害：这三个锚点是复盘「哪一根挂的单、哪一根成交的」的唯一记录，
+    FREEZE-1 那种永久冻结事故正是靠它们定出根因的 —— 而自检行
+    恰恰是最常被拿来复盘的行。
+    """
+    eng = FakeEngine()
+    row = {
+        "thesis_id": "selfcheck|x|1000|100000.0", "kind": "selfcheck",
+        "direction": T.UP, "family": T.FAMILY_REVERSAL,
+        "order_price": 100000.0, "stop_price": 99000.0,
+        "target_price": 102000.0, "order_type": T.ORDER_LIMIT,
+        "horizon_bars": 12, "stale_distance": 0.0, "surprise_pts": 0.0,
+        "bar_ts": 1000, "state": T.FILLED, "next_index": 7,
+        "armed_at_bar": 3, "armed_at_sub_ts": 1111,
+        "armed_bar_ts": 2222, "fill_bar_ts": 3333,
+        "armed_ref_close": 100500.0, "ambiguous": 0, "note": "",
+    }
+
+    SC._mark_cancelled(eng, row, closed_ok=True)
+
+    assert eng.pending.upserted, "落终态必须写库"
+    out = eng.pending.upserted[-1]
+    assert out["state"] == T.CANCELLED, "终态没落下"
+    assert out["armed_at_sub_ts"] == 1111, "子根锚点被抹掉了"
+    assert out["armed_bar_ts"] == 2222, "粗周期锚点被抹掉了"
+    assert out["fill_bar_ts"] == 3333, "成交锚点被抹掉了"

@@ -591,6 +591,16 @@ class RunResult:
     #:   必须跟着结果返回并落库 —— 它是增量推进的**游标**，丢了就等于
     #:   「每根都重新开始数容忍根数」，容忍窗口永远不到期。
     armed_at_sub_ts: Optional[int] = None
+    #: ★★ FREEZE-1（2026-11-26）：挂单那一刻**粗周期那根**的 open_time。
+    #:
+    #:   为什么不能只靠 `armed_at_bar`（数组下标）：粗粒度 arming 一定发生在
+    #:   「当前最新那根 15m 收盘」，所以 `armed_at_bar` 恒等于缓冲末尾下标。
+    #:   deque 每来一根新 K 整体左移，那个下标永远指向队尾 →
+    #:   成交守卫 `i <= armed_at_bar` **恒真**，之后的每根都被跳过，
+    #:   成交永远判不出来，状态机永久冻结在 ARMED，
+    #:   `_close_position`（止损/止盈/保本棘轮/恐慌盘/缩量停滞）一次都进不去。
+    #:   时间戳不随缓冲滑动而漂移，所以粗周期锚点也必须跟着结果返回并落库。
+    armed_bar_ts: Optional[int] = None
     #: 已经推进到第几根（下一次 `step` 从 `next_index` 接着跑）。
     next_index: int = 0
     #: ★ S5 棘轮游标：自成交以来**最有利**的价格已走到哪（做多=最高价，做空=最低价）。
@@ -601,6 +611,14 @@ class RunResult:
     best_favorable_px: Optional[float] = None
 
     fill_bar_ts: int = 0
+
+    #: ★★ FREEZE-1：本次推进**退回了会漂移的下标判据**（两条时间戳锚点都缺）。
+    #:
+    #:   本模块是纯函数、不持有 logger，所以痕迹只能走返回值。
+    #:   调用方（引擎）看到 True 必须记一条 risk 事件 —— 因为这种状态下
+    #:   状态机可能永久停在 ARMED，而「停住」和「没到条件」在日志里
+    #:   长得一模一样，正是这次事故拖了 7 小时才被发现的原因。
+    freeze_anchor_missing: bool = False
 
     @property
     def ambiguous_same_bar(self) -> int:
@@ -1105,6 +1123,11 @@ def run(thesis: Thesis,
     #:   实际是 36 根 5m = 3 小时，远超「几根」。
     #:   有值 = 这笔单的超期按细周期计（同时关掉粗周期那份计数，避免双记）。
     armed_at_sub_ts: Optional[int] = None
+    #: ★★ FREEZE-1：粗周期挂单锚点（挂单那根 15m 的 open_time）。
+    #:   与 `armed_at_bar` 的区别是它**不随缓冲滑动漂移**，见 RunResult 字段注释。
+    armed_bar_ts: Optional[int] = None
+    #: 「两条时间戳锚点都缺」只标记一次（本函数内标志，`run()` 没有 self）。
+    _freeze_warned = False
     _walked = max(0, int(start_at))
     # ★ 续跑：把上一次调用留下的两个「由历史派生」的值的接回来。
     #
@@ -1153,6 +1176,17 @@ def run(thesis: Thesis,
         armed_ref_close = float(_arc) if _arc is not None else None
         _ast = resume.get("armed_at_sub_ts")
         armed_at_sub_ts = int(_ast) if _ast is not None else None
+        _abt = resume.get("armed_bar_ts")
+        armed_bar_ts = int(_abt) if _abt is not None else None
+        # ★★ FREEZE-1：旧行（列是 11-26 才加的）没有 armed_bar_ts。
+        #   回填**不在这一层做** —— 这里拿不到「挂单那一根」的可靠来源：
+        #   `pending_theses.bar_ts` 是**末次推进**的时刻（会一直往前移），
+        #   生产实证：活着的 ARMED 行 bar_ts=1795688100000，而真实挂单根是
+        #   1795657200000（差 5 小时）。拿它当锚点会把历史成交全跳过，
+        #   等于换个姿势继续冻结。
+        #   正确来源是 `pending_thesis_actions` 里 kind='place_order' 的
+        #   bar_ts（同一 DB），由 `PendingThesisStore` 在打开库时回填。
+        #   这里只负责：两条锚点都没有时记痕（见下方守卫），不许静默冻结。
 
     def emit(to_state: str, verdict: str, reason: str,
              evidence: Dict[str, Any], bar_ts: int,
@@ -1245,6 +1279,7 @@ def run(thesis: Thesis,
                 armed_at_bar = i
                 armed_ref_close = float(sb.c)
                 armed_at_sub_ts = sb_ts      # 超期按 5m 根数计（用户 2026-11-20）
+                armed_bar_ts = int(ts)       # ★ FREEZE-1：粗周期锚点，恒落库
                 continue
 
             if state == ARMED:
@@ -1268,11 +1303,42 @@ def run(thesis: Thesis,
                 #     on_a_later_5m_bar 当场变红）。
                 #   单在 `armed_at_sub_ts` 收盘之后才存在 → 那之前（含）的
                 #   子根里不可能成交。这是二值事实，不是阈值。
+                #
+                # ★★★ FREEZE-1（2026-11-26）：粗粒度挂单时 `armed_at_sub_ts`
+                #   是 None，原来这里退回 `i <= armed_at_bar` 的**下标**比较。
+                #   而粗粒度 arming 一定发生在「当前最新那根 15m 收盘」，
+                #   所以那个下标恒等于缓冲末尾（400 根 → 399）。deque 每来
+                #   一根新 K 整体左移，399 永远指着队尾 → 每根都被跳过，
+                #   成交永远判不出来，状态永久停在 ARMED，
+                #   `_close_position`（止损/止盈/保本棘轮/恐慌盘/缩量停滞）
+                #   一次都进不去。生产实证：11-26 01:57 成交的空单到 17:00
+                #   仍是 ARMED / filled_ts=0，止盈 59487.6 没有任何执行者，
+                #   唯一的出场只剩交易所地板单。
+                #   所以粗周期也改用**时间戳**锚点（`armed_bar_ts`）：
+                #   「本桶的 open_time <= 挂单那根的 open_time」= 这根不晚于
+                #   挂单那根，价格事实属于过去，不判成交。时间戳不漂移。
                 if armed_at_sub_ts is not None:
                     if int(sb_ts) <= int(armed_at_sub_ts):
                         continue
+                elif armed_bar_ts is not None:
+                    if int(ts) <= int(armed_bar_ts):
+                        continue
                 elif armed_at_bar is not None and i <= int(armed_at_bar):
-                    continue
+                    # 最后的兜底：两条时间戳锚点都没有（只可能是 11-26 之前
+                    # 落库、且计划时间戳也丢了的极老数据）。下标判据会漂，
+                    # 但不许因此**静默冻结** —— 留一条痕，否则下一次还是
+                    # 「仓位在、止损在、止盈永远不平」而日志什么都不说。
+                    # ★ 只提醒一次（`_freeze_warned` 是本函数内的标志：
+                    #   `run()` 是模块级函数、**没有 self**，本模块又是
+                    #   纯函数、不持有 logger —— 所以痕迹走返回值交给引擎，
+                    #   和 `unresolved_reason` 同一个模式。
+                    #   第一版写成 `getattr(self, ...)` + `logger.error`，
+                    #   在这条兜底路径上直接 NameError；否定验证（临时
+                    #   禁掉时间戳分支后跑回归测试）当场把它打了出来。
+                    _freeze_warned = True
+                    res.freeze_anchor_missing = True
+                    if i <= int(armed_at_bar):
+                        continue
                 # 先看成交（保守：同根既成交又失效时，按先成交再平掉）
                 filled = FILL_BEFORE_INVALIDATION and _fill_condition(sb, thesis)
                 # ★ 挂单后按**细周期根数**容忍（用户 2026-11-20：
@@ -1415,6 +1481,9 @@ def run(thesis: Thesis,
                                 state_after=ARMED))
                     # 同 split 的保守约定：本根 h/l 属于过去，不判成交
                     armed_at_bar = i
+                    # ★★ FREEZE-1：粗周期锚点必须是**时间戳**。
+                    #   只记下标的话，它恒等于缓冲末尾，成交守卫永远进不去。
+                    armed_bar_ts = int(ts)
                     armed_ref_close = float(bar.c)
             continue
 
@@ -1428,7 +1497,8 @@ def run(thesis: Thesis,
             _armed_coarse_checks(thesis, verdict, ev, i, ts,
                                  _armed_bar_for_coarse, emit,
                                  close=float(bar.c),
-                                 armed_ref_close=armed_ref_close)
+                                 armed_ref_close=armed_ref_close,
+                                 armed_bar_ts=armed_bar_ts)
             continue
 
         if state == FILLED:
@@ -1479,6 +1549,7 @@ def run(thesis: Thesis,
     res.best_favorable_px = best_fav
     res.armed_ref_close = armed_ref_close
     res.armed_at_sub_ts = armed_at_sub_ts
+    res.armed_bar_ts = armed_bar_ts
     # ★ EXIT-1：把成交那根的锚点带出去（增量推进/重启要用它）
     res.fill_bar_ts = int(_fill_bar_ts or 0)
     res.next_index = max(0, min(len(bars), _walked))
@@ -1545,7 +1616,10 @@ def step(thesis: Thesis,
     resume = {"armed_at_bar": p.get("armed_at_bar"),
               "best_favorable_px": p.get("best_favorable_px"),
               "armed_ref_close": p.get("armed_ref_close"),
-              "armed_at_sub_ts": p.get("armed_at_sub_ts")}
+              "armed_at_sub_ts": p.get("armed_at_sub_ts"),
+              # ★ FREEZE-1：粗周期时间戳锚点 + 计划那根的时间戳
+              #   （后者只用于给 11-26 之前的老行回填 armed_bar_ts）。
+              "armed_bar_ts": p.get("armed_bar_ts")}
     # ★ EXIT-1：成交那根的开盘时刻必须跨调用/跨重启传下去。
     #   它在一次 step 内部是"亲眼看到的成交那根"，但下一次 step 只从
     #   next_index 往后走，看不到那一根了 —— 不传就会把锚点丢掉，
@@ -1559,6 +1633,7 @@ def step(thesis: Thesis,
             "best_favorable_px": res.best_favorable_px,
             "armed_ref_close": res.armed_ref_close,
             "armed_at_sub_ts": res.armed_at_sub_ts,
+            "armed_bar_ts": res.armed_bar_ts,
             # 首次成交时由 `run()` 返回；之后一路沿用
             "fill_bar_ts": int(getattr(res, "fill_bar_ts", 0)
                                or kw.get("fill_bar_ts") or 0)}
@@ -1569,7 +1644,8 @@ def _armed_coarse_checks(thesis: Thesis, verdict: str, ev: Dict[str, Any],
                          i: int, ts: int, armed_at_bar: Optional[int],
                          emit, *,
                          close: Optional[float] = None,
-                         armed_ref_close: Optional[float] = None) -> None:
+                         armed_ref_close: Optional[float] = None,
+                         armed_bar_ts: Optional[int] = None) -> None:
     """已挂单、粗周期收盘时的三个「不看 h/l」的判决：
     失效撤单 / **预期衰减撤单** / 超期撤单。
 
@@ -1618,11 +1694,23 @@ def _armed_coarse_checks(thesis: Thesis, verdict: str, ev: Dict[str, Any],
                         state_after=CANCELLED))
             return
     if thesis.horizon_bars and armed_at_bar is not None:
-        if i - armed_at_bar >= int(thesis.horizon_bars):
+        # ★★ FREEZE-1：超期计数也改用**时间戳**。原来用 `i - armed_at_bar`
+        #   的下标差，而下标会随 deque 滑动失真：挂单那根从队尾左移，
+        #   存着的 armed_at_bar 却不变，差值恒为 0 → 超期永不触发。
+        #   时间戳版本对「缓冲滑没滑过」完全不敏感。
+        _bar_ts = int(ts or 0)
+        _elapsed_coarse = None
+        if armed_bar_ts is not None and _bar_ts > 0:
+            _elapsed_coarse = (int(ts) - int(armed_bar_ts)) // 900_000
+        if _elapsed_coarse is None:
+            _elapsed_coarse = i - armed_at_bar
+        if _elapsed_coarse >= int(thesis.horizon_bars):
             emit(EXPIRED, PENDING,
                  "挂单超过 %d 根仍未成交 → 撤单"
                  % thesis.horizon_bars,
                  {"armed_at_bar": armed_at_bar, "now_bar": i,
+                  "armed_bar_ts": armed_bar_ts,
+                  "elapsed_bars": int(_elapsed_coarse),
                   "cancel_reason": "thesis_expired"},
                  ts,
                  Action(kind="cancel", thesis_id=thesis.thesis_id,

@@ -4233,7 +4233,17 @@ class DecisionEngine:
                     prog["next_index"] = _start
                 res, newp = _T.step(th, b15, book, progress=prog,
                                     entry_bars=b5, kbar=kbar_view,
-                                    fill_bar_ts=self._pending_fill_bar_ts(tid))
+                                    # ★★ FREEZE-1 收尾（2026-11-26）：
+                                    #   优先用**落库的精确锚点**（状态机当初
+                                    #   亲眼看到成交那根），推断只做兜底。
+                                    #
+                                    #   以前这里无条件传推断值 —— 而
+                                    #   `step()` 里 `if not kw.get(...)` 让
+                                    #   kw 压过 `p`，于是「精确值」永远
+                                    #   赢不了「猜测值」，补了列也白补。
+                                    #   现在 0 值（未成交/老行）才退回推断。
+                                    fill_bar_ts=(int(prog.get("fill_bar_ts") or 0)
+                                                 or self._pending_fill_bar_ts(tid)))
             except Exception as e:
                 logger.error("[挂单] 推进 %s 失败：%s", tid, e, exc_info=True)
                 self.db.log_risk("pending_step_error", "%s: %s" % (tid, str(e)[:200]))
@@ -4317,6 +4327,16 @@ class DecisionEngine:
             _p_state = newp["state"]
             _p_armed = newp.get("armed_at_bar")
             _p_armed_sub = newp.get("armed_at_sub_ts")
+            # ★★ FREEZE-1：粗周期时间戳锚点。不落这一列，重启后
+            #   `armed_at_sub_ts` 依然是 None（粗粒度分支本来就不设它），
+            #   守卫退回下标判据 → 该下标恒等于缓冲末尾 → 永久冻结。
+            _p_armed_ts = newp.get("armed_bar_ts")
+            # ★★ FREEZE-1 收尾（2026-11-26）：EXIT-1 的精确锚点。
+            #   状态机「亲眼看到成交」那一轮会给出**精确**的
+            #   `fill_bar_ts`；以前这里从不落库，下一轮 `progress_of()`
+            #   也交不回来，于是每轮都退回按 `pos.entry_ts` 推断
+            #   （晚一根 → 「收盘跌破」用下一根的收盘判，静默分叉）。
+            _p_fill_ts = newp.get("fill_bar_ts")
             _p_ref = newp.get("armed_ref_close")
             # ★★ 诊断埋点：arming 到底走的是哪条分支（2026-11-25）。
             #
@@ -4369,9 +4389,25 @@ class DecisionEngine:
             #   所以：没有仓位事实就不许进 CLOSED_*。退回 ARMED 让下一轮
             #   继续用「挂单之后的 K」判成交（配合 thesis.py 的
             #   `i > armed_at_bar` 守卫），并留一条风险事件说明这次拦截。
+            # ★★★ FREEZE-1 尾修（2026-11-26，部署后第一分钟就撞上）：
+            #   「`self.pos` 为空」这一个条件**不足以**判定自相矛盾 ——
+            #   因为**本轮刚刚把仓平掉时它也会是空的**
+            #   （`_pending_close` 末尾 `self.pos = None`）。
+            #
+            #   生产实证：解冻后第一轮就正确判出成交、并按
+            #   `observation_reject` 真实平仓（BUY 0.01 @ 60484.3，净 +3.54U），
+            #   然后这道闸看到空仓 → 把**合法终态**判成撒谎 → 回滚成 ARMED。
+            #   后果不是「多跑一轮」：仓位已经没了却回到 ARMED，
+            #   下一轮会把同一根历史 K 再判成成交，再发一次 BUY 0.01 ——
+            #   在空仓上那就是**反手开多**。
+            #
+            #   正确判据：本轮真的执行过 `close`（`placed` 里出现 "close"）
+            #   就说明仓位是被**我们**合法平掉的，终态成立。
+            _closed_now = "close" in placed
             if (str(_p_state) in (_T.CLOSED_TP, _T.CLOSED_SL,
                                  _T.CLOSED_THESIS)
-                    and not float((self.pos or {}).get("qty") or 0.0)):
+                    and not float((self.pos or {}).get("qty") or 0.0)
+                    and not _closed_now):
                 logger.error(
                     "[挂单] %s 状态机推出终态 %s，但引擎没有对应的仓位事实"
                     " → 拦截（不落终态，退回 ARMED 重新判）",
@@ -4384,6 +4420,7 @@ class DecisionEngine:
                 _p_state = _T.EXPECTED
                 _p_armed = None
                 _p_armed_sub = None
+                _p_armed_ts = None
                 _p_ref = None
                 logger.warning(
                     "[挂单] %s 本根未成功挂出 → 状态退回 EXPECTED（不判成交、不平仓）",
@@ -4426,6 +4463,7 @@ class DecisionEngine:
                     _p_state = _T.EXPECTED
                     _p_armed = None
                     _p_armed_sub = None
+                    _p_armed_ts = None
                     _p_ref = None
 
             # ★ 动作落地之后才前移游标（不变量 2）
@@ -4438,12 +4476,34 @@ class DecisionEngine:
                     th, state=_p_state, next_index=_next_index,
                     armed_at_bar=_p_armed,
                     armed_at_sub_ts=_p_armed_sub,
+                    armed_bar_ts=_p_armed_ts,
+                    # ★ 不复位、不参与「退回 EXPECTED」的清理：
+                    #   它是**成交事实**（哪一根成交），不是 arming 游标。
+                    #   没成交时本来就是 0；有成交时清掉它等于丢锚点。
+                    fill_bar_ts=_p_fill_ts,
                     armed_ref_close=_p_ref,
                     bar_ts=ts, ambiguous=bool(res.ambiguous),
                     note=",".join(placed) or ("place_failed" if failed_place else "")))
             except Exception as e:
                 logger.error("[挂单] 落库 %s 失败：%s", tid, e, exc_info=True)
                 self.db.log_risk("pending_store_error", "%s: %s" % (tid, str(e)[:200]))
+
+            # ★★ FREEZE-1：状态机退回了会漂移的下标判据（两条时间戳锚点
+            #   都缺）。这是「可能永久冻结」的唯一信号，必须留痕 ——
+            #   冻结的表现是「什么都不发生」，不留痕就查不出来。
+            if getattr(res, "freeze_anchor_missing", False):
+                try:
+                    logger.error(
+                        "[挂单] %s 缺少时间戳锚点（armed_at_sub_ts / "
+                        "armed_bar_ts 都为空），成交判据退回下标 —— "
+                        "状态机可能永久停在 ARMED、出场闸全部不工作",
+                        tid)
+                    self.db.log_risk(
+                        "pending_freeze_anchor_missing",
+                        "%s: armed_at_bar=%s next_index=%s state=%s"
+                        % (tid, _p_armed, _next_index, _p_state))
+                except Exception:                # noqa: BLE001
+                    pass
 
             if placed:
                 self._log_decision(
@@ -4706,21 +4766,27 @@ class DecisionEngine:
             a["qty"] = left
 
     def _pending_fill_bar_ts(self, tid: str) -> int:
-        """成交所在那根 5m 的开盘时刻 —— EXIT-1 找锚点的起点。
+        """成交所在那根 5m 的开盘时刻 —— EXIT-1 找锚点的**兜底**来源。
 
-        ★ 为什么不靠状态机自己记：
-          `thesis.step()` 每次只从 `next_index` 往后推，成交那一根只有在
-          "亲眼看到成交"的那一轮里存在过。下一轮、重启之后都看不到它，
-          局部变量活不下来，而丢了它的表现是"收盘跌破判据什么也不做"——
-          不报错、不告警，回测和实盘的出场规则悄悄分叉。
+        ★★★ 2026-11-26 降级（FREEZE-1 收尾）：
 
-          所以锚点从**持仓的 entry_ts** 推：它是落库的、重启还在。
-          对齐到 5m 桶边界即可（`assess` 的过滤条件是 `ts >= since_ts`）。
+          本方法原来唯一来源。但它是**猜**出来的 —— 而状态机在
+          「亲眼看到成交」那一轮给出的是**精确**值（`res.fill_bar_ts`）。
+          现在那个值随 `fill_bar_ts` 列落库、下一轮从 `progress_of()`
+          交回来，**优先于**这里的推断（见 `_step_pending` 里的
+          `int(prog.get("fill_bar_ts") or 0) or self._pending_fill_bar_ts(tid)`）。
 
-        已知精度上限：`_pending_book_fill` 落账时的 entry_ts 是"落账那一刻"，
-        可能比真实成交晚一根。晚一根的代价是锚点晚一根开始找 ——
-        最坏情况退化成"用下一根的收盘判跌破"，不会误判成没跌破。
-        状态机自己看到成交那条路径是精确的（`res.fill_bar_ts`）。
+          所以本方法只剩两种情况会被用到：
+            · 老行（补列之前建的，`fill_bar_ts=0`）
+            · 成交那一轮之后的第一次推进（精确值还没落库）
+
+          ★ 别把兜底改回主路径。`entry_ts` 是 `_pending_book_fill`
+            **落账那一刻**，不是成交那一刻 —— 两者的差距就是「晚一根」，
+            而锚点晚一根，「收盘跌破」就退化成用**下一根的收盘**判跌破：
+            不报错、不告警，回测和实盘的出场规则悄悄分叉。
+
+        已知精度上限（兜底路径专属）：如上，最坏退化成
+        「用下一根的收盘判跌破」，不会误判成没跌破。
         """
         p = self.pos
         if not p:

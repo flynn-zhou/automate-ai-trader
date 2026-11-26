@@ -61,6 +61,38 @@ CREATE TABLE IF NOT EXISTS pending_theses (
     --   下标会随缓冲前移而漂移（事故现场就是 next_index 被重算到 386
     --   而 armed_at_bar 是 399），时间戳不会。所以必须落库。
     armed_at_sub_ts INTEGER,
+    -- 挂单那一刻**粗周期那根**的 open_time（成交守卫的兜底锚点）
+    --
+    -- ★★★ 2026-11-26 补（FREEZE-1，真钱事故根因）：
+    --   粗粒度 arming 分支（thesis.py 的「粗周期确认」那条）**从来不设**
+    --   `armed_at_sub_ts`，只设 `armed_at_bar = i`。于是成交守卫退回下标比较
+    --   `i <= armed_at_bar`。而粗粒度挂单一定发生在**当前最新那根 15m**
+    --   收盘时，也就是 `armed_at_bar` 恒等于缓冲末尾下标（400 根缓冲 → 399）。
+    --   deque 每来一根新 K 整体左移，399 永远指着队尾 →
+    --   **每一根都被 `i <= 399` 跳过，成交永远判不出来**，状态机永久停在
+    --   ARMED，`_close_position`（止损/止盈/保本棘轮/恐慌盘/缩量停滞）
+    --   一次都进不去。生产实证：上涨三引线|down|1795656300000 自 11-26
+    --   01:57 成交到 17:00 仍是 ARMED / filled_ts=0，而交易所那张单
+    --   早已 FILLED、引擎已有一笔 0.01 空单 —— 那笔仓当时唯一的出场
+    --   只剩交易所地板单，止盈 59487.6 没有任何执行者。
+    --   时间戳不会随缓冲滑动而漂移，所以粗粒度锚点也必须落库。
+    armed_bar_ts    INTEGER,
+    -- 成交那根 **5m** 的开盘时刻（EXIT-1 的锚点）
+    --
+    -- ★★★ 2026-11-26 补（FREEZE-1 收尾，EXIT-1 的精确锚点一直没落库）：
+    --   `thesis.step()` 早就在读 `p.get("fill_bar_ts")`（见 thesis.py 的
+    --   「EXIT-1：成交那根的开盘时刻必须跨调用/跨重启传下去」），
+    --   但这一列**从来不存在** → `progress_of()` 拿不到 → 那句读是死代码，
+    --   恒为 None，于是每一轮都退回引擎的 `_pending_fill_bar_ts()` 推断。
+    --
+    --   而那个推断只认 `pos.entry_ts`，它自己的 docstring 就写着
+    --   「`entry_ts` 是落账那一刻，可能比真实成交晚一根」。晚一根的代价是
+    --   锚点晚一根开始找 —— 「收盘跌破」这条判据最坏退化成用下一根的收盘
+    --   判跌破，回测与实盘悄悄分叉（不报错、不告警）。
+    --
+    --   状态机自己「亲眼看到成交」那条路径是**精确**的（`res.fill_bar_ts`），
+    --   落库之后重启也还在，引擎的推断降级成兜底。
+    fill_bar_ts    INTEGER NOT NULL DEFAULT 0,
     -- 成交与出场的事实（引擎侧写，状态机侧只读）
     filled_ts       INTEGER NOT NULL DEFAULT 0,
     filled_price    REAL NOT NULL DEFAULT 0,
@@ -134,6 +166,76 @@ class PendingThesisStore:
             self._conn.execute(
                 "ALTER TABLE pending_theses ADD COLUMN armed_at_sub_ts INTEGER")
             self._conn.commit()
+        # ★ FREEZE-1（2026-11-26）：粗周期挂单锚点。缺了这一列，
+        #   `upsert_thesis` 会因「表里没这列」直接抛错 —— 而下单路径
+        #   上的抛错会变成每轮刷一次 ERROR，所以 SQL 和 ALTER 必须成对。
+        if "armed_bar_ts" not in have:
+            self._conn.execute(
+                "ALTER TABLE pending_theses ADD COLUMN armed_bar_ts INTEGER")
+            self._conn.commit()
+        # ★ FREEZE-1 收尾（2026-11-26）：EXIT-1 的精确锚点。
+        #   与 `armed_bar_ts` 同款 —— SCHEMA 改了但老库不会自动长列，
+        #   而 `upsert_thesis` 只要引用了这一列就会「表里没这列」抛错，
+        #   抛在下单路径上就是每轮刷 ERROR。SQL 与 ALTER 必须成对。
+        #
+        #   ★ 这里**不回填**：`fill_bar_ts` 是「成交那根」的锚点，
+        #     只能由状态机亲眼看到成交时写出；从 `filled_ts` 或
+        #     `pos.entry_ts` 反推都是**猜测**（那正是这次要替掉的坏口径）。
+        #     老行保持 0，由引擎的推断兜底 —— 与补列之前的行为一致。
+        if "fill_bar_ts" not in have:
+            self._conn.execute(
+                "ALTER TABLE pending_theses"
+                " ADD COLUMN fill_bar_ts INTEGER NOT NULL DEFAULT 0")
+            self._conn.commit()
+        self.backfill_armed_bar_ts()
+
+    def backfill_armed_bar_ts(self) -> int:
+        """★ FREEZE-1：给「11-26 之前挂单」的行回填粗周期时间戳锚点。
+
+        数据来源是 `pending_thesis_actions` 里 `kind='place_order'` 的
+        `bar_ts` —— 那条 action 就是**挂单那一刻**写的，它的 bar_ts
+        正是挂单那根 15m 的 open_time。生产实证：
+
+            thesis_id = 上涨三引线假突破限价单|down|1795656300000|60880.8000
+            place_order.bar_ts = 1795657200000   ← 真实挂单根
+            pending_theses.armed_at_bar = 399, armed_at_sub_ts = NULL
+
+        ★ 为什么**不能**用 `pending_theses.bar_ts`：它是「末次推进到的根」，
+          会一直往前移。同一行生产里是 1795688100000，比真实挂单根晚
+          5 小时；拿它当锚点会把 5 小时的历史成交全部跳过 ——
+          换个姿势继续冻结，而且这次连「停在 ARMED」都看不出来。
+
+        ★ 为什么取 `MIN`：挂单可能重试多次（`failed_place` 之后重挂），
+          最早那一次才是 arming 的时刻。
+
+        ★ 只回填**非终态**行：终态行的锚点已经不影响任何判决，
+          改动历史记录只会让复盘对不上账。
+
+        Returns: 实际回填的行数（0 表示没有需要回填的，幂等）。
+        """
+        try:
+            has_actions = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name='pending_thesis_actions'").fetchone()
+            if not has_actions:
+                return 0
+            cur = self._conn.execute(
+                "UPDATE pending_theses SET armed_bar_ts = ("
+                "  SELECT MIN(a.bar_ts) FROM pending_thesis_actions a"
+                "   WHERE a.thesis_id = pending_theses.thesis_id"
+                "     AND a.kind = 'place_order'"
+                "     AND a.bar_ts IS NOT NULL AND a.bar_ts > 0)"
+                " WHERE armed_bar_ts IS NULL"
+                "   AND armed_at_bar IS NOT NULL"
+                "   AND state NOT IN ('CLOSED_TP', 'CLOSED_SL',"
+                "                     'CLOSED_THESIS', 'CANCELLED',"
+                "                     'EXPIRED', 'REJECTED')")
+            self._conn.commit()
+            return int(cur.rowcount or 0)
+        except Exception:                    # noqa: BLE001
+            # 回填是**尽力而为**：失败只影响老行（新行在 arming 时就写好了），
+            # 绝不能让「补一列历史数据」把服务启动搞挂。
+            return 0
 
     def close(self) -> None:
         try:
@@ -148,6 +250,7 @@ class PendingThesisStore:
         marks = ", ".join("?" for _ in FIELDS)
         sets = ", ".join("%s=excluded.%s" % (f, f) for f in FIELDS)
         extra = ("state", "next_index", "armed_at_bar", "armed_at_sub_ts",
+                 "armed_bar_ts", "fill_bar_ts",
                  "armed_ref_close", "ambiguous", "note", "updated_ts")
         cols2 = cols + ", " + ", ".join(extra)
         marks2 = marks + ", " + ", ".join("?" for _ in extra)
@@ -155,6 +258,8 @@ class PendingThesisStore:
         vals = [row.get(f, 0) for f in FIELDS]
         vals += [row.get("state", "EXPECTED"), int(row.get("next_index", 0)),
                  row.get("armed_at_bar"), row.get("armed_at_sub_ts"),
+                 row.get("armed_bar_ts"),
+                 int(row.get("fill_bar_ts") or 0),
                  row.get("armed_ref_close"),
                  1 if row.get("ambiguous") else 0, row.get("note", ""),
                  int(row.get("updated_ts") or time.time() * 1000)]
@@ -292,6 +397,8 @@ class PendingThesisStore:
 def row_of(thesis, *, state: str, next_index: int,
            armed_at_bar: Optional[int] = None,
            armed_at_sub_ts: Optional[int] = None,
+           armed_bar_ts: Optional[int] = None,
+           fill_bar_ts: int = 0,
            armed_ref_close: Optional[float] = None,
            bar_ts: int = 0, ambiguous: bool = False,
            note: str = "") -> Dict[str, Any]:
@@ -313,6 +420,8 @@ def row_of(thesis, *, state: str, next_index: int,
         "bar_ts": int(bar_ts or 0),
         "state": state, "next_index": int(next_index),
         "armed_at_bar": armed_at_bar, "armed_at_sub_ts": armed_at_sub_ts,
+        "armed_bar_ts": armed_bar_ts,
+        "fill_bar_ts": int(fill_bar_ts or 0),
         "armed_ref_close": armed_ref_close,
         "ambiguous": ambiguous, "note": note,
     }
@@ -341,4 +450,14 @@ def progress_of(row: Dict[str, Any]) -> Dict[str, Any]:
             #   `armed_at_bar` 判据（见 thesis.step 的 elif 分支），
             #   也就是补列之前的行为 —— 向后兼容，不会把老预期判错。
             "armed_at_sub_ts": row.get("armed_at_sub_ts"),
+            # ★ FREEZE-1：粗周期挂单锚点。旧行没有这列值时补 None，
+            #   由 `thesis.step()` 回退到 `armed_bar_ts_fallback()` 的时间戳
+            #   推断（用 plan bar_ts），再退到 `armed_at_bar` 下标判据。
+            "armed_bar_ts": row.get("armed_bar_ts"),
+            # ★ FREEZE-1 收尾（2026-11-26）：成交那根 5m 的锚点。
+            #   以前不交出去 → `step()` 里 `p.get("fill_bar_ts")` 是死代码，
+            #   每轮都退回引擎按 `pos.entry_ts` 推断（晚一根）。
+            #   0 表示「还没成交」或「老行」——`step()` 会继续退回推断，
+            #   所以补列前后行为一致，只是新行开始用精确值。
+            "fill_bar_ts": int(row.get("fill_bar_ts") or 0),
             "armed_ref_close": row["armed_ref_close"]}

@@ -395,9 +395,25 @@ def _mark_cancelled(engine: Any, row: Dict[str, Any], closed_ok: bool) -> None:
         th = _PTS.thesis_of(row)
         prog = _PTS.progress_of(row)
         state = _T.CANCELLED if closed_ok else _T.CLOSED_THESIS
+        # ★★★ 2026-11-26（FREEZE-1 收尾审查）：**必须**把锚点原样带过去。
+        #
+        #   `upsert_thesis` 是 `ON CONFLICT DO UPDATE`，`row_of()` 没给的
+        #   列会被 `excluded.<col>` 覆盖 —— 也就是说「没传」等于「写成 0」。
+        #
+        #   这里原来只传 next_index / armed_at_bar / armed_ref_close，
+        #   于是 `armed_at_sub_ts` / `armed_bar_ts` / `fill_bar_ts`
+        #   三个时间戳锚点被**静默抹成 0/None**。
+        #
+        #   危害不是「少一列统计」：这三个锚点是复盘「哪一根挂的单、
+        #   哪一根成交的」的唯一记录，FREEZE-1 那种永久冻结事故正是靠
+        #   它们才定得出根因 —— 而自检行恰恰是最常被拿来复盘的行。
+        #   行一旦被任何未来逻辑复活，锚点也已经没了。
         engine.pending.upsert_thesis(_PTS.row_of(
             th, state=state, next_index=int(prog.get("next_index") or 0),
             armed_at_bar=prog.get("armed_at_bar"),
+            armed_at_sub_ts=row.get("armed_at_sub_ts"),
+            armed_bar_ts=row.get("armed_bar_ts"),
+            fill_bar_ts=int(row.get("fill_bar_ts") or 0),
             armed_ref_close=prog.get("armed_ref_close"),
             bar_ts=int(row.get("bar_ts") or 0),
             ambiguous=bool(row.get("ambiguous")),

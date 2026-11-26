@@ -706,3 +706,47 @@ class TestEngineWiring:
         risk = floored * 60880.8 * 0.01547
         assert risk <= ENG._max_risk_share(100.0, 1.0) + 1e-6
 
+
+# ============================================ 名字（用户 2026-11-26 定名）
+
+def test_策略名叫15m反包K():
+    """★ 用户 2026-11-26 定名：**15m反包K**（原名「实体反包三档限价单」）。
+
+    ★ 为什么这条值得一条测试：策略名会进 `thesis_id`
+      （`kind|direction|bar_ts|price`）、决策行、风险事件和订单备注 ——
+      改名漏一处，统计表就会按两个名字各算一半，而**不会报错**。
+      全仓所有引用都走 `KIND_ENGULF` 常量，所以只要钉住常量值 + 钉住
+      「没有任何地方硬编码旧名字」就够了。
+    """
+    import io
+    import os
+
+    assert E.KIND_ENGULF == "15m反包K"
+
+    # 旧名字不许再出现在**代码**里（docstring 里作为历史说明保留是允许的）
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "ai_trader", "trading", "engulf.py"),
+                  encoding="utf-8").read()
+    code = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    assert "实体反包三档限价单" not in code, (
+        "engulf.py 的**代码**里还残留旧策略名 → thesis_id / 统计会分裂")
+
+
+def test_名字进thesis_id():
+    """策略名必须真的进 `thesis_id`（否则历史行无法按策略名检索）。
+
+    `thesis_id` 由 `pending_plan.to_thesis()` 拼成
+    `kind-direction-bar_ts-order_price` —— 所以改名会**改变主键**。
+    生产库改名时 0 条反包行（实测），不存在覆盖/分裂。
+    """
+    plan = P.Plan(kind=E.KIND_ENGULF, direction=T.UP,
+                  order_type=T.ORDER_LIMIT, bar_index=0, bar_ts=1795659000000,
+                  order_price=60800.0, stop_price=60700.0,
+                  target_price=61000.0, bar_space=E.BAR_SPACE,
+                  family=T.FAMILY_REVERSAL)
+    th = P.to_thesis(plan)
+    # 顺序是 `direction-kind-bar_ts-order_price`
+    assert E.KIND_ENGULF in th.thesis_id, (
+        "thesis_id 里没有策略名：%r" % (th.thesis_id,))
+    assert th.kind == E.KIND_ENGULF
